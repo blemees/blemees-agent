@@ -22,7 +22,11 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
 ]
-dependencies = []
+# NOTE (blemees/3 ACP migration, #15 spike): the daemon is no longer
+# stdlib-only. It acts as an ACP client via the official Python SDK.
+dependencies = [
+    "agent-client-protocol>=0.10",
+]
 
 [project.scripts]
 blemees-agentd = "blemees_agent.__main__:main"

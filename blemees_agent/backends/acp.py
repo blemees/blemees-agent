@@ -35,6 +35,7 @@ from uuid import uuid4
 
 import acp
 from acp import PROTOCOL_VERSION as ACP_PROTOCOL_VERSION, connect_to_agent, text_block
+from acp.connection import InMemoryMessageQueue
 from acp.schema import AllowedOutcome, ClientCapabilities, RequestPermissionResponse
 
 from ..errors import ProtocolError, SessionBusyError, SpawnFailedError
@@ -123,6 +124,12 @@ class AcpBackend:
 
         self._proc: asyncio.subprocess.Process | None = None
         self._conn: Any = None  # acp.ClientSideConnection once spawned
+        # Our own handle on the SDK's RPC task queue so we can drain pending
+        # session/update notifications before emitting session.result — the
+        # SDK resolves prompt() responses inline but processes notifications
+        # off this queue, so the response can otherwise race ahead of a
+        # turn's final updates.
+        self._rpc_queue: Any = None
         self._stderr_task: asyncio.Task | None = None
         self._turn_task: asyncio.Task | None = None
 
@@ -160,7 +167,13 @@ class AcpBackend:
         # output_stream=reader←agent stdout). asyncio gives us exactly those.
         assert self._proc.stdin is not None and self._proc.stdout is not None
         # input_stream = agent stdin (we write), output_stream = agent stdout (we read).
-        self._conn = connect_to_agent(_DaemonAcpClient(self), self._proc.stdin, self._proc.stdout)
+        self._rpc_queue = InMemoryMessageQueue()
+        self._conn = connect_to_agent(
+            _DaemonAcpClient(self),
+            self._proc.stdin,
+            self._proc.stdout,
+            queue=self._rpc_queue,
+        )
         self._stderr_task = asyncio.create_task(
             self._pump_stderr(), name=f"acp-stderr-{self._session_id}"
         )
@@ -205,6 +218,9 @@ class AcpBackend:
                 session_id=self.native_session_id,
                 message_id=str(uuid4()),
             )
+            # Ensure every session/update notification for this turn has been
+            # emitted before we close the turn with session.result.
+            await self._drain_notifications()
             frame: dict[str, Any] = {"type": "session.result", "stop_reason": resp.stop_reason}
             usage = getattr(resp, "usage", None)
             if usage is not None:
@@ -271,6 +287,16 @@ class AcpBackend:
 
     async def _emit(self, frame: dict[str, Any]) -> None:
         await self._on_event(frame)
+
+    async def _drain_notifications(self) -> None:
+        """Block until queued session/update handlers have run.
+
+        Guarded by a timeout so a stuck worker can never wedge a turn.
+        """
+        if self._rpc_queue is None:
+            return
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(self._rpc_queue.join(), timeout=5.0)
 
     async def _pump_stderr(self) -> None:
         proc = self._proc

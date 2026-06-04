@@ -42,6 +42,21 @@ async def _drain_until(queue: asyncio.Queue, *types: str, timeout: float = 30.0)
             return frames
 
 
+async def _collect_turn(queue: asyncio.Queue, timeout: float = 30.0) -> list[dict]:
+    """Collect a full turn: frames up to ``session.result`` plus any stragglers.
+
+    ACP does not guarantee every ``session/update`` reaches the wire before the
+    prompt response (a final update may trail the result), so we also drain a
+    short tail after the result to capture any late update for the turn.
+    """
+    frames = await _drain_until(queue, "session.result", timeout=timeout)
+    while True:
+        try:
+            frames.append(await asyncio.wait_for(queue.get(), timeout=0.5))
+        except TimeoutError:
+            return frames
+
+
 # ---------------------------------------------------------------------------
 # Pure helpers
 # ---------------------------------------------------------------------------
@@ -92,7 +107,7 @@ async def test_turn_streams_updates_then_result():
     await backend.spawn()
     try:
         await backend.send_user_turn({"role": "user", "content": "say pong"})
-        frames = await _drain_until(queue, "session.result")
+        frames = await _collect_turn(queue)
     finally:
         await backend.close()
 
@@ -100,11 +115,12 @@ async def test_turn_streams_updates_then_result():
     results = [f for f in frames if f["type"] == "session.result"]
     assert len(results) == 1
     assert results[0]["stop_reason"] == "end_turn"
+    # Exactly one turn's worth of streamed chunks; the fake emits two.
     assert len(updates) == 2
-    # Verbatim ACP update payload carried under "update".
-    first = updates[0]["update"]
-    assert first["sessionUpdate"] == "agent_message_chunk"
-    assert first["content"]["text"] == "PONG"
+    # Verbatim ACP update payload carried under "update" (camelCase wire shape).
+    assert all(u["update"]["sessionUpdate"] == "agent_message_chunk" for u in updates)
+    streamed = "".join(u["update"]["content"]["text"] for u in updates)
+    assert streamed == "PONG done"
     # Backend does NOT assign seq — that's the Session's job (#19 path).
     assert "seq" not in results[0]
 

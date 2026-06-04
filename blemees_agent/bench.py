@@ -38,34 +38,13 @@ from .client import BlemeesClient, default_socket_path
 # frames (``agent.system_init``, ``agent.notice``) are deliberately
 # excluded: they fire before the upstream model has produced anything,
 # so counting them would understate latency.
-_FIRST_EVENT_TYPES: frozenset[str] = frozenset(
-    {
-        "agent.delta",
-        "agent.message",
-        "agent.tool_use",
-        "agent.tool_result",
-        "agent.result",
-    }
-)
-
-_DEFAULT_MODELS: dict[str, str] = {
-    "claude": "haiku",
-    "codex": "gpt-5.2-codex",
-}
+# blemees/3 event types that signal "model output started" — the first
+# of these after a turn opens stops the latency timer.
+_FIRST_EVENT_TYPES: frozenset[str] = frozenset({"session.update", "session.result"})
 
 
-def _backend_options(backend: str, model: str | None) -> dict[str, object]:
-    if backend == "claude":
-        opts: dict[str, object] = {"tools": "", "permission_mode": "bypassPermissions"}
-        if model:
-            opts["model"] = model
-        return opts
-    if backend == "codex":
-        opts = {"sandbox": "read-only", "approval-policy": "never"}
-        if model:
-            opts["model"] = model
-        return opts
-    raise SystemExit(f"unknown backend: {backend!r}")
+def _options(model: str | None) -> dict[str, object]:
+    return {"model": model} if model else {}
 
 
 async def _first_event_latency(sess, prompt: str) -> float:
@@ -73,7 +52,7 @@ async def _first_event_latency(sess, prompt: str) -> float:
     await sess.send_user(prompt)
     async for evt in sess.events():
         t = evt.get("type")
-        if t == "agent.error":
+        if t == "error" or t == "session.error":
             raise RuntimeError(evt)
         if t in _FIRST_EVENT_TYPES:
             return time.monotonic() - t0
@@ -81,29 +60,27 @@ async def _first_event_latency(sess, prompt: str) -> float:
 
 
 async def _drain_to_result(sess) -> int:
-    """Drain events until a turn-end ``agent.result`` arrives. Returns
+    """Drain events until a turn-end ``session.result`` arrives. Returns
     the highest seq seen so the caller can resume cleanly."""
     last_seq = 0
     async for evt in sess.events():
         seq = evt.get("seq")
         if isinstance(seq, int) and seq > last_seq:
             last_seq = seq
-        if evt.get("type") == "agent.result":
+        if evt.get("type") == "session.result":
             return last_seq
     return last_seq
 
 
-async def run_one(
-    socket_path: str, backend: str, model: str | None, prompt: str
-) -> dict[str, float]:
+async def run_one(socket_path: str, model: str | None, prompt: str) -> dict[str, float]:
     results: dict[str, float] = {}
     session_id = str(uuid.uuid4())
-    options = _backend_options(backend, model)
+    options = _options(model)
 
     async with await BlemeesClient.connect(socket_path) as c:
         # Cold open
         t_open = time.monotonic()
-        async with c.open_session(session_id=session_id, backend=backend, options=options) as sess:
+        async with c.open_session(session_id=session_id, options=options) as sess:
             cold_latency = await _first_event_latency(sess, prompt)
             results["cold_first_event"] = cold_latency
             results["cold_open_plus_first"] = time.monotonic() - t_open
@@ -114,19 +91,12 @@ async def run_one(
             results["warm_first_event"] = warm_latency
             last_seq = await _drain_to_result(sess)
 
-    # Resume: reconnect and re-open with resume:true. Codex 0.125.x's
-    # `tools/call codex-reply` does not reliably rehydrate state from
-    # disk across processes (returns an empty success without
-    # resuming) — skip the resume step for codex until that's fixed
-    # upstream so the bench doesn't hang.
-    if backend == "codex":
-        return results
-
+    # Resume: reconnect and re-open with resume:true (depends on the agent's
+    # session/load support, #23).
     async with await BlemeesClient.connect(socket_path) as c:
         t_resume = time.monotonic()
         async with c.open_session(
             session_id=session_id,
-            backend=backend,
             options=options,
             resume=True,
             last_seen_seq=last_seq,
@@ -141,7 +111,7 @@ async def run_one(
 async def main_async(args: argparse.Namespace) -> int:
     rows: list[dict[str, float]] = []
     for i in range(args.iters):
-        row = await run_one(args.socket, args.backend, args.model, args.prompt)
+        row = await run_one(args.socket, args.model, args.prompt)
         rows.append(row)
         print(f"iter {i + 1}: {json.dumps(row, indent=2)}")
     if len(rows) > 1:
@@ -154,22 +124,10 @@ async def main_async(args: argparse.Namespace) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(prog="python -m blemees_agent.bench")
     ap.add_argument("--socket", default=default_socket_path())
-    ap.add_argument(
-        "--backend",
-        choices=("claude", "codex"),
-        default="claude",
-        help="Which backend to bench (default: claude)",
-    )
-    ap.add_argument(
-        "--model",
-        default=None,
-        help="Backend-specific model name (default depends on --backend)",
-    )
+    ap.add_argument("--model", default=None, help="Model name to request (agent-specific)")
     ap.add_argument("--iters", type=int, default=3)
     ap.add_argument("--prompt", default="Reply with just the word OK.")
     args = ap.parse_args()
-    if args.model is None:
-        args.model = _DEFAULT_MODELS.get(args.backend)
     return asyncio.run(main_async(args))
 
 

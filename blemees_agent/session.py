@@ -147,7 +147,7 @@ class Session:
                 self._watchers.pop(conn_id, None)
         # Soft-kill after a completed turn when the client has left.
         # Backends emit `agent.result` as the turn-ending frame.
-        if self._finishing and frame.get("type") == "agent.result":
+        if self._finishing and frame.get("type") == "session.result":
             self._finishing = False
             sub = self.backend
             if sub is not None:
@@ -190,7 +190,7 @@ class Session:
             self.seq += 1
             await writer(
                 {
-                    "type": "agent.replay_gap",
+                    "type": "replay_gap",
                     "session_id": self.session_id,
                     "since_seq": last_seen_seq,
                     "first_available_seq": earliest,
@@ -205,7 +205,7 @@ class Session:
             self.seq += 1
             await writer(
                 {
-                    "type": "agent.replay_gap",
+                    "type": "replay_gap",
                     "session_id": self.session_id,
                     "since_seq": last_seen_seq,
                     "first_available_seq": self.seq + 1,
@@ -253,7 +253,7 @@ class Session:
             self.seq += 1
             await writer(
                 {
-                    "type": "agent.replay_gap",
+                    "type": "replay_gap",
                     "session_id": self.session_id,
                     "since_seq": last_seen_seq,
                     "first_available_seq": earliest,
@@ -395,41 +395,20 @@ class Session:
     # ------------------------------------------------------------------
 
     def _update_usage_from_frame(self, frame: dict) -> None:
-        """Pull model / usage out of normalised agent.* events. Persist if enabled."""
-        t = frame.get("type")
-        if t == "agent.system_init":
-            model = frame.get("model")
-            if isinstance(model, str):
-                self.last_model = model
-            native = frame.get("native_session_id")
-            if isinstance(native, str) and native:
-                self.native_session_id = native
-            caps = frame.get("capabilities")
-            if isinstance(caps, dict):
-                rollout = caps.get("rollout_path")
-                if isinstance(rollout, str) and rollout:
-                    self.rollout_path = rollout
-            # Persist so resume across daemon restarts can recover both.
-            self._save_usage_sidecar()
-            return
-        if t != "agent.result":
+        """Maintain turn counters / last-turn usage from session.result frames.
+
+        ACP usage is *optional* (#15 finding A): when present it's stored
+        verbatim and summed field-by-field; a turn with no usage still
+        counts. Persisted to the usage sidecar when the durable log is on.
+        """
+        if frame.get("type") != "session.result":
             return
         usage = frame.get("usage")
-        if not isinstance(usage, dict):
-            return
-        # Snapshot last-turn usage verbatim so clients see whatever fields a
-        # backend emits (including future ones we don't know about yet).
-        self.last_turn_usage = dict(usage)
-        for key in (
-            "input_tokens",
-            "output_tokens",
-            "cache_read_input_tokens",
-            "cache_creation_input_tokens",
-            "reasoning_output_tokens",
-        ):
-            v = usage.get(key)
-            if isinstance(v, int):
-                self.cumulative_usage[key] = self.cumulative_usage.get(key, 0) + v
+        if isinstance(usage, dict):
+            self.last_turn_usage = dict(usage)
+            for key, value in usage.items():
+                if isinstance(value, int):
+                    self.cumulative_usage[key] = self.cumulative_usage.get(key, 0) + value
         self.turns += 1
         self.last_turn_at_ms = int(time.time() * 1000)
         self._save_usage_sidecar()
@@ -538,7 +517,7 @@ class SessionTable:
             session_id=open_msg.session_id,
             open_msg=open_msg,
             cwd=open_msg.options.get("cwd"),
-            backend_name=open_msg.backend,
+            backend_name="acp",
             ring=RingBuffer(self.ring_buffer_size),
             started_at_ms=int(time.time() * 1000),
         )

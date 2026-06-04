@@ -1,23 +1,9 @@
-"""JSON Schemas for the `blemees-agent/1` wire protocol.
+"""JSON Schemas for the blemees/3 wire protocol.
 
-Every frame on the wire has a corresponding Draft 2020-12 schema. This
-subpackage ships with the wheel so clients in any environment can
-validate their implementations without copying the JSON out of the
-source tree.
-
-    from blemees_agent.schemas import load
-    hello = load("inbound/agent.hello.json")
-
-    # Full registry with $ref resolution (needs `jsonschema` + `referencing`):
-    from blemees_agent.schemas import iter_schemas
-    from referencing import Registry, Resource
-    reg = Registry().with_resources(
-        (s["$id"], Resource.from_contents(s)) for s in iter_schemas()
-    )
-
-The `files()` helper returns the package as an `importlib.resources`
-`Traversable` if you need direct path access (e.g. for tooling that
-expects on-disk JSON paths via `as_file()`).
+> **blemees/3 migration (#16):** the `blemees-agent/1` (`agent.*`) schemas
+> were removed in the clean break. The `blemees/3` `session.*` schemas are
+> not yet authored — `iter_schemas()` currently yields nothing. Re-authoring
+> them is a tracked follow-up; `protocol.py` is the contract in the interim.
 """
 
 from __future__ import annotations
@@ -55,7 +41,10 @@ def iter_schemas() -> Iterator[dict[str, Any]]:
     """
     root = files()
     for direction in ("inbound", "outbound"):
-        for entry in (root / direction).iterdir():
+        sub = root / direction
+        if not sub.is_dir():
+            continue
+        for entry in sub.iterdir():
             if entry.name.endswith(".json"):
                 yield json.loads(entry.read_text(encoding="utf-8"))
     common = root / "_common.json"

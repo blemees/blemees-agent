@@ -1,10 +1,11 @@
-"""Tests for daemon shutdown behaviour: graceful (§5.9 soft-detach applied
-to every session) vs force-kill when the grace period expires."""
+"""Daemon shutdown behaviour: graceful (in-flight turns run to completion
+within the grace window) vs force-kill when the grace period expires."""
 
 from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import time
 from pathlib import Path
 
@@ -15,17 +16,18 @@ from blemees_agent.config import Config
 from blemees_agent.daemon import Daemon
 from blemees_agent.logging import configure
 
-FAKE_CLAUDE = str(Path(__file__).parent / "fake_claude.py")
+from .conftest import short_socket_path
+
+FAKE_ACP = str(Path(__file__).parent / "fake_acp.py")
 
 pytestmark = pytest.mark.asyncio
 
 
-def _config(tmp_path: Path, *, grace_s: int) -> Config:
-    from tests.blemees_agent.conftest import short_socket_path
-
+def _config(*, grace_s: int) -> Config:
     return Config(
         socket_path=str(short_socket_path("blemeesd-shutdown")),
-        claude_bin=FAKE_CLAUDE,
+        agent_command=sys.executable,
+        agent_args=[FAKE_ACP],
         idle_timeout_s=60,
         max_concurrent_sessions=8,
         shutdown_grace_s=grace_s,
@@ -57,7 +59,7 @@ class _Stream:
             raise ConnectionError("closed")
         return evt
 
-    async def wait_for(self, pred, *, timeout=5.0):
+    async def wait_for(self, pred, *, timeout=10.0):
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         while True:
@@ -80,7 +82,7 @@ class _Stream:
 async def _connect(path: str) -> _Stream:
     r, w = await asyncio.open_unix_connection(path)
     s = _Stream(r, w)
-    await s.send({"type": "agent.hello", "client": "t/0", "protocol": PROTOCOL_VERSION})
+    await s.send({"type": "hello", "client": "t/0", "protocol": PROTOCOL_VERSION})
     await s.recv()
     return s
 
@@ -88,52 +90,31 @@ async def _connect(path: str) -> _Stream:
 async def _start_daemon(cfg: Config) -> tuple[Daemon, asyncio.Task]:
     daemon = Daemon(cfg, configure("error"))
     await daemon.start()
-    task = asyncio.create_task(daemon.serve_forever())
-    return daemon, task
+    return daemon, asyncio.create_task(daemon.serve_forever())
 
 
-# ---------------------------------------------------------------------------
-# Graceful path: subprocess finishes during the grace period.
-# ---------------------------------------------------------------------------
+async def _open(s: _Stream, session_id: str) -> None:
+    await s.send({"type": "session.open", "id": "r1", "session_id": session_id, "options": {}})
+    await s.wait_for(lambda e: e.get("type") == "session.opened")
 
 
-async def test_shutdown_waits_for_in_flight_turn(tmp_path, monkeypatch):
-    monkeypatch.setenv("BLEMEES_FAKE_MODE", "finish")
-    monkeypatch.setenv("BLEMEES_FAKE_FINISH_DELAY_S", "0.4")
-    cfg = _config(tmp_path, grace_s=5)
+async def test_shutdown_waits_for_in_flight_turn():
+    cfg = _config(grace_s=5)
     daemon, task = await _start_daemon(cfg)
     try:
         s = await _connect(cfg.socket_path)
         try:
-            await s.send(
-                {
-                    "type": "agent.open",
-                    "id": "r1",
-                    "session_id": "g",
-                    "backend": "claude",
-                    "options": {"claude": {"tools": ""}},
-                }
-            )
-            await s.wait_for(lambda e: e.get("type") == "agent.opened")
-            await s.send(
-                {
-                    "type": "agent.user",
-                    "session_id": "g",
-                    "message": {"role": "user", "content": "hi"},
-                }
-            )
-            # Turn is now active; wait for first event so we're past spawn.
-            await s.wait_for(lambda e: e.get("type") == "agent.delta")
-
+            await _open(s, "g")
+            await s.send({"type": "session.prompt", "session_id": "g", "prompt": "finish please"})
+            await s.wait_for(lambda e: e.get("type") == "session.update")
             t0 = time.monotonic()
             daemon.request_shutdown()
             await asyncio.wait_for(task, timeout=10.0)
             elapsed = time.monotonic() - t0
         finally:
             await s.close()
-        # The subprocess needed ~0.4 s to emit its result. A clean graceful
-        # shutdown should take at least that long but much less than the
-        # configured 5 s grace budget.
+        # The turn needs ~0.5s to finish; graceful shutdown waits for it but
+        # well under the 5s grace budget.
         assert 0.3 <= elapsed <= 3.0, f"elapsed={elapsed}"
     finally:
         if not task.done():
@@ -141,44 +122,21 @@ async def test_shutdown_waits_for_in_flight_turn(tmp_path, monkeypatch):
             await asyncio.wait_for(task, timeout=5.0)
 
 
-# ---------------------------------------------------------------------------
-# Expiry path: subprocess never finishes; grace expires; force-kill.
-# ---------------------------------------------------------------------------
-
-
-async def test_shutdown_force_kills_when_grace_expires(tmp_path, monkeypatch):
-    monkeypatch.setenv("BLEMEES_FAKE_MODE", "slow")
-    cfg = _config(tmp_path, grace_s=1)
+async def test_shutdown_force_kills_when_grace_expires():
+    cfg = _config(grace_s=1)
     daemon, task = await _start_daemon(cfg)
     try:
         s = await _connect(cfg.socket_path)
         try:
-            await s.send(
-                {
-                    "type": "agent.open",
-                    "id": "r1",
-                    "session_id": "slow",
-                    "backend": "claude",
-                    "options": {"claude": {"tools": ""}},
-                }
-            )
-            await s.wait_for(lambda e: e.get("type") == "agent.opened")
-            await s.send(
-                {
-                    "type": "agent.user",
-                    "session_id": "slow",
-                    "message": {"role": "user", "content": "go"},
-                }
-            )
-            await s.wait_for(lambda e: e.get("type") == "agent.delta")
-
+            await _open(s, "slow")
+            await s.send({"type": "session.prompt", "session_id": "slow", "prompt": "hang please"})
+            await s.wait_for(lambda e: e.get("type") == "session.update")
             t0 = time.monotonic()
             daemon.request_shutdown()
             await asyncio.wait_for(task, timeout=10.0)
             elapsed = time.monotonic() - t0
         finally:
             await s.close()
-        # Grace is 1 s; force-kill phase adds up to ~1 s more.
         assert 0.9 <= elapsed <= 4.0, f"elapsed={elapsed}"
     finally:
         if not task.done():
@@ -186,37 +144,15 @@ async def test_shutdown_force_kills_when_grace_expires(tmp_path, monkeypatch):
             await asyncio.wait_for(task, timeout=5.0)
 
 
-# ---------------------------------------------------------------------------
-# Zero grace: no wait, immediate SIGTERM (legacy v0.1 behaviour).
-# ---------------------------------------------------------------------------
-
-
-async def test_shutdown_grace_zero_kills_immediately(tmp_path, monkeypatch):
-    monkeypatch.setenv("BLEMEES_FAKE_MODE", "slow")
-    cfg = _config(tmp_path, grace_s=0)
+async def test_shutdown_grace_zero_kills_immediately():
+    cfg = _config(grace_s=0)
     daemon, task = await _start_daemon(cfg)
     try:
         s = await _connect(cfg.socket_path)
         try:
-            await s.send(
-                {
-                    "type": "agent.open",
-                    "id": "r1",
-                    "session_id": "z",
-                    "backend": "claude",
-                    "options": {"claude": {"tools": ""}},
-                }
-            )
-            await s.wait_for(lambda e: e.get("type") == "agent.opened")
-            await s.send(
-                {
-                    "type": "agent.user",
-                    "session_id": "z",
-                    "message": {"role": "user", "content": "go"},
-                }
-            )
-            await s.wait_for(lambda e: e.get("type") == "agent.delta")
-
+            await _open(s, "z")
+            await s.send({"type": "session.prompt", "session_id": "z", "prompt": "hang please"})
+            await s.wait_for(lambda e: e.get("type") == "session.update")
             t0 = time.monotonic()
             daemon.request_shutdown()
             await asyncio.wait_for(task, timeout=5.0)
@@ -230,36 +166,19 @@ async def test_shutdown_grace_zero_kills_immediately(tmp_path, monkeypatch):
             await asyncio.wait_for(task, timeout=5.0)
 
 
-# ---------------------------------------------------------------------------
-# Idle sessions (no turn in flight) are torn down immediately even at high grace.
-# ---------------------------------------------------------------------------
-
-
-async def test_shutdown_skips_wait_for_idle_sessions(tmp_path, monkeypatch):
-    monkeypatch.setenv("BLEMEES_FAKE_MODE", "normal")
-    cfg = _config(tmp_path, grace_s=30)
+async def test_shutdown_skips_wait_for_idle_sessions():
+    cfg = _config(grace_s=30)
     daemon, task = await _start_daemon(cfg)
     try:
         s = await _connect(cfg.socket_path)
         try:
-            await s.send(
-                {
-                    "type": "agent.open",
-                    "id": "r1",
-                    "session_id": "idle",
-                    "backend": "claude",
-                    "options": {"claude": {"tools": ""}},
-                }
-            )
-            await s.wait_for(lambda e: e.get("type") == "agent.opened")
-            # No user turn sent; session is idle.
+            await _open(s, "idle")  # no prompt → session idle
             t0 = time.monotonic()
             daemon.request_shutdown()
             await asyncio.wait_for(task, timeout=5.0)
             elapsed = time.monotonic() - t0
         finally:
             await s.close()
-        # With no active turn, the 30 s grace should not apply.
         assert elapsed <= 2.0, f"elapsed={elapsed}"
     finally:
         if not task.done():

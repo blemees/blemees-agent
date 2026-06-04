@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import os
 import signal
 import socket
@@ -21,22 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from . import PROTOCOL_VERSION, __version__
-from .backends.claude import (
-    ClaudeBackend,
-    build_argv as build_claude_argv,
-    detect_version as detect_claude_version,
-    find_session_by_id as find_claude_session_by_id,
-    list_on_disk_sessions as list_claude_session_files,
-    validate_options as validate_claude_options,
-)
-from .backends.codex import (
-    CodexBackend,
-    build_argv as build_codex_argv,
-    detect_version as detect_codex_version,
-    find_session_by_id as find_codex_session_by_id,
-    list_on_disk_sessions as list_codex_session_files,
-    validate_options as validate_codex_options,
-)
+from .backends.acp import AcpBackend
 from .config import Config
 from .errors import (
     DAEMON_SHUTDOWN,
@@ -69,17 +53,17 @@ from .protocol import (
     encode,
     error_frame,
     hello_ack,
+    parse_cancel,
     parse_close,
     parse_hello,
-    parse_interrupt,
     parse_line,
-    parse_list_sessions,
+    parse_list,
     parse_open,
     parse_ping,
+    parse_prompt,
     parse_session_info,
     parse_status,
     parse_unwatch,
-    parse_user,
     parse_watch,
 )
 from .session import SessionTable, make_reaper
@@ -97,15 +81,21 @@ _CONNECTION_QUEUE_SIZE = 1024
 _SHUTDOWN_BUDGET_S = 5.0
 
 
-def detect_backends(config: Config) -> dict[str, str]:
-    """Probe each known backend for a version string. Best-effort."""
+def detect_agents(config: Config) -> dict[str, str]:
+    """Best-effort note of the configured ACP agent binary.
+
+    blemees/3 spawns one ACP agent (``config.agent_command``); profiles
+    (#17) will broaden this. We don't run the binary (agents vary in how
+    ``--version`` behaves); we just record whether it resolves on PATH.
+    """
+    import shutil
+
     out: dict[str, str] = {}
-    cv = detect_claude_version(config.claude_bin)
-    if cv:
-        out["claude"] = cv
-    xv = detect_codex_version(config.codex_bin)
-    if xv:
-        out["codex"] = xv
+    resolved = shutil.which(config.agent_command) or (
+        config.agent_command if Path(config.agent_command).exists() else None
+    )
+    if resolved:
+        out[Path(config.agent_command).name] = "available"
     return out
 
 
@@ -132,7 +122,7 @@ class Connection:
         config: Config,
         sessions: SessionTable,
         logger: StructuredLogger,
-        backends: dict[str, str],
+        agents: dict[str, str],
         shutdown_event: asyncio.Event,
         lookup_connection: Callable[[int], Connection | None] | None = None,
         status_snapshot: Callable[[], dict[str, Any]] | None = None,
@@ -142,7 +132,7 @@ class Connection:
         self._writer = writer
         self._config = config
         self._sessions = sessions
-        self._backends = backends
+        self._agents = agents
         self._shutdown = shutdown_event
         self._lookup_connection = lookup_connection
         self._status_snapshot = status_snapshot
@@ -209,8 +199,8 @@ class Connection:
             return False
         try:
             obj = parse_line(raw, max_bytes=self._config.max_line_bytes)
-            if obj.get("type") != "agent.hello":
-                raise ProtocolError("first frame must be agent.hello")
+            if obj.get("type") != "hello":
+                raise ProtocolError("first frame must be hello")
             hello = parse_hello(obj)
         except OversizeMessageError as exc:
             await self._send_error_sync(OVERSIZE_MESSAGE, exc.message)
@@ -228,7 +218,7 @@ class Connection:
             hello_ack(
                 daemon_version=__version__,
                 pid=os.getpid(),
-                backends=self._backends,
+                agents=self._agents,
             )
         )
         self._log.info("connection.hello", client=hello.client)
@@ -273,27 +263,27 @@ class Connection:
             )
             return
         try:
-            if msg_type == "agent.open":
+            if msg_type == "session.open":
                 await self._handle_open(parse_open(obj))
-            elif msg_type == "agent.user":
-                await self._handle_user(parse_user(obj))
-            elif msg_type == "agent.interrupt":
-                await self._handle_interrupt(parse_interrupt(obj))
-            elif msg_type == "agent.close":
+            elif msg_type == "session.prompt":
+                await self._handle_prompt(parse_prompt(obj))
+            elif msg_type == "session.cancel":
+                await self._handle_cancel(parse_cancel(obj))
+            elif msg_type == "session.close":
                 await self._handle_close(parse_close(obj))
-            elif msg_type == "agent.list_sessions":
-                await self._handle_list_sessions(parse_list_sessions(obj))
-            elif msg_type == "agent.ping":
+            elif msg_type == "session.list":
+                await self._handle_list(parse_list(obj))
+            elif msg_type == "ping":
                 await self._handle_ping(parse_ping(obj))
-            elif msg_type == "agent.status":
+            elif msg_type == "status":
                 await self._handle_status(parse_status(obj))
-            elif msg_type == "agent.watch":
+            elif msg_type == "session.watch":
                 await self._handle_watch(parse_watch(obj))
-            elif msg_type == "agent.unwatch":
+            elif msg_type == "session.unwatch":
                 await self._handle_unwatch(parse_unwatch(obj))
-            elif msg_type == "agent.session_info":
+            elif msg_type == "session.info":
                 await self._handle_session_info(parse_session_info(obj))
-            elif msg_type == "agent.hello":
+            elif msg_type == "hello":
                 await self._emit_error(INVALID_MESSAGE, "duplicate hello", id=obj.get("id"))
             else:
                 await self._emit_error(
@@ -319,60 +309,23 @@ class Connection:
     # Handlers
     # ------------------------------------------------------------------
 
-    def _make_backend(
-        self,
-        msg: OpenMessage,
-        *,
-        on_event,
-        for_resume: bool,
-        thread_id: str | None = None,
-    ):
-        """Construct a per-session AgentBackend from the open message.
+    def _make_backend(self, msg: OpenMessage, *, on_event):
+        """Construct the per-session ACP backend from the open message.
 
-        Validates the per-backend options block (refusing unsafe flags
-        and daemon-owned keys) and assembles the spawn-time argv.
-        ``thread_id`` is the cached Codex ``threadId`` (from a prior
-        ``session_configured`` event) — used so a respawn after resume
-        or interrupt routes the first ``tools/call`` through
-        ``codex-reply`` instead of starting a new thread.
+        blemees/3 (#16) drives one configured ACP agent binary. Profiles
+        (#17) will supply per-session command/args/model and resume
+        (#23) will reuse the agent's ``session/load``.
         """
-        if msg.backend == "claude":
-            validate_claude_options(msg.options)
-            argv = build_claude_argv(
-                self._config.claude_bin,
-                session_id=msg.session_id,
-                options=msg.options,
-                for_resume=for_resume,
-            )
-            return ClaudeBackend(
-                session_id=msg.session_id,
-                argv=argv,
-                cwd=msg.options.get("cwd"),
-                options=msg.options,
-                on_event=on_event,
-                logger=self._log,
-                stderr_rate_lines=self._config.stderr_rate_lines,
-                stderr_rate_window_s=self._config.stderr_rate_window_s,
-                include_raw_events=bool(msg.options.get("include_raw_events", False)),
-                alias=msg.alias,
-            )
-        if msg.backend == "codex":
-            validate_codex_options(msg.options)
-            argv = build_codex_argv(self._config.codex_bin, options=msg.options)
-            return CodexBackend(
-                session_id=msg.session_id,
-                argv=argv,
-                cwd=msg.options.get("cwd"),
-                options=msg.options,
-                on_event=on_event,
-                logger=self._log,
-                stderr_rate_lines=self._config.stderr_rate_lines,
-                stderr_rate_window_s=self._config.stderr_rate_window_s,
-                include_raw_events=bool(msg.options.get("include_raw_events", False)),
-                thread_id=thread_id,
-                alias=msg.alias,
-            )
-        raise UnknownBackendError(msg.backend)
+        return AcpBackend(
+            session_id=msg.session_id,
+            command=self._config.agent_command,
+            args=list(self._config.agent_args),
+            cwd=msg.options.get("cwd"),
+            on_event=on_event,
+            logger=self._log,
+            model=msg.options.get("model"),
+            alias=msg.alias,
+        )
 
     async def _handle_open(self, msg: OpenMessage) -> None:
         existing = self._sessions.try_get(msg.session_id)
@@ -405,12 +358,7 @@ class Connection:
         # events the child emits before we attach buffer into the session's
         # ring and get delivered below.
         if sess.backend is None or not sess.backend.running:
-            backend = self._make_backend(
-                msg,
-                on_event=sess.on_event,
-                for_resume=msg.resume,
-                thread_id=sess.native_session_id,
-            )
+            backend = self._make_backend(msg, on_event=sess.on_event)
             try:
                 await backend.spawn()
             except SpawnFailedError as exc:
@@ -420,27 +368,26 @@ class Connection:
                 )
                 return
             sess.backend = backend
+            # Surface what the ACP agent reported at new_session: its own
+            # session id and whether it supports session/load (#23).
+            sess.native_session_id = getattr(backend, "native_session_id", None)
+            if getattr(backend, "model", None):
+                sess.last_model = backend.model
+            sess.extra["load_session"] = bool(getattr(backend, "load_session", False))
 
         self._owned_sessions.add(msg.session_id)
 
         # Send ack before the event stream so clients can match the reply
         # before they start consuming (possibly replayed) frames.
-        #
-        # ``native_session_id`` is present *only when it differs from*
-        # ``session_id`` — its absence is the signal "the daemon's
-        # session id is also the backend's id, use it directly". For
-        # Claude the two are always equal (CC's ``--session-id``
-        # accepts our value verbatim) so we never emit it. For Codex
-        # we emit it once the threadId has been observed (after the
-        # first turn produces ``session_configured``, or on resume
-        # where the threadId is cached on the Session).
+        # ``native_session_id`` is the agent's own session id; included only
+        # when it differs from the daemon's session id.
         opened_frame: dict[str, Any] = {
-            "type": "agent.opened",
+            "type": "session.opened",
             "id": msg.id,
             "session_id": msg.session_id,
-            "backend": msg.backend,
             "subprocess_pid": sess.backend.pid,
             "last_seq": sess.seq,
+            "view_only": False,
         }
         if sess.native_session_id and sess.native_session_id != msg.session_id:
             opened_frame["native_session_id"] = sess.native_session_id
@@ -457,29 +404,23 @@ class Connection:
         self._log.info(
             "session.open",
             session_id=msg.session_id,
-            backend=msg.backend,
             resume=msg.resume,
             replayed=replay.get("replayed", 0),
             model=msg.options.get("model"),
         )
 
-    async def _handle_user(self, msg) -> None:
-        # Per spec §5.14, ``agent.user`` is connection-scoped — only the
-        # owning connection (the one that opened or took over the session)
-        # can drive turns. A non-owner sees the session as unknown.
+    async def _handle_prompt(self, msg) -> None:
+        # session.prompt is connection-scoped — only the owning connection
+        # (the one that opened or took over the session) can drive turns.
+        # A non-owner sees the session as unknown.
         if msg.session_id not in self._owned_sessions:
             from .errors import SessionUnknownError
 
             raise SessionUnknownError(msg.session_id)
         sess = self._sessions.get(msg.session_id)
         if sess.backend is None or not sess.backend.running:
-            # Respawn transparently (spec §9.1).
-            backend = self._make_backend(
-                sess.open_msg,
-                on_event=sess.on_event,
-                for_resume=True,
-                thread_id=sess.native_session_id,
-            )
+            # Respawn transparently.
+            backend = self._make_backend(sess.open_msg, on_event=sess.on_event)
             try:
                 await backend.spawn()
             except SpawnFailedError as exc:
@@ -504,148 +445,52 @@ class Connection:
             # Only the first call sets a value; subsequent turns no-op.
             sess.record_user_message(msg.message)
 
-    async def _handle_interrupt(self, msg) -> None:
-        # Per spec §5.14, ``agent.interrupt`` is connection-scoped to
-        # the owner. A non-owner gets the same ``was_idle:true`` reply
-        # the daemon would emit for an unknown session — they don't see
-        # whether the session actually exists somewhere else.
+    async def _handle_cancel(self, msg) -> None:
+        # session.cancel is connection-scoped to the owner. A non-owner gets
+        # the same ``was_idle:true`` reply the daemon emits for an unknown
+        # session — they don't learn whether it exists elsewhere.
         if msg.session_id not in self._owned_sessions:
             await self._emit_frame(
-                {
-                    "type": "agent.interrupted",
-                    "session_id": msg.session_id,
-                    "was_idle": True,
-                }
+                {"type": "session.cancelled", "session_id": msg.session_id, "was_idle": True}
             )
             return
         sess = self._sessions.try_get(msg.session_id)
         if sess is None or sess.backend is None:
             await self._emit_frame(
-                {
-                    "type": "agent.interrupted",
-                    "session_id": msg.session_id,
-                    "was_idle": True,
-                }
+                {"type": "session.cancelled", "session_id": msg.session_id, "was_idle": True}
             )
             return
-        self._log.info("session.interrupt", session_id=msg.session_id)
+        self._log.info("session.cancel", session_id=msg.session_id)
         did_kill = await sess.backend.interrupt()
         await self._emit_frame(
-            {
-                "type": "agent.interrupted",
-                "session_id": msg.session_id,
-                "was_idle": not did_kill,
-            }
+            {"type": "session.cancelled", "session_id": msg.session_id, "was_idle": not did_kill}
         )
 
-    async def _handle_list_sessions(self, msg) -> None:
-        """Enumerate sessions with composable, independent filters.
+    async def _handle_list(self, msg) -> None:
+        """Enumerate live sessions known to the daemon (optionally by cwd).
 
-        ``cwd`` and ``live`` are filters; absence means "no filter on
-        that axis" — see ``parse_list_sessions`` for the contract.
-
-        * ``include_disk = msg.live is not True`` — when ``live`` is
-          unset or ``False``, walk the on-disk transcripts. Cwd
-          filtering is delegated to the backend helpers; ``cwd=None``
-          there means "every project."
-        * ``include_live = msg.live is not False`` — when ``live`` is
-          unset or ``True``, walk the in-memory ``SessionTable``. Cwd
-          filtering uses ``iter_by_cwd``.
-        * When ``msg.live is False`` the disk pass runs but the live
-          overlay is suppressed; we additionally subtract any
-          ``(backend, session_id)`` keys that *are* currently live, so
-          a session with both an in-memory record and a disk transcript
-          isn't surfaced as "cold."
-
-        Live rows always carry the richer fields (``title``, ``model``,
-        ``started_at_ms``, ``last_active_at_ms``, ``owner_pid``,
-        ``last_seq``, ``turn_active``); disk-only rows keep
-        ``mtime_ms`` / ``size`` / ``preview`` (and, for ``cwd=None``
-        scans, ``cwd`` and ``model`` extracted from the transcript).
+        blemees/3 (#16) lists only sessions currently in the daemon's
+        ``SessionTable``. On-disk / cross-restart discovery moves to the
+        persistent registry in #21 (the daemon no longer scans agent-owned
+        transcript directories).
         """
-        include_disk = msg.live is not True
-        include_live = msg.live is not False
-
-        merged: dict[tuple[str, str], dict] = {}
-
-        if include_disk:
-            for row in list_claude_session_files(msg.cwd):
-                key = ("claude", row["session_id"])
-                merged[key] = {**row, "backend": "claude", "attached": False}
-            for row in list_codex_session_files(msg.cwd):
-                key = ("codex", row["session_id"])
-                merged[key] = {**row, "backend": "codex", "attached": False}
-
-        if include_live:
-            # cwd filter: per-cwd uses iter_by_cwd; absent uses all.
-            if msg.cwd is not None:
-                live_iter = self._sessions.iter_by_cwd(msg.cwd)
-            else:
-                live_iter = list(self._sessions._sessions.values())
-
-            for sess in live_iter:
-                # For codex, on-disk row is keyed by threadId; in-memory by
-                # the daemon's session_id (== threadId only after resume from
-                # a prior list_sessions row). Match on whichever id we know.
-                candidate_keys: list[tuple[str, str]] = [(sess.backend_name, sess.session_id)]
-                if sess.backend_name == "codex" and sess.native_session_id:
-                    candidate_keys.append(("codex", sess.native_session_id))
-                existing_key: tuple[str, str] | None = None
-                for k in candidate_keys:
-                    if k in merged:
-                        existing_key = k
-                        break
-                rec = merged.get(existing_key) if existing_key else None
-
-                owner_pid: int | None = None
-                if sess.connection_id is not None and self._lookup_connection is not None:
-                    owner = self._lookup_connection(sess.connection_id)
-                    if owner is not None:
-                        owner_pid = owner._peer_pid
-                live = sess.live_summary(owner_pid=owner_pid)
-
-                if rec is None:
-                    rec = live
-                else:
-                    # Disk-derived fields stay; live fields overlay on top.
-                    rec.update(live)
-                merged[existing_key or (sess.backend_name, sess.session_id)] = rec
-        elif include_disk:
-            # ``live=False``: a session that's currently in memory is
-            # "live", not "on-disk-only" — even if its transcript is on
-            # disk. Subtract live keys from disk rows so the result is
-            # truly the cold-only set.
-            live_keys: set[tuple[str, str]] = set()
-            sess_iter = (
-                self._sessions.iter_by_cwd(msg.cwd)
-                if msg.cwd is not None
-                else list(self._sessions._sessions.values())
-            )
-            for sess in sess_iter:
-                live_keys.add((sess.backend_name, sess.session_id))
-                if sess.backend_name == "codex" and sess.native_session_id:
-                    live_keys.add(("codex", sess.native_session_id))
-            for key in live_keys:
-                merged.pop(key, None)
-
-        # Prefer last_active_at_ms (precise daemon-side) over mtime_ms
-        # (disk lag) for sort. Disk-only rows fall back to mtime_ms.
-        sessions = sorted(
-            merged.values(),
-            key=lambda r: r.get("last_active_at_ms") or r.get("mtime_ms") or 0,
-            reverse=True,
+        live_iter = (
+            self._sessions.iter_by_cwd(msg.cwd)
+            if msg.cwd is not None
+            else list(self._sessions._sessions.values())
         )
-        self._log.info(
-            "session.list",
-            cwd=msg.cwd,
-            live=msg.live,
-            count=len(sessions),
-        )
-        reply: dict[str, Any] = {
-            "type": "agent.sessions",
-            "id": msg.id,
-            "sessions": sessions,
-        }
+        rows: list[dict[str, Any]] = []
+        for sess in live_iter:
+            owner_pid: int | None = None
+            if sess.connection_id is not None and self._lookup_connection is not None:
+                owner = self._lookup_connection(sess.connection_id)
+                if owner is not None:
+                    owner_pid = owner._peer_pid
+            rows.append(sess.live_summary(owner_pid=owner_pid))
+
+        rows.sort(key=lambda r: r.get("last_active_at_ms") or 0, reverse=True)
+        self._log.info("session.list", cwd=msg.cwd, count=len(rows))
+        reply: dict[str, Any] = {"type": "sessions", "id": msg.id, "sessions": rows}
         if msg.cwd is not None:
             reply["cwd"] = msg.cwd
         await self._emit_frame(reply)
@@ -657,7 +502,7 @@ class Connection:
         # it exists elsewhere, and they can't kill someone else's session.
         if msg.session_id not in self._owned_sessions:
             await self._emit_frame(
-                {"type": "agent.closed", "id": msg.id, "session_id": msg.session_id}
+                {"type": "session.closed", "id": msg.id, "session_id": msg.session_id}
             )
             return
         self._log.info("session.close", session_id=msg.session_id, delete=msg.delete)
@@ -671,13 +516,15 @@ class Connection:
         if sess is not None:
             await sess.broadcast_to_watchers(
                 {
-                    "type": "agent.session_closed",
+                    "type": "session.closed_notice",
                     "session_id": msg.session_id,
                     "reason": "owner_closed",
                 }
             )
         await self._sessions.remove(msg.session_id, delete_file=msg.delete)
-        await self._emit_frame({"type": "agent.closed", "id": msg.id, "session_id": msg.session_id})
+        await self._emit_frame(
+            {"type": "session.closed", "id": msg.id, "session_id": msg.session_id}
+        )
 
     async def _handle_ping(self, msg: PingMessage) -> None:
         """Liveness check: reply with ``agent.pong`` carrying the client's id.
@@ -685,7 +532,7 @@ class Connection:
         A ``data`` field on the ping is echoed back so clients can round-trip a
         correlation token without relying solely on ``id``.
         """
-        frame: dict[str, Any] = {"type": "agent.pong", "id": msg.id}
+        frame: dict[str, Any] = {"type": "pong", "id": msg.id}
         if msg.data is not _MISSING:
             frame["data"] = msg.data
         await self._emit_frame(frame)
@@ -699,7 +546,7 @@ class Connection:
         total connection count, daemon uptime).
         """
         snap: dict[str, Any] = self._status_snapshot() if self._status_snapshot is not None else {}
-        frame = {"type": "agent.status_reply", "id": msg.id, **snap}
+        frame = {"type": "status_reply", "id": msg.id, **snap}
         await self._emit_frame(frame)
 
     async def _handle_watch(self, msg) -> None:
@@ -715,7 +562,7 @@ class Connection:
             return
         await self._emit_frame(
             {
-                "type": "agent.watching",
+                "type": "session.watching",
                 "id": msg.id,
                 "session_id": msg.session_id,
                 "last_seq": sess.seq,
@@ -740,7 +587,7 @@ class Connection:
         self._watched_sessions.discard(msg.session_id)
         await self._emit_frame(
             {
-                "type": "agent.unwatched",
+                "type": "session.unwatched",
                 "id": msg.id,
                 "session_id": msg.session_id,
                 "was_watching": removed,
@@ -748,33 +595,14 @@ class Connection:
         )
 
     async def _handle_session_info(self, msg) -> None:
-        """Reply with the session's cumulative usage + per-turn snapshot.
+        """Reply with the session's metadata + per-turn snapshot.
 
-        No side effects. For sessions live in memory, returns the
-        in-memory accumulator. For sessions that exist only on disk
-        (closed sessions, sessions from a previous daemon run, sessions
-        listed via ``list_sessions`` but not yet reattached), walks the
-        on-disk transcripts and merges in the durable usage sidecar
-        when it's available — usage counters are zero in that case
-        unless the sidecar is present, but at least ``backend`` /
-        ``cwd`` / ``model`` are populated so the client can decide
-        what to do with the row.
+        blemees/3 (#16) serves only sessions live in the daemon. On-disk /
+        cross-restart info moves to the persistent registry in #21. Token
+        usage is optional — present only when the ACP agent reported it.
         """
         sess = self._sessions.try_get(msg.session_id)
-        if sess is not None:
-            subproc_running = sess.backend is not None and sess.backend.running
-            snap = sess.usage_snapshot(
-                attached=sess.connection_id is not None,
-                subprocess_running=subproc_running,
-            )
-            frame: dict[str, Any] = {"type": "agent.session_info_reply", "id": msg.id}
-            frame.update(snap)
-            await self._emit_frame(frame)
-            return
-
-        # Not in memory — try the on-disk transcripts + durable sidecar.
-        snap = self._session_info_from_disk(msg.session_id)
-        if snap is None:
+        if sess is None:
             await self._emit_error(
                 SESSION_UNKNOWN,
                 f"no such session: {msg.session_id}",
@@ -782,101 +610,14 @@ class Connection:
                 session_id=msg.session_id,
             )
             return
-        frame = {"type": "agent.session_info_reply", "id": msg.id}
+        subproc_running = sess.backend is not None and sess.backend.running
+        snap = sess.usage_snapshot(
+            attached=sess.connection_id is not None,
+            subprocess_running=subproc_running,
+        )
+        frame: dict[str, Any] = {"type": "session.info_reply", "id": msg.id}
         frame.update(snap)
         await self._emit_frame(frame)
-
-    def _session_info_from_disk(self, session_id: str) -> dict[str, Any] | None:
-        """Build a session_info snapshot from on-disk artefacts only.
-
-        Tries Claude project transcripts first (cheap glob), then Codex
-        rollouts (date-bucketed scan, capped). Independently merges in
-        the durable usage sidecar at ``<event_log_dir>/<session>.usage.json``
-        when present — that's the only place persistent usage counters
-        live. Returns ``None`` when nothing on disk matches.
-        """
-        match = find_claude_session_by_id(session_id) or find_codex_session_by_id(session_id)
-        sidecar = self._load_usage_sidecar(session_id)
-        if match is None and sidecar is None:
-            return None
-
-        out: dict[str, Any] = {
-            "session_id": session_id,
-            "turns": 0,
-            "last_turn_at_ms": None,
-            "last_turn_usage": {},
-            "cumulative_usage": {},
-            "context_tokens": 0,
-            "attached": False,
-            "subprocess_running": False,
-            "last_seq": 0,
-        }
-
-        if match is not None:
-            out["backend"] = match["backend"]
-            out["native_session_id"] = match.get("native_session_id", session_id)
-            if "cwd" in match:
-                out["cwd"] = match["cwd"]
-            if "model" in match:
-                out["model"] = match["model"]
-            mtime = match.get("mtime_ms")
-            if isinstance(mtime, int):
-                out["last_turn_at_ms"] = mtime
-
-        if sidecar is not None:
-            if isinstance(sidecar.get("model"), str) and "model" not in out:
-                out["model"] = sidecar["model"]
-            if isinstance(sidecar.get("turns"), int):
-                out["turns"] = sidecar["turns"]
-            if isinstance(sidecar.get("last_turn_at_ms"), int):
-                out["last_turn_at_ms"] = sidecar["last_turn_at_ms"]
-            if isinstance(sidecar.get("last_turn_usage"), dict):
-                out["last_turn_usage"] = {
-                    k: v for k, v in sidecar["last_turn_usage"].items() if isinstance(v, int)
-                }
-            if isinstance(sidecar.get("cumulative_usage"), dict):
-                out["cumulative_usage"] = {
-                    k: v for k, v in sidecar["cumulative_usage"].items() if isinstance(v, int)
-                }
-            if isinstance(sidecar.get("native_session_id"), str):
-                out["native_session_id"] = sidecar["native_session_id"]
-            # If we never found an on-disk transcript but the sidecar's
-            # rollout_path points at a codex rollout, that's enough to
-            # tag the backend.
-            if "backend" not in out:
-                rp = sidecar.get("rollout_path")
-                if isinstance(rp, str) and "/.codex/" in rp:
-                    out["backend"] = "codex"
-                else:
-                    out["backend"] = "claude"
-                out["native_session_id"] = out.get("native_session_id", session_id)
-
-        # Recompute context_tokens from whatever last_turn_usage we ended up with.
-        last = out["last_turn_usage"]
-        out["context_tokens"] = (
-            int(last.get("input_tokens", 0) or 0)
-            + int(last.get("cache_read_input_tokens", 0) or 0)
-            + int(last.get("cache_creation_input_tokens", 0) or 0)
-        )
-        return out
-
-    def _load_usage_sidecar(self, session_id: str) -> dict[str, Any] | None:
-        """Read ``<event_log_dir>/<session>.usage.json`` if enabled.
-
-        Returns the parsed payload or ``None`` (no event log configured,
-        sidecar missing, or unreadable / malformed JSON).
-        """
-        log_dir = self._config.event_log_dir
-        if not log_dir:
-            return None
-        path = Path(log_dir) / f"{session_id}.usage.json"
-        if not path.is_file():
-            return None
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return None
-        return data if isinstance(data, dict) else None
 
     # ------------------------------------------------------------------
     # Writer side
@@ -1001,7 +742,7 @@ class Connection:
         fight the new owner over it. Events stop flowing here immediately.
         """
         self._owned_sessions.discard(session_id)
-        frame: dict[str, Any] = {"type": "agent.session_taken", "session_id": session_id}
+        frame: dict[str, Any] = {"type": "session.taken", "session_id": session_id}
         if by_peer_pid is not None:
             frame["by_peer_pid"] = by_peer_pid
         await self._emit_frame(frame)
@@ -1027,11 +768,11 @@ class Daemon:
         self._connections: set[Connection] = set()
         self._shutdown_event = asyncio.Event()
         self._reaper_task: asyncio.Task | None = None
-        self._backends: dict[str, str] = {}
+        self._agents: dict[str, str] = {}
         self._start_time: float = time.monotonic()
 
     async def start(self) -> None:
-        self._backends = detect_backends(self._config)
+        self._agents = detect_agents(self._config)
         _prepare_socket_path(self._config.socket_path, self._log)
 
         self._server = await asyncio.start_unix_server(
@@ -1044,7 +785,7 @@ class Daemon:
             "daemon.start",
             socket=self._config.socket_path,
             pid=os.getpid(),
-            backends=self._backends,
+            agents=self._agents,
             version=__version__,
         )
 
@@ -1055,7 +796,7 @@ class Daemon:
             config=self._config,
             sessions=self._sessions,
             logger=self._log,
-            backends=self._backends,
+            agents=self._agents,
             shutdown_event=self._shutdown_event,
             lookup_connection=self._lookup_connection,
             status_snapshot=self._status_snapshot,
@@ -1088,7 +829,7 @@ class Daemon:
             "pid": os.getpid(),
             "uptime_s": round(now - self._start_time, 3),
             "socket_path": self._config.socket_path,
-            "backends": dict(self._backends),
+            "agents": dict(self._agents),
             "connections": len(self._connections),
             "sessions": {
                 "total": total,

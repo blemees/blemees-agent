@@ -22,7 +22,7 @@ Usage:
 At the REPL:
 
     blemees-agentctl> help
-    blemees-agentctl> open new backend=claude model=sonnet permission_mode=bypassPermissions
+    blemees-agentctl> open new cwd=/home/u/proj model=sonnet
     blemees-agentctl> send <id> hello there
     blemees-agentctl> interrupt <id>
     blemees-agentctl> close <id> --delete
@@ -58,31 +58,29 @@ Commands — each sends one wire frame, responses are printed as they arrive:
                                $BLEMEES_AGENTD_SOCKET / XDG / /tmp fallback)
   disconnect                   Close the socket
 
-  hello                        (Re)send agent.hello
-  ping                         agent.ping  (expect agent.pong)
-  status                       agent.status
-  sessions <cwd>               agent.list_sessions cwd=<cwd>
-  session-info <id>            agent.session_info session_id=<id>
+  hello                        (Re)send hello
+  ping                         ping  (expect pong)
+  status                       status
+  sessions [cwd]               session.list (optional cwd filter)
+  session-info <id>            session.info session_id=<id>
 
-  open <id|new> [k=v ...]      agent.open session_id=<id> …
-                               id 'new' generates a uuid
-                               backend=<name> picks the agent (claude|codex);
-                               default claude. All other k=v go under
-                               options.<backend>.* (use options.foo=bar to be
-                               explicit). Values coerce true/false/int/json.
+  open <id|new> [k=v ...]      session.open session_id=<id> …
+                               id 'new' generates a uuid. k=v pairs become
+                               options.* (e.g. cwd=/proj model=sonnet).
+                               Values coerce true/false/int/json.
   resume <id> [k=v ...]        open with resume=true (shortcut)
-  close <id> [--delete]        agent.close session_id=<id> delete=…
-  interrupt <id>               agent.interrupt session_id=<id>
+  close <id> [--delete]        session.close session_id=<id> delete=…
+  interrupt <id>               session.cancel session_id=<id>
 
-  watch <id> [last_seen_seq=N] agent.watch (observer mode)
-  unwatch <id>                 agent.unwatch
+  watch <id> [last_seen_seq=N] session.watch (observer mode)
+  unwatch <id>                 session.unwatch
 
-  send <id> <text...>          agent.user with message={role,user,content:text}
-  send-json <id> <json>        agent.user with message=<json>
+  send <id> <text...>          session.prompt with prompt=<text>
+  send-json <id> <json>        session.prompt with prompt=<json content blocks>
   raw <json>                   send an arbitrary frame
 
   pretty on|off                pretty-print inbound JSON (default off)
-  quiet on|off                 suppress agent.delta spam (default off)
+  quiet on|off                 suppress session.update spam (default off)
 
   help                         this
   quit | exit | .q             leave the REPL
@@ -202,7 +200,7 @@ class Harness:
                 except json.JSONDecodeError:
                     await self._print_note(f"non-JSON line from daemon: {raw!r}")
                     continue
-                if self.quiet and evt.get("type") == "agent.delta":
+                if self.quiet and evt.get("type") == "session.update":
                     continue
                 await self._print_frame("in", evt)
         except asyncio.CancelledError:
@@ -241,39 +239,37 @@ class Harness:
     async def hello(self) -> None:
         await self._send(
             {
-                "type": "agent.hello",
+                "type": "hello",
                 "client": f"blemees-agentctl/{__version__}",
                 "protocol": PROTOCOL_VERSION,
             }
         )
 
     async def ping(self) -> None:
-        await self._send({"type": "agent.ping", "id": _req_id()})
+        await self._send({"type": "ping", "id": _req_id()})
 
     async def status(self) -> None:
-        await self._send({"type": "agent.status", "id": _req_id()})
+        await self._send({"type": "status", "id": _req_id()})
 
     async def list_sessions(self, cwd: str) -> None:
-        await self._send({"type": "agent.list_sessions", "id": _req_id(), "cwd": cwd})
+        await self._send({"type": "session.list", "id": _req_id(), "cwd": cwd})
 
     async def session_info(self, session_id: str) -> None:
-        await self._send({"type": "agent.session_info", "id": _req_id(), "session_id": session_id})
+        await self._send({"type": "session.info", "id": _req_id(), "session_id": session_id})
 
     async def open(self, session_id: str, fields: dict[str, Any]) -> str:
         if session_id == "new":
             session_id = str(uuid.uuid4())
-        # Pull the well-known top-level keys; anything else goes under
-        # options.<backend>.*. Lets you write `open new backend=claude
-        # model=sonnet` instead of having to spell out the nesting.
-        backend = fields.pop("backend", "claude")
+        # blemees/3: a session opens against the daemon's configured ACP
+        # agent. Well-known keys are pulled out; the rest become `options`
+        # (e.g. `open new cwd=/proj model=sonnet`).
         resume = fields.pop("resume", False)
         last_seen_seq = fields.pop("last_seen_seq", None)
         frame: dict[str, Any] = {
-            "type": "agent.open",
+            "type": "session.open",
             "id": _req_id(),
             "session_id": session_id,
-            "backend": backend,
-            "options": {backend: fields},
+            "options": fields,
         }
         if resume:
             frame["resume"] = True
@@ -283,14 +279,14 @@ class Harness:
         return session_id
 
     async def close_session(self, session_id: str, delete: bool) -> None:
-        await self._send({"type": "agent.close", "session_id": session_id, "delete": delete})
+        await self._send({"type": "session.close", "session_id": session_id, "delete": delete})
 
     async def interrupt(self, session_id: str) -> None:
-        await self._send({"type": "agent.interrupt", "session_id": session_id})
+        await self._send({"type": "session.cancel", "session_id": session_id})
 
     async def watch(self, session_id: str, fields: dict[str, Any]) -> None:
         frame: dict[str, Any] = {
-            "type": "agent.watch",
+            "type": "session.watch",
             "id": _req_id(),
             "session_id": session_id,
         }
@@ -298,20 +294,17 @@ class Harness:
         await self._send(frame)
 
     async def unwatch(self, session_id: str) -> None:
-        await self._send({"type": "agent.unwatch", "id": _req_id(), "session_id": session_id})
+        await self._send({"type": "session.unwatch", "id": _req_id(), "session_id": session_id})
 
     async def send_user(self, session_id: str, text: str) -> None:
-        await self._send(
-            {
-                "type": "agent.user",
-                "session_id": session_id,
-                "message": {"role": "user", "content": text},
-            }
-        )
+        await self._send({"type": "session.prompt", "session_id": session_id, "prompt": text})
 
-    async def send_user_raw(self, session_id: str, message_json: str) -> None:
-        msg = json.loads(message_json)
-        await self._send({"type": "agent.user", "session_id": session_id, "message": msg})
+    async def send_user_raw(self, session_id: str, prompt_json: str) -> None:
+        # blemees/3 session.prompt carries `prompt` (a string or ACP content
+        # block array) directly.
+        await self._send(
+            {"type": "session.prompt", "session_id": session_id, "prompt": json.loads(prompt_json)}
+        )
 
     async def raw(self, payload: str) -> None:
         frame = json.loads(payload)

@@ -5,12 +5,11 @@ Usage::
     async with BlemeesClient.connect() as c:
         async with c.open_session(
             session_id="s1",
-            backend="claude",
-            options={"model": "sonnet", "tools": ""},
+            options={"model": "sonnet", "cwd": "/proj"},
         ) as s:
             await s.send_user("hi")
             async for evt in s.events():
-                if evt.get("type") == "agent.result":
+                if evt.get("type") == "session.result":
                     break
 """
 
@@ -56,30 +55,27 @@ class Session:
         text: str | None = None,
         *,
         content: list | None = None,
-        message: dict | None = None,
     ) -> None:
         """Send a user turn.
 
-        Pass ``message={"role":"user","content":...}`` for the raw wire
-        shape. For convenience, ``text="..."`` or ``content=[...]`` will
-        be wrapped into that shape before sending.
+        blemees/3 ``session.prompt`` carries ``prompt`` directly — a string
+        or an array of ACP content blocks. Pass ``text="..."`` or
+        ``content=[...]``.
         """
-        if message is None:
-            payload: object = content if content is not None else (text or "")
-            message = {"role": "user", "content": payload}
+        prompt: object = content if content is not None else (text or "")
         await self._client._send(
-            {"type": "agent.user", "session_id": self.session_id, "message": message}
+            {"type": "session.prompt", "session_id": self.session_id, "prompt": prompt}
         )
 
     async def interrupt(self) -> None:
-        await self._client._send({"type": "agent.interrupt", "session_id": self.session_id})
+        await self._client._send({"type": "session.cancel", "session_id": self.session_id})
 
     async def close(self, *, delete: bool = False) -> None:
         if self._closed:
             return
         self._closed = True
         await self._client._send(
-            {"type": "agent.close", "session_id": self.session_id, "delete": delete}
+            {"type": "session.close", "session_id": self.session_id, "delete": delete}
         )
 
     async def events(self) -> AsyncIterator[dict[str, Any]]:
@@ -117,13 +113,13 @@ class BlemeesClient:
         client = cls(reader, writer)
         await client._send(
             {
-                "type": "agent.hello",
+                "type": "hello",
                 "client": "blemees-reference/0.1",
                 "protocol": PROTOCOL_VERSION,
             }
         )
         ack = await client._read_one()
-        if ack.get("type") != "agent.hello_ack":
+        if ack.get("type") != "hello_ack":
             raise BlemeesClientError(ack.get("code", "protocol"), ack.get("message", str(ack)))
         client.daemon_info = ack
         client._reader_task = asyncio.create_task(client._reader_loop())
@@ -146,9 +142,9 @@ class BlemeesClient:
         req_id = f"req_{self._next_req}"
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending[req_id] = fut
-        await self._send({"type": "agent.list_sessions", "id": req_id, "cwd": cwd})
+        await self._send({"type": "session.list", "id": req_id, "cwd": cwd})
         reply = await fut
-        if reply.get("type") == "agent.error":
+        if reply.get("type") == "error":
             raise BlemeesClientError(reply.get("code", ""), reply.get("message", ""))
         return list(reply.get("sessions", []))
 
@@ -157,7 +153,6 @@ class BlemeesClient:
         self,
         *,
         session_id: str,
-        backend: str = "claude",
         options: dict[str, Any] | None = None,
         resume: bool = False,
         last_seen_seq: int | None = None,
@@ -169,11 +164,10 @@ class BlemeesClient:
         sess = Session(self, session_id)
         self._sessions[session_id] = sess
         frame: dict[str, Any] = {
-            "type": "agent.open",
+            "type": "session.open",
             "id": req_id,
             "session_id": session_id,
-            "backend": backend,
-            "options": {backend: dict(options or {})},
+            "options": dict(options or {}),
         }
         if resume:
             frame["resume"] = True
@@ -181,7 +175,7 @@ class BlemeesClient:
             frame["last_seen_seq"] = last_seen_seq
         await self._send(frame)
         reply = await fut
-        if reply.get("type") == "agent.error":
+        if reply.get("type") == "error":
             self._sessions.pop(session_id, None)
             raise BlemeesClientError(reply.get("code", ""), reply.get("message", ""))
         try:
@@ -224,10 +218,10 @@ class BlemeesClient:
                     req_id
                     and msg_type
                     in {
-                        "agent.opened",
-                        "agent.closed",
-                        "agent.sessions",
-                        "agent.error",
+                        "session.opened",
+                        "session.closed",
+                        "sessions",
+                        "error",
                     }
                     and req_id in self._pending
                 ):

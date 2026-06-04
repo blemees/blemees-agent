@@ -44,7 +44,7 @@ EventCallback = Callable[[dict[str, Any]], Awaitable[None]]
 # in the JSON schemas. Kept as a frozenset so callers can do `in` checks
 # in O(1) and the dispatcher can list registered backends without
 # importing the concrete classes.
-KNOWN_BACKENDS: frozenset[str] = frozenset({"claude", "codex"})
+KNOWN_BACKENDS: frozenset[str] = frozenset({"claude", "codex", "acp"})
 
 
 @runtime_checkable

@@ -321,19 +321,20 @@ class Connection:
     # ------------------------------------------------------------------
 
     def _make_backend(self, msg: OpenMessage, *, on_event):
-        """Construct the per-session ACP handle bound to the profile's process.
+        """Construct the per-session ACP handle bound to the agent's process.
 
-        The supervisor owns one ACP agent process per profile (#17) and
-        multiplexes sessions onto it; the handle is the per-session view.
+        Model is Profile → Agent → Session (#17): the supervisor owns one ACP
+        process per agent and multiplexes sessions onto it; the handle is the
+        per-session view.
         """
         return self._supervisor.make_handle(
-            msg.profile, on_event=on_event, cwd=msg.options.get("cwd")
+            msg.profile, msg.agent, on_event=on_event, cwd=msg.options.get("cwd")
         )
 
     async def _handle_open(self, msg: OpenMessage) -> None:
-        # Validate the profile up front so an unknown name fails cleanly
+        # Validate profile + agent up front so an unknown name fails cleanly
         # (profile_unknown) before we register a session.
-        self._supervisor.get_profile(msg.profile)
+        profile, agent = self._supervisor.resolve(msg.profile, msg.agent)
         existing = self._sessions.try_get(msg.session_id)
         if existing is not None and not msg.resume:
             raise SessionExistsError(msg.session_id)
@@ -391,7 +392,8 @@ class Connection:
             "type": "session.opened",
             "id": msg.id,
             "session_id": msg.session_id,
-            "profile": msg.profile or "default",
+            "profile": profile.name,
+            "agent": agent.name,
             "subprocess_pid": sess.backend.pid,
             "last_seq": sess.seq,
             "view_only": False,
@@ -639,19 +641,29 @@ class Connection:
         # get_profile raises ProfileUnknownError (→ profile_unknown) for a bad name.
         self._supervisor.get_profile(msg.name)
         try:
-            proc = await self._supervisor.start(msg.name)
+            procs = await self._supervisor.start(msg.name)
         except SpawnFailedError as exc:
             await self._emit_error(SPAWN_FAILED, exc.message, id=msg.id)
             return
         await self._emit_frame(
-            {"type": "profile.started", "id": msg.id, "name": msg.name, "pid": proc.pid}
+            {
+                "type": "profile.started",
+                "id": msg.id,
+                "name": msg.name,
+                "agents_started": len(procs),
+            }
         )
 
     async def _handle_profile_stop(self, msg) -> None:
         self._supervisor.get_profile(msg.name)
         stopped = await self._supervisor.stop(msg.name)
         await self._emit_frame(
-            {"type": "profile.stopped", "id": msg.id, "name": msg.name, "was_running": stopped}
+            {
+                "type": "profile.stopped",
+                "id": msg.id,
+                "name": msg.name,
+                "agents_stopped": stopped,
+            }
         )
 
     # ------------------------------------------------------------------

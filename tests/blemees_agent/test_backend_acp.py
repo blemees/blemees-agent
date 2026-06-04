@@ -17,14 +17,16 @@ import pytest
 from blemees_agent.backends.acp import AcpAgentProcess, AcpSessionHandle, _to_content_blocks
 from blemees_agent.errors import ProtocolError, SessionBusyError
 from blemees_agent.logging import configure
-from blemees_agent.supervisor import Profile
+from blemees_agent.supervisor import Agent
 
 FAKE_ACP = str(Path(__file__).parent / "fake_acp.py")
 
 
 def _process() -> AcpAgentProcess:
-    profile = Profile(name="t", command=sys.executable, args=[FAKE_ACP])
-    return AcpAgentProcess(profile, logger=configure("error"), env=dict(os.environ))
+    agent = Agent(name="default", command=sys.executable, args=[FAKE_ACP])
+    return AcpAgentProcess(
+        agent, key=("t", "default"), logger=configure("error"), env=dict(os.environ)
+    )
 
 
 async def _collect_turn(q: asyncio.Queue, timeout: float = 30.0) -> list[dict]:

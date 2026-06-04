@@ -1,9 +1,10 @@
-"""Daemon-level integration for profiles + supervisor (#17).
+"""Daemon-level integration for profiles + agents + supervisor (#17).
 
-Drives a live daemon configured with a default profile plus a named one,
-asserting: open under a named profile, profile.list with running/session
-counts, lazy start, profile.start/stop, unknown-profile error, and two
-profiles' processes running concurrently.
+Model: Profile -> Agent -> Session. Drives a live daemon configured with the
+default profile, a flat single-agent profile, and a multi-agent profile;
+asserts open-under-(profile,agent), agent selection, profile.list (nested
+agents with running/session counts), profile.start/stop, and unknown
+profile/agent errors.
 """
 
 from __future__ import annotations
@@ -24,6 +25,10 @@ from .conftest import _StreamClient, short_socket_path, socket_cleanup
 FAKE_ACP = str(Path(__file__).parent / "fake_acp.py")
 
 
+def _agent_spec() -> dict:
+    return {"agent_command": sys.executable, "agent_args": [FAKE_ACP]}
+
+
 @pytest.fixture
 async def profile_daemon():
     socket_path = short_socket_path("blemeesd-prof")
@@ -33,10 +38,13 @@ async def profile_daemon():
             agent_command=sys.executable,
             agent_args=[FAKE_ACP],
             profiles={
-                "alt": {"agent_command": sys.executable, "agent_args": [FAKE_ACP], "model": "x"},
+                # flat → single "default" agent
+                "alt": {**_agent_spec(), "model": "x"},
+                # multi-agent profile
+                "work": {"agents": {"a": _agent_spec(), "b": _agent_spec()}},
             },
             idle_timeout_s=60,
-            max_concurrent_sessions=8,
+            max_concurrent_sessions=16,
         )
         daemon = Daemon(cfg, configure("error"))
         await daemon.start()
@@ -51,7 +59,7 @@ async def profile_daemon():
                 serve.cancel()
 
 
-async def _connect(socket_path: str) -> _StreamClient:
+async def _connect(socket_path: str):
     reader, writer = await asyncio.open_unix_connection(socket_path)
     client = _StreamClient(reader, writer)
     await client.send({"type": "hello", "client": "t/1", "protocol": PROTOCOL_VERSION})
@@ -60,10 +68,12 @@ async def _connect(socket_path: str) -> _StreamClient:
     return client, ack
 
 
-async def _drive_turn(client, sid, profile=None):
+async def _drive_turn(client, sid, *, profile=None, agent=None):
     frame = {"type": "session.open", "id": "o", "session_id": sid, "options": {}}
     if profile:
         frame["profile"] = profile
+    if agent:
+        frame["agent"] = agent
     await client.send(frame)
     opened = await client.wait_for(lambda e: e.get("type") == "session.opened")
     await client.send({"type": "session.prompt", "session_id": sid, "prompt": "say pong"})
@@ -74,52 +84,76 @@ async def _drive_turn(client, sid, profile=None):
 async def test_hello_ack_lists_profiles(profile_daemon):
     client, ack = await _connect(profile_daemon)
     try:
-        assert set(ack["profiles"]) == {"default", "alt"}
+        assert set(ack["profiles"]) == {"default", "alt", "work"}
     finally:
         await client.close()
 
 
-async def test_open_under_named_profile(profile_daemon):
+async def test_open_under_flat_profile_uses_default_agent(profile_daemon):
     client, _ = await _connect(profile_daemon)
     try:
         opened = await _drive_turn(client, "s-alt", profile="alt")
         assert opened["profile"] == "alt"
+        assert opened["agent"] == "default"
     finally:
         await client.close()
 
 
-async def test_unknown_profile_rejected(profile_daemon):
+async def test_open_selects_agent_within_profile(profile_daemon):
+    client, _ = await _connect(profile_daemon)
+    try:
+        opened_a = await _drive_turn(client, "s-a", profile="work", agent="a")
+        opened_b = await _drive_turn(client, "s-b", profile="work", agent="b")
+        assert opened_a["agent"] == "a"
+        assert opened_b["agent"] == "b"
+    finally:
+        await client.close()
+
+
+async def test_unknown_profile_and_agent_rejected(profile_daemon):
     client, _ = await _connect(profile_daemon)
     try:
         await client.send(
             {
                 "type": "session.open",
                 "id": "o",
-                "session_id": "s",
+                "session_id": "s1",
                 "profile": "ghost",
                 "options": {},
             }
         )
-        err = await client.wait_for(lambda e: e.get("type") == "error")
-        assert err["code"] == "profile_unknown"
+        e1 = await client.wait_for(lambda e: e.get("type") == "error")
+        assert e1["code"] == "profile_unknown"
+
+        await client.send(
+            {
+                "type": "session.open",
+                "id": "o",
+                "session_id": "s2",
+                "profile": "work",
+                "agent": "ghost",
+                "options": {},
+            }
+        )
+        e2 = await client.wait_for(lambda e: e.get("type") == "error")
+        assert e2["code"] == "profile_unknown"
     finally:
         await client.close()
 
 
-async def test_profile_list_reports_running_and_session_counts(profile_daemon):
+async def test_profile_list_nested_with_running_and_sessions(profile_daemon):
     client, _ = await _connect(profile_daemon)
     try:
-        # Lazily start by opening under each profile.
-        await _drive_turn(client, "s-default", profile="default")
-        await _drive_turn(client, "s-alt", profile="alt")
+        await _drive_turn(client, "s-a", profile="work", agent="a")
 
         await client.send({"type": "profile.list", "id": "pl"})
         reply = await client.wait_for(lambda e: e.get("type") == "profiles")
         rows = {r["name"]: r for r in reply["profiles"]}
-        assert rows["default"]["running"] is True and rows["default"]["sessions"] >= 1
-        assert rows["alt"]["running"] is True and rows["alt"]["sessions"] >= 1
-        # Two distinct profiles' processes are up concurrently.
-        assert rows["default"]["sessions"] >= 1 and rows["alt"]["sessions"] >= 1
+        work_agents = {a["name"]: a for a in rows["work"]["agents"]}
+        assert work_agents["a"]["running"] is True
+        assert work_agents["a"]["sessions"] >= 1
+        # Agent "b" of the same profile was never opened → its own process is idle.
+        assert work_agents["b"]["running"] is False
     finally:
         await client.close()
 
@@ -127,12 +161,12 @@ async def test_profile_list_reports_running_and_session_counts(profile_daemon):
 async def test_profile_start_and_stop(profile_daemon):
     client, _ = await _connect(profile_daemon)
     try:
-        await client.send({"type": "profile.start", "id": "ps", "name": "alt"})
+        await client.send({"type": "profile.start", "id": "ps", "name": "work"})
         started = await client.wait_for(lambda e: e.get("type") == "profile.started")
-        assert started["name"] == "alt" and started["pid"]
+        assert started["name"] == "work" and started["agents_started"] == 2
 
-        await client.send({"type": "profile.stop", "id": "px", "name": "alt"})
+        await client.send({"type": "profile.stop", "id": "px", "name": "work"})
         stopped = await client.wait_for(lambda e: e.get("type") == "profile.stopped")
-        assert stopped["name"] == "alt" and stopped["was_running"] is True
+        assert stopped["name"] == "work" and stopped["agents_stopped"] == 2
     finally:
         await client.close()

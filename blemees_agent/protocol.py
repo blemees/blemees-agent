@@ -129,6 +129,7 @@ class OpenMessage:
     options: dict[str, Any]
     resume: bool
     profile: str | None = None
+    agent: str | None = None
     last_seen_seq: int | None = None
     alias: str | None = None
 
@@ -215,7 +216,7 @@ def parse_hello(obj: dict[str, Any]) -> HelloMessage:
 
 
 _OPEN_TOP_LEVEL = frozenset(
-    {"type", "id", "session_id", "resume", "last_seen_seq", "options", "alias", "profile"}
+    {"type", "id", "session_id", "resume", "last_seen_seq", "options", "alias", "profile", "agent"}
 )
 
 
@@ -243,12 +244,17 @@ def parse_open(obj: dict[str, Any]) -> OpenMessage:
     if profile is not None and (not isinstance(profile, str) or not profile):
         raise ProtocolError("'profile' must be a non-empty string when set")
 
+    agent = obj.get("agent")
+    if agent is not None and (not isinstance(agent, str) or not agent):
+        raise ProtocolError("'agent' must be a non-empty string when set")
+
     return OpenMessage(
         id=_opt_str_id(obj),
         session_id=session_id,
         options=options_field,
         resume=resume,
         profile=profile,
+        agent=agent,
         last_seen_seq=last_seen_seq,
         alias=alias or None,
     )

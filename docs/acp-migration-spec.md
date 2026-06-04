@@ -74,45 +74,70 @@ are deleted.
 
 ---
 
-## 2. Profiles
+## 2. Profiles, agents, sessions
 
-A **profile** is a named, persisted configuration bundle and the unit of
-process supervision. Each profile maps to at most one running ACP agent
-process.
+The model is **Profile → Agent → Session**:
 
-### 2.1 Profile fields
+- A **profile** is a named container of one or more **agents** (plus
+  profile-level cross-cutting config — permission policy §5, notify §6).
+- An **agent** is an independently-configured ACP agent (its own binary, CLI
+  args, model/mode, cwd, MCP servers, env). Two agents in one profile may be
+  the *same vendor* with different configs (e.g. `claude` on sonnet and
+  `claude-opus` on opus). The agent is the **unit of process supervision**:
+  at most one running ACP process per agent.
+- A **session** is an ACP session multiplexed inside an agent's process.
+
+### 2.1 Agent fields
 
 | Field | Purpose |
 |---|---|
-| `name` | Unique profile id (kebab-case). |
-| `agent` | Which ACP agent: `command` + `args` + `env` to spawn (e.g. `npx @agentclientprotocol/claude-agent-acp`, `codex-acp`, `gemini --experimental-acp`). |
-| `model` / `mode` / `effort` | Desired model, permission mode, and reasoning effort. **Not** `session/new` params — applied *after* the session opens via whichever mechanism the agent advertises (§3, finding B): `set_session_model` (`SessionModelState`), `set_session_mode` (`SessionModeState`), and/or `set_config_option` (`config_options`). The daemon maps these onto the agent's advertised option ids best-effort and warns when one is unavailable. |
+| `name` | Agent id within its profile (kebab-case). |
+| `agent_command` / `agent_args` / `env` | How to spawn the ACP agent (e.g. `claude-agent-acp`, `codex-acp`, `gemini --experimental-acp`). |
+| `model` / `mode` | Desired model and permission mode. **Not** `session/new` params — applied *after* the session opens via whichever mechanism the agent advertises (§3, finding B): `set_session_model` (`SessionModelState`), `set_session_mode` (`SessionModeState`), and/or `set_config_option` (`config_options`). Mapped best-effort; a miss warns, never fails. |
 | `cwd` | Default working directory for new sessions. |
-| `permission_policy` | See §5. `relay` (default), `allow`, `deny`, or a per-tool/kind map; plus `detached: stall \| allow \| deny`. |
-| `mcp_servers` | List of MCP server configs, injected verbatim into every `session/new.mcpServers` / `session/load.mcpServers` for this profile. |
-| `notify` | Notify sink config for this profile (§6); falls back to the global default. |
-| `idle_reap_s` | Reap the agent process after this long with zero sessions (default: inherit daemon `profile_idle_s`). |
-| `auto_start` | If `true`, spawn the agent at daemon start; default `false` (lazy). |
+| `mcp_servers` | MCP server configs injected verbatim into every `session/new.mcpServers` / `session/load.mcpServers` for this agent. |
 
-### 2.2 Lifecycle
+Profile-level fields (`permission_policy` §5, `notify` §6) apply across the
+profile's agents and are added with those features.
 
-- **Lazy start (default).** The agent process spawns on the first
-  `session.open` under the profile (or an explicit `profile.start`).
-- **Idle reap.** When a profile's last session closes, its process is reaped
-  after `idle_reap_s`.
-- **Definition.** Profiles come from a config file *and* the over-wire
-  control protocol (`profile.create` / `profile.update` / `profile.delete`).
-  Both are persisted to the registry (§7). The config file is the
-  declarative source for reproducible/headless deployments; over-wire CRUD
-  is for the TUI.
+### 2.2 Config shape
 
-### 2.3 MCP and ACP
+```toml
+# Flat sugar: a profile with fields directly under it is one "default" agent.
+[profiles.solo]
+agent_command = "claude-agent-acp"
+model = "sonnet"
 
-The daemon never speaks MCP. A profile's `mcp_servers` are passed to the
-*agent* in `session/new.mcpServers`; the agent connects to them as their
-MCP client and exposes their tools to the model. With sessions multiplexed
-in one process, each session connects its own MCP servers — deduplication
-(if any) is the agent's concern.
+# Multi-agent profile.
+[profiles.work.agents.claude]
+agent_command = "claude-agent-acp"
+model = "sonnet"
+[profiles.work.agents.codex]
+agent_command = "codex-acp"
+args = ["acp"]
+```
+
+A built-in `default` profile with a `default` agent is always synthesised
+from the daemon's `agent_command` / `agent_args`, so `session.open` works
+with no config. `session.open {profile?, agent?}` defaults to
+`default`/`default` (or the profile's sole / `default`-named agent).
+
+### 2.3 Lifecycle
+
+- **Lazy start (default).** An agent's process spawns on the first
+  `session.open` against it (or an explicit `profile.start`, which starts all
+  of a profile's agents).
+- **Idle reap.** When an agent's last session closes, its process is reaped
+  after the idle timeout.
+- **Definition.** Profiles come from the config file's `[profiles.*]` tables
+  (#17) and, later, over-wire CRUD (#25).
+
+### 2.4 MCP and ACP
+
+The daemon never speaks MCP. An agent's `mcp_servers` (stdio entries for now;
+HTTP/SSE later) are passed to the *agent* in `session/new.mcpServers`; the
+agent connects to them as their MCP client and exposes their tools to the
+model.
 
 ---
 

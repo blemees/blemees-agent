@@ -45,7 +45,7 @@ from ..errors import ProtocolError, SessionBusyError, SpawnFailedError
 from . import EventCallback
 
 if TYPE_CHECKING:
-    from ..supervisor import Profile
+    from ..supervisor import Agent
 
 
 def _to_content_blocks(message: dict[str, Any]) -> list[Any]:
@@ -69,14 +69,14 @@ def _to_content_blocks(message: dict[str, Any]) -> list[Any]:
     raise ProtocolError("message.content must be a string or array")
 
 
-def _mcp_servers(profile: Profile) -> list[Any]:
+def _mcp_servers(agent: Agent) -> list[Any]:
     """Build ACP McpServer entries from a profile's mcp_servers config.
 
     #17 supports stdio servers (`{name, command, args, env}`); HTTP/SSE
     transports are a later addition.
     """
     out: list[Any] = []
-    for spec in profile.mcp_servers:
+    for spec in agent.mcp_servers:
         if not isinstance(spec, dict) or "command" not in spec:
             continue
         env = spec.get("env") or {}
@@ -135,8 +135,12 @@ class _ProcessClient(acp.Client):
 class AcpAgentProcess:
     """One supervised ACP agent subprocess for a profile; multiplexes sessions."""
 
-    def __init__(self, profile: Profile, *, logger: Any, env: dict[str, str]) -> None:
-        self.profile = profile
+    def __init__(
+        self, agent: Agent, *, key: tuple[str, str], logger: Any, env: dict[str, str]
+    ) -> None:
+        self.agent = agent
+        self.key_tuple = key
+        self._label = f"{key[0]}/{key[1]}"
         self._log = logger
         self._env = env
         self._proc: asyncio.subprocess.Process | None = None
@@ -168,17 +172,17 @@ class AcpAgentProcess:
                 return
             try:
                 self._proc = await asyncio.create_subprocess_exec(
-                    self.profile.command,
-                    *self.profile.args,
+                    self.agent.command,
+                    *self.agent.args,
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
-                    cwd=self.profile.cwd or None,
+                    cwd=self.agent.cwd or None,
                     env=self._env,
                 )
             except (OSError, ValueError) as exc:
                 raise SpawnFailedError(
-                    f"failed to spawn ACP agent {self.profile.command!r}: {exc}"
+                    f"failed to spawn ACP agent {self.agent.command!r}: {exc}"
                 ) from exc
 
             assert self._proc.stdin is not None and self._proc.stdout is not None
@@ -187,7 +191,7 @@ class AcpAgentProcess:
                 _ProcessClient(self), self._proc.stdin, self._proc.stdout, queue=self._rpc_queue
             )
             self._stderr_task = asyncio.create_task(
-                self._pump_stderr(), name=f"acp-stderr-{self.profile.name}"
+                self._pump_stderr(), name=f"acp-stderr-{self._label}"
             )
             try:
                 init = await self._conn.initialize(
@@ -201,16 +205,16 @@ class AcpAgentProcess:
                 raise SpawnFailedError(f"ACP initialize failed: {exc}") from exc
             self._log.info(
                 "acp.process_started",
-                profile=self.profile.name,
-                command=self.profile.command,
+                agent=self._label,
+                command=self.agent.command,
                 load_session=self.load_session,
             )
 
     async def new_session(self, *, cwd: str | None, on_event: EventCallback) -> str:
         await self.ensure_started()
         ns = await self._conn.new_session(
-            cwd=cwd or self.profile.cwd or ".",
-            mcp_servers=_mcp_servers(self.profile),
+            cwd=cwd or self.agent.cwd or ".",
+            mcp_servers=_mcp_servers(self.agent),
         )
         sid = ns.session_id
         self.sessions[sid] = _SessionState(on_event)
@@ -224,10 +228,10 @@ class AcpAgentProcess:
         SessionModeState (set_session_model/mode) or config_options
         (set_config_option). Best-effort — warn, never fail, on a miss.
         """
-        if self.profile.model:
-            await self._select(sid, ns, want=self.profile.model, category="model")
-        if self.profile.mode:
-            await self._select(sid, ns, want=self.profile.mode, category="mode")
+        if self.agent.model:
+            await self._select(sid, ns, want=self.agent.model, category="model")
+        if self.agent.mode:
+            await self._select(sid, ns, want=self.agent.mode, category="mode")
 
     async def _select(self, sid: str, ns: Any, *, want: str, category: str) -> None:
         try:
@@ -254,13 +258,13 @@ class AcpAgentProcess:
                         return
             self._log.warning(
                 "acp.selection_unavailable",
-                profile=self.profile.name,
+                agent=self._label,
                 category=category,
                 requested=want,
             )
         except Exception as exc:  # noqa: BLE001 — selection is best-effort
             self._log.warning(
-                "acp.selection_failed", profile=self.profile.name, category=category, error=str(exc)
+                "acp.selection_failed", agent=self._label, category=category, error=str(exc)
             )
 
     async def prompt(self, acp_session_id: str, blocks: list[Any]) -> None:
@@ -387,7 +391,7 @@ class AcpSessionHandle:
         self._on_close = on_close  # supervisor callback for idle-reap accounting
         self.native_session_id: str | None = None
         self.load_session: bool = False
-        self.model: str | None = process.profile.model
+        self.model: str | None = process.agent.model
 
     @property
     def running(self) -> bool:

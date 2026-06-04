@@ -1,16 +1,23 @@
-"""Profiles and the per-profile process supervisor (blemees/3, #17).
+"""Profiles, agents, and the per-agent process supervisor (blemees/3, #17).
 
-A **profile** is a named config bundle (agent binary + args, default model /
-mode / cwd, MCP servers) and the unit of process supervision: the daemon runs
-at most one :class:`~blemees_agent.backends.acp.AcpAgentProcess` per profile,
-lazily started on first ``session.open`` and idle-reaped when its last session
-closes. Sessions opened under a profile are ACP sessions multiplexed inside
-that one process.
+The model is **Profile → Agent → Session**:
 
-Profiles come from the config file's ``[profiles.<name>]`` tables; a built-in
-``default`` profile is always synthesised from the daemon's
-``agent_command`` / ``agent_args`` so ``session.open`` works with no profile
-configured at all.
+* A **Profile** is a named container of one or more **Agents** (plus, later,
+  profile-level permission policy / notify config — #20 / #24).
+* An **Agent** is an independently-configured ACP agent (its own binary, CLI
+  args, model/mode, cwd, MCP servers, env). Two agents in a profile may even
+  be the same vendor with different configs. Each agent is the unit of
+  process supervision: the daemon runs at most one
+  :class:`~blemees_agent.backends.acp.AcpAgentProcess` per agent, lazily
+  started on first ``session.open`` and idle-reaped when its last session
+  closes.
+* A **Session** is an ACP session multiplexed inside an agent's process.
+
+Profiles come from the config file's ``[profiles.<p>.agents.<a>]`` tables; a
+profile written flat (fields directly under ``[profiles.<p>]``, no ``agents``
+table) is sugar for a single agent named ``default``. A built-in ``default``
+profile with a ``default`` agent is always synthesised from the daemon's
+``agent_command`` / ``agent_args`` so ``session.open`` works with no config.
 """
 
 from __future__ import annotations
@@ -25,10 +32,13 @@ from .config import Config
 from .errors import ProfileUnknownError
 
 DEFAULT_PROFILE = "default"
+DEFAULT_AGENT = "default"
 
 
 @dataclasses.dataclass(slots=True)
-class Profile:
+class Agent:
+    """One independently-configured ACP agent (the process-supervision unit)."""
+
     name: str
     command: str
     args: list[str] = dataclasses.field(default_factory=list)
@@ -39,109 +49,167 @@ class Profile:
     env: dict[str, str] = dataclasses.field(default_factory=dict)
 
 
+@dataclasses.dataclass(slots=True)
+class Profile:
+    """A named container of agents."""
+
+    name: str
+    agents: dict[str, Agent] = dataclasses.field(default_factory=dict)
+
+    @property
+    def default_agent(self) -> Agent:
+        """The agent used when ``session.open`` names a profile but no agent."""
+        if DEFAULT_AGENT in self.agents:
+            return self.agents[DEFAULT_AGENT]
+        # else the sole / first agent
+        return next(iter(self.agents.values()))
+
+
+def _agent_from_spec(name: str, spec: dict[str, Any], fallback_command: str) -> Agent:
+    return Agent(
+        name=name,
+        command=spec.get("agent_command") or spec.get("command") or fallback_command,
+        args=list(spec.get("agent_args") or spec.get("args") or []),
+        model=spec.get("model"),
+        mode=spec.get("mode"),
+        cwd=spec.get("cwd"),
+        mcp_servers=list(spec.get("mcp_servers") or []),
+        env=dict(spec.get("env") or {}),
+    )
+
+
 def _profiles_from_config(config: Config) -> dict[str, Profile]:
     """Build the profile registry: a synthesised ``default`` + config-file ones."""
     profiles: dict[str, Profile] = {
         DEFAULT_PROFILE: Profile(
             name=DEFAULT_PROFILE,
-            command=config.agent_command,
-            args=list(config.agent_args),
+            agents={
+                DEFAULT_AGENT: Agent(
+                    name=DEFAULT_AGENT,
+                    command=config.agent_command,
+                    args=list(config.agent_args),
+                )
+            },
         )
     }
-    for name, spec in (config.profiles or {}).items():
-        if not isinstance(spec, dict):
+    for pname, pspec in (config.profiles or {}).items():
+        if not isinstance(pspec, dict):
             continue
-        profiles[name] = Profile(
-            name=name,
-            command=spec.get("agent_command") or spec.get("command") or config.agent_command,
-            args=list(spec.get("agent_args") or spec.get("args") or []),
-            model=spec.get("model"),
-            mode=spec.get("mode"),
-            cwd=spec.get("cwd"),
-            mcp_servers=list(spec.get("mcp_servers") or []),
-            env=dict(spec.get("env") or {}),
-        )
+        agents_spec = pspec.get("agents")
+        if isinstance(agents_spec, dict) and agents_spec:
+            agents = {
+                aname: _agent_from_spec(aname, aspec, config.agent_command)
+                for aname, aspec in agents_spec.items()
+                if isinstance(aspec, dict)
+            }
+        else:
+            # Flat sugar: the profile body defines a single "default" agent.
+            agents = {DEFAULT_AGENT: _agent_from_spec(DEFAULT_AGENT, pspec, config.agent_command)}
+        if agents:
+            profiles[pname] = Profile(name=pname, agents=agents)
     return profiles
 
 
 class Supervisor:
-    """Owns the profile registry and one ACP agent process per profile."""
+    """Owns the profile/agent registry and one ACP process per agent."""
 
     def __init__(self, config: Config, logger: Any) -> None:
         self._config = config
         self._log = logger
         self._profiles: dict[str, Profile] = _profiles_from_config(config)
-        self._processes: dict[str, AcpAgentProcess] = {}
-        # profile name → monotonic time its last session closed (idle-reap clock)
-        self._idle_since: dict[str, float] = {}
+        # (profile, agent) → process
+        self._processes: dict[tuple[str, str], AcpAgentProcess] = {}
+        # (profile, agent) → monotonic time its last session closed (idle clock)
+        self._idle_since: dict[tuple[str, str], float] = {}
 
-    # -- profiles -------------------------------------------------------
+    # -- registry -------------------------------------------------------
 
     def get_profile(self, name: str | None) -> Profile:
-        key = name or DEFAULT_PROFILE
         try:
-            return self._profiles[key]
+            return self._profiles[name or DEFAULT_PROFILE]
         except KeyError:
-            raise ProfileUnknownError(key) from None
+            raise ProfileUnknownError(name or DEFAULT_PROFILE) from None
 
-    def _process_for(self, profile: Profile) -> AcpAgentProcess:
-        proc = self._processes.get(profile.name)
+    def resolve(self, profile_name: str | None, agent_name: str | None) -> tuple[Profile, Agent]:
+        profile = self.get_profile(profile_name)
+        if agent_name is None:
+            return profile, profile.default_agent
+        agent = profile.agents.get(agent_name)
+        if agent is None:
+            raise ProfileUnknownError(f"{profile.name}/{agent_name}")
+        return profile, agent
+
+    def profile_names(self) -> list[str]:
+        return list(self._profiles)
+
+    # -- processes ------------------------------------------------------
+
+    def _process_for(self, profile: Profile, agent: Agent) -> AcpAgentProcess:
+        key = (profile.name, agent.name)
+        proc = self._processes.get(key)
         if proc is None:
-            env = {**os.environ, **profile.env}
-            proc = AcpAgentProcess(profile, logger=self._log, env=env)
-            self._processes[profile.name] = proc
+            env = {**os.environ, **agent.env}
+            proc = AcpAgentProcess(agent, key=key, logger=self._log, env=env)
+            self._processes[key] = proc
         return proc
 
     def make_handle(
-        self, profile_name: str | None, *, on_event: Any, cwd: str | None
+        self, profile_name: str | None, agent_name: str | None, *, on_event: Any, cwd: str | None
     ) -> AcpSessionHandle:
-        """Return a per-session handle bound to the profile's (lazy) process."""
-        profile = self.get_profile(profile_name)
-        proc = self._process_for(profile)
-        self._idle_since.pop(profile.name, None)  # acquiring → not idle
+        """Return a per-session handle bound to the (profile, agent)'s lazy process."""
+        profile, agent = self.resolve(profile_name, agent_name)
+        proc = self._process_for(profile, agent)
+        self._idle_since.pop((profile.name, agent.name), None)  # acquiring → not idle
         return AcpSessionHandle(
             process=proc,
             on_event=on_event,
-            cwd=cwd or profile.cwd,
+            cwd=cwd or agent.cwd,
             on_close=self._on_session_close,
         )
 
     async def _on_session_close(self, proc: AcpAgentProcess) -> None:
         if proc.session_count() == 0:
-            self._idle_since[proc.profile.name] = time.monotonic()
+            self._idle_since[proc.key_tuple] = time.monotonic()
 
-    # -- explicit lifecycle --------------------------------------------
+    # -- explicit lifecycle (profile-wide: all of a profile's agents) ---
 
-    async def start(self, name: str | None) -> AcpAgentProcess:
-        proc = self._process_for(self.get_profile(name))
-        await proc.ensure_started()
-        return proc
+    async def start(self, name: str | None) -> list[AcpAgentProcess]:
+        profile = self.get_profile(name)
+        started: list[AcpAgentProcess] = []
+        for agent in profile.agents.values():
+            proc = self._process_for(profile, agent)
+            await proc.ensure_started()
+            started.append(proc)
+        return started
 
-    async def stop(self, name: str | None) -> bool:
-        key = name or DEFAULT_PROFILE
-        proc = self._processes.pop(key, None)
-        self._idle_since.pop(key, None)
-        if proc is None:
-            return False
-        await proc.close()
-        return True
-
-    def profile_names(self) -> list[str]:
-        return list(self._profiles)
+    async def stop(self, name: str | None) -> int:
+        profile = self.get_profile(name)
+        stopped = 0
+        for agent in profile.agents.values():
+            key = (profile.name, agent.name)
+            proc = self._processes.pop(key, None)
+            self._idle_since.pop(key, None)
+            if proc is not None:
+                await proc.close()
+                stopped += 1
+        return stopped
 
     def profile_list(self) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
-        for name, profile in self._profiles.items():
-            proc = self._processes.get(name)
-            rows.append(
-                {
-                    "name": name,
-                    "agent": profile.command,
-                    "model": profile.model,
-                    "running": bool(proc and proc.running),
-                    "sessions": proc.session_count() if proc else 0,
-                }
-            )
+        for pname, profile in self._profiles.items():
+            agents = []
+            for aname, agent in profile.agents.items():
+                proc = self._processes.get((pname, aname))
+                agents.append(
+                    {
+                        "name": aname,
+                        "agent": agent.command,
+                        "model": agent.model,
+                        "running": bool(proc and proc.running),
+                        "sessions": proc.session_count() if proc else 0,
+                    }
+                )
+            rows.append({"name": pname, "agents": agents})
         return rows
 
     # -- reaping / shutdown --------------------------------------------
@@ -150,16 +218,16 @@ class Supervisor:
         if now is None:
             now = time.monotonic()
         reaped: list[str] = []
-        for name, since in list(self._idle_since.items()):
-            proc = self._processes.get(name)
+        for key, since in list(self._idle_since.items()):
+            proc = self._processes.get(key)
             if proc is None:
-                self._idle_since.pop(name, None)
+                self._idle_since.pop(key, None)
                 continue
             if proc.session_count() == 0 and now - since >= idle_timeout_s:
                 await proc.close()
-                self._processes.pop(name, None)
-                self._idle_since.pop(name, None)
-                reaped.append(name)
+                self._processes.pop(key, None)
+                self._idle_since.pop(key, None)
+                reaped.append(f"{key[0]}/{key[1]}")
         return reaped
 
     async def close_all(self) -> None:

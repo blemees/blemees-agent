@@ -120,7 +120,7 @@ class AcpBackend:
         self._on_event = on_event
         self._log = logger
         self._env = env if env is not None else build_spawn_env(session_id, cwd, alias)
-        self._model = model
+        self.model = model
 
         self._proc: asyncio.subprocess.Process | None = None
         self._conn: Any = None  # acp.ClientSideConnection once spawned

@@ -30,6 +30,11 @@ class Config:
     socket_path: str
     claude_bin: str = "claude"
     codex_bin: str = "codex"
+    # blemees/3 ACP backend: the agent binary the daemon spawns and drives
+    # over stdio (e.g. "claude-agent-acp", "codex-acp", "gemini").
+    # Profiles (#17) will let each session pick its own; #16 uses this default.
+    agent_command: str = "claude-agent-acp"
+    agent_args: list[str] = dataclasses.field(default_factory=list)
     log_level: str = "info"
     log_file: str | None = None
     max_line_bytes: int = 16 * 1024 * 1024
@@ -73,6 +78,7 @@ def _env_overrides() -> dict[str, Any]:
         "BLEMEES_AGENTD_SOCKET": "socket_path",
         "BLEMEES_AGENTD_CLAUDE": "claude_bin",
         "BLEMEES_AGENTD_CODEX": "codex_bin",
+        "BLEMEES_AGENTD_AGENT": "agent_command",
         "BLEMEES_AGENTD_LOG_LEVEL": "log_level",
         "BLEMEES_AGENTD_LOG_FILE": "log_file",
         "BLEMEES_AGENTD_MAX_LINE": "max_line_bytes",
@@ -101,6 +107,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--socket", dest="socket_path", help="Unix socket path")
     parser.add_argument("--claude", dest="claude_bin", help="Path to the claude binary")
     parser.add_argument("--codex", dest="codex_bin", help="Path to the codex binary")
+    parser.add_argument("--agent", dest="agent_command", help="Path to the ACP agent binary")
     parser.add_argument("--log-level", dest="log_level", help="debug|info|warning|error")
     parser.add_argument("--log-file", dest="log_file", help="Log file path (default stderr)")
     parser.add_argument("--config", dest="config_path", help="TOML config file")

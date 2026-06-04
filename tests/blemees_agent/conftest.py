@@ -5,14 +5,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-import os
 import secrets
 import sys
 import tempfile
 from pathlib import Path
 from typing import Any
 
-import pytest
 import pytest_asyncio
 
 from blemees_agent import PROTOCOL_VERSION
@@ -20,8 +18,7 @@ from blemees_agent.config import Config
 from blemees_agent.daemon import Daemon
 from blemees_agent.logging import configure
 
-FAKE_CLAUDE = Path(__file__).parent / "fake_claude.py"
-FAKE_CODEX = Path(__file__).parent / "fake_codex.py"
+FAKE_ACP = Path(__file__).parent / "fake_acp.py"
 
 
 def short_socket_path(name: str = "blemeesd") -> Path:
@@ -48,58 +45,27 @@ def socket_cleanup(path: Path):
             path.unlink()
 
 
-@pytest.fixture
-def fake_claude_bin() -> str:
-    """Return an invoker that runs the fake claude via the current Python."""
-    # The daemon uses asyncio.create_subprocess_exec; we can't trivially pass
-    # multi-token argv, so we wrap by writing a tiny shim script.
-    return str(FAKE_CLAUDE)
-
-
-@pytest.fixture
-def argv_trace_path(tmp_path):
-    path = tmp_path / "argv_trace.jsonl"
-    return path
-
-
-@pytest.fixture
-def fake_mode(monkeypatch):
-    def _set(mode: str) -> None:
-        monkeypatch.setenv("BLEMEES_FAKE_MODE", mode)
-
-    return _set
-
-
 @pytest_asyncio.fixture
-async def daemon_and_socket(tmp_path, argv_trace_path, monkeypatch, request):
-    """Start a daemon bound to a tmp socket using the fake claude stub.
+async def daemon_and_socket(tmp_path, request):
+    """Start a daemon bound to a tmp socket driving the fake ACP agent.
 
     Yields ``(Daemon, socket_path)``. The daemon is shut down on teardown.
-
-    Tests may parametrize extra config via ``indirect``-style attrs on the
-    request's ``node.stash`` or by reading the ``daemon_config`` fixture.
+    Per-test overrides (ring_buffer_size, event_log_dir) come via
+    ``request.param`` for indirectly-parametrized tests.
     """
-    monkeypatch.setenv("BLEMEES_FAKE_ARGV_FILE", str(argv_trace_path))
-    monkeypatch.setenv("BLEMEES_FAKE_MODE", os.environ.get("BLEMEES_FAKE_MODE", "normal"))
-
     # macOS sun_path is 104 bytes; pytest's tmp_path on macOS CI overflows
     # that limit for nested socket files. Bind under /tmp instead.
     socket_path = short_socket_path("blemeesd-test")
     overrides = getattr(request, "param", None) or {}
     cfg = Config(
         socket_path=str(socket_path),
-        claude_bin=f"{sys.executable}",  # will be overridden below
+        agent_command=sys.executable,
+        agent_args=[str(FAKE_ACP)],
         idle_timeout_s=60,
         max_concurrent_sessions=8,
         ring_buffer_size=overrides.get("ring_buffer_size", 1024),
         event_log_dir=overrides.get("event_log_dir"),
     )
-    # We can't spawn "python fake_claude.py" with create_subprocess_exec using
-    # a single binary; use the fake script's shebang by making the "binary"
-    # path the python interpreter and injecting a wrapper. Simpler: swap
-    # claude_bin to point at the fake script directly (shebang runs it).
-    cfg.claude_bin = str(FAKE_CLAUDE)
-    cfg.codex_bin = str(FAKE_CODEX)
 
     logger = configure("error")
     daemon = Daemon(cfg, logger)
@@ -186,9 +152,9 @@ async def client_factory(daemon_and_socket):
     async def make() -> _StreamClient:
         reader, writer = await asyncio.open_unix_connection(socket_path)
         c = _StreamClient(reader, writer)
-        await c.send({"type": "agent.hello", "client": "test/0", "protocol": PROTOCOL_VERSION})
+        await c.send({"type": "hello", "client": "test/0", "protocol": PROTOCOL_VERSION})
         ack = await c.recv()
-        assert ack["type"] == "agent.hello_ack", ack
+        assert ack["type"] == "hello_ack", ack
         created.append(c)
         return c
 

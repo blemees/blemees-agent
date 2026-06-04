@@ -6,7 +6,10 @@ SDK so ``AcpBackend`` can be exercised without a real agent binary. Behaviour
 is driven by the prompt text so a single stub covers several scenarios:
 
 * default          → stream two text chunks, stop ``end_turn``.
-* contains "hang"  → sleep until cancelled (exercises interrupt → ``cancelled``).
+* contains "hang"  → emit one chunk, then sleep until cancelled (interrupt /
+                     never-finishing-turn for shutdown force-kill tests).
+* contains "finish"→ emit one chunk, sleep ~0.5s, finish ``end_turn`` (graceful
+                     shutdown: turn completes within the grace window).
 * contains "boom"  → raise, so the turn surfaces as an agent error.
 
 Run as: ``python fake_acp.py`` (stdio).
@@ -57,14 +60,24 @@ class FakeAgent(acp.Agent):
         if "boom" in text:
             raise RuntimeError("synthetic agent failure")
 
+        assert self._conn is not None
+
         if "hang" in text:
+            # Emit one chunk so the client can observe the turn is in flight,
+            # then block until cancelled / killed.
+            await self._conn.session_update(session_id, update_agent_message_text("working"))
             try:
                 await asyncio.sleep(30)
             except asyncio.CancelledError:
                 return PromptResponse(stop_reason="cancelled")
             return PromptResponse(stop_reason="end_turn")
 
-        assert self._conn is not None
+        if "finish" in text:
+            await self._conn.session_update(session_id, update_agent_message_text("working"))
+            await asyncio.sleep(0.5)
+            await self._conn.session_update(session_id, update_agent_message_text(" done"))
+            return PromptResponse(stop_reason="end_turn")
+
         await self._conn.session_update(session_id, update_agent_message_text("PONG"))
         await self._conn.session_update(session_id, update_agent_message_text(" done"))
         return PromptResponse(stop_reason="end_turn")

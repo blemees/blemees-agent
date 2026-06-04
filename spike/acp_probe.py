@@ -11,6 +11,7 @@ will play). Throwaway: prints a JSON report; does not touch the daemon code.
 Run:  uv run spike/acp_probe.py            # all agents
       uv run spike/acp_probe.py codex-acp  # one agent by name
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -77,9 +78,10 @@ class ProbeClient(acp.Client):
 async def _probe(agent: dict) -> dict:
     res: dict = {"name": agent["name"], "cmd": agent["cmd"]}
     client = ProbeClient()
-    async with spawn_agent_process(
-        client, agent["cmd"], *agent["args"], env=dict(os.environ)
-    ) as (conn, _proc):
+    async with spawn_agent_process(client, agent["cmd"], *agent["args"], env=dict(os.environ)) as (
+        conn,
+        _proc,
+    ):
         # 1) initialize with EMPTY client capabilities (no fs, no terminal)
         init = await conn.initialize(
             protocol_version=PROTOCOL_VERSION,
@@ -122,7 +124,9 @@ async def _probe(agent: dict) -> dict:
         # 4) turn 2 — in-process multi-turn memory
         client.assistant_text.clear()
         p2 = await conn.prompt(
-            prompt=[text_block("What single word did I just ask you to say? Reply with only that word.")],
+            prompt=[
+                text_block("What single word did I just ask you to say? Reply with only that word.")
+            ],
             session_id=sid,
             message_id=str(uuid4()),
         )
@@ -135,10 +139,12 @@ async def _probe(agent: dict) -> dict:
         client.assistant_text.clear()
         before = client.permission_requests
         p3 = await conn.prompt(
-            prompt=[text_block(
-                "Use your tools to create a file named spike.txt containing the word hi "
-                "in the current working directory, then tell me done."
-            )],
+            prompt=[
+                text_block(
+                    "Use your tools to create a file named spike.txt containing the word hi "
+                    "in the current working directory, then tell me done."
+                )
+            ],
             session_id=sid,
             message_id=str(uuid4()),
         )

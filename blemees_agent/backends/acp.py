@@ -260,17 +260,15 @@ class AcpBackend:
             self._stderr_task = None
         proc = self._proc
         if proc is not None and proc.returncode is None:
-            try:
+            # ProcessLookupError: the agent may have exited between the
+            # returncode check and the signal — safe to ignore during teardown.
+            with contextlib.suppress(ProcessLookupError):
                 proc.terminate()
-            except ProcessLookupError:
-                pass
             try:
                 await asyncio.wait_for(proc.wait(), timeout=0.5)
             except TimeoutError:
-                try:
+                with contextlib.suppress(ProcessLookupError):
                     proc.kill()
-                except ProcessLookupError:
-                    pass
                 with contextlib.suppress(asyncio.CancelledError):
                     await proc.wait()
 

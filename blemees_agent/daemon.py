@@ -968,11 +968,11 @@ class Daemon:
         except TimeoutError:
             self._log.warning("daemon.shutdown_supervisor_timeout")
 
-        for task in (self._reaper_task, self._proc_reaper_task):
-            if task is not None:
-                task.cancel()
-                with contextlib.suppress(BaseException):
-                    await task
+        reapers = [t for t in (self._reaper_task, self._proc_reaper_task) if t is not None]
+        for task in reapers:
+            task.cancel()
+        if reapers:
+            await asyncio.gather(*reapers, return_exceptions=True)
 
         # Unlink the socket file.
         try:

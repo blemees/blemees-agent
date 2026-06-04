@@ -81,12 +81,13 @@ def test_parse_hello_rejects_extra_keys():
 
 
 def test_hello_ack_shape():
-    ack = hello_ack("0.2.0", 1234, {"claude-agent-acp": "available"})
+    ack = hello_ack("0.2.0", 1234, {"claude-agent-acp": "available"}, ["default", "codex"])
     assert ack["type"] == "hello_ack"
     assert ack["daemon"] == "blemees-agentd/0.2.0"
     assert ack["protocol"] == PROTOCOL_VERSION
     assert ack["pid"] == 1234
     assert ack["agents"] == {"claude-agent-acp": "available"}
+    assert ack["profiles"] == ["default", "codex"]
 
 
 # ---------------------------------------------------------------------------

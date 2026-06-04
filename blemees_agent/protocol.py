@@ -32,7 +32,9 @@ def encode(obj: dict[str, Any]) -> bytes:
     return (json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
 
 
-def hello_ack(daemon_version: str, pid: int, agents: dict[str, str]) -> dict[str, Any]:
+def hello_ack(
+    daemon_version: str, pid: int, agents: dict[str, str], profiles: list[str]
+) -> dict[str, Any]:
     return {
         "type": "hello_ack",
         "daemon": f"blemees-agentd/{daemon_version}",
@@ -40,6 +42,8 @@ def hello_ack(daemon_version: str, pid: int, agents: dict[str, str]) -> dict[str
         "pid": pid,
         # Detected ACP agent binaries (name → version-ish), best-effort.
         "agents": dict(agents),
+        # Configured profile names (#17).
+        "profiles": list(profiles),
     }
 
 
@@ -124,8 +128,20 @@ class OpenMessage:
     session_id: str
     options: dict[str, Any]
     resume: bool
+    profile: str | None = None
     last_seen_seq: int | None = None
     alias: str | None = None
+
+
+@dataclasses.dataclass(slots=True)
+class ProfileListMessage:
+    id: str | None
+
+
+@dataclasses.dataclass(slots=True)
+class ProfileActionMessage:
+    id: str | None
+    name: str
 
 
 @dataclasses.dataclass(slots=True)
@@ -199,7 +215,7 @@ def parse_hello(obj: dict[str, Any]) -> HelloMessage:
 
 
 _OPEN_TOP_LEVEL = frozenset(
-    {"type", "id", "session_id", "resume", "last_seen_seq", "options", "alias"}
+    {"type", "id", "session_id", "resume", "last_seen_seq", "options", "alias", "profile"}
 )
 
 
@@ -223,14 +239,32 @@ def parse_open(obj: dict[str, Any]) -> OpenMessage:
     if alias is not None and not isinstance(alias, str):
         raise ProtocolError("'alias' must be a string")
 
+    profile = obj.get("profile")
+    if profile is not None and (not isinstance(profile, str) or not profile):
+        raise ProtocolError("'profile' must be a non-empty string when set")
+
     return OpenMessage(
         id=_opt_str_id(obj),
         session_id=session_id,
         options=options_field,
         resume=resume,
+        profile=profile,
         last_seen_seq=last_seen_seq,
         alias=alias or None,
     )
+
+
+def parse_profile_list(obj: dict[str, Any]) -> ProfileListMessage:
+    _reject_extra_keys(obj, frozenset({"type", "id"}))
+    return ProfileListMessage(id=_opt_str_id(obj))
+
+
+def parse_profile_action(obj: dict[str, Any]) -> ProfileActionMessage:
+    _reject_extra_keys(obj, frozenset({"type", "id", "name"}))
+    name = obj.get("name")
+    if not isinstance(name, str) or not name:
+        raise ProtocolError("profile action requires non-empty 'name'")
+    return ProfileActionMessage(id=_opt_str_id(obj), name=name)
 
 
 def parse_prompt(obj: dict[str, Any]) -> PromptMessage:

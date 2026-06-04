@@ -20,7 +20,6 @@ from pathlib import Path
 from typing import Any
 
 from . import PROTOCOL_VERSION, __version__
-from .backends.acp import AcpBackend
 from .config import Config
 from .errors import (
     DAEMON_SHUTDOWN,
@@ -60,6 +59,8 @@ from .protocol import (
     parse_list,
     parse_open,
     parse_ping,
+    parse_profile_action,
+    parse_profile_list,
     parse_prompt,
     parse_session_info,
     parse_status,
@@ -67,6 +68,7 @@ from .protocol import (
     parse_watch,
 )
 from .session import SessionTable, make_reaper
+from .supervisor import Supervisor
 
 # Reserved `blemeesd.*` types that the daemon explicitly refuses with
 # ``unknown_message`` (Appendix B). All four originally-reserved verbs
@@ -123,6 +125,7 @@ class Connection:
         sessions: SessionTable,
         logger: StructuredLogger,
         agents: dict[str, str],
+        supervisor: Supervisor,
         shutdown_event: asyncio.Event,
         lookup_connection: Callable[[int], Connection | None] | None = None,
         status_snapshot: Callable[[], dict[str, Any]] | None = None,
@@ -133,6 +136,7 @@ class Connection:
         self._config = config
         self._sessions = sessions
         self._agents = agents
+        self._supervisor = supervisor
         self._shutdown = shutdown_event
         self._lookup_connection = lookup_connection
         self._status_snapshot = status_snapshot
@@ -219,6 +223,7 @@ class Connection:
                 daemon_version=__version__,
                 pid=os.getpid(),
                 agents=self._agents,
+                profiles=self._supervisor.profile_names(),
             )
         )
         self._log.info("connection.hello", client=hello.client)
@@ -283,6 +288,12 @@ class Connection:
                 await self._handle_unwatch(parse_unwatch(obj))
             elif msg_type == "session.info":
                 await self._handle_session_info(parse_session_info(obj))
+            elif msg_type == "profile.list":
+                await self._handle_profile_list(parse_profile_list(obj))
+            elif msg_type == "profile.start":
+                await self._handle_profile_start(parse_profile_action(obj))
+            elif msg_type == "profile.stop":
+                await self._handle_profile_stop(parse_profile_action(obj))
             elif msg_type == "hello":
                 await self._emit_error(INVALID_MESSAGE, "duplicate hello", id=obj.get("id"))
             else:
@@ -310,24 +321,19 @@ class Connection:
     # ------------------------------------------------------------------
 
     def _make_backend(self, msg: OpenMessage, *, on_event):
-        """Construct the per-session ACP backend from the open message.
+        """Construct the per-session ACP handle bound to the profile's process.
 
-        blemees/3 (#16) drives one configured ACP agent binary. Profiles
-        (#17) will supply per-session command/args/model and resume
-        (#23) will reuse the agent's ``session/load``.
+        The supervisor owns one ACP agent process per profile (#17) and
+        multiplexes sessions onto it; the handle is the per-session view.
         """
-        return AcpBackend(
-            session_id=msg.session_id,
-            command=self._config.agent_command,
-            args=list(self._config.agent_args),
-            cwd=msg.options.get("cwd"),
-            on_event=on_event,
-            logger=self._log,
-            model=msg.options.get("model"),
-            alias=msg.alias,
+        return self._supervisor.make_handle(
+            msg.profile, on_event=on_event, cwd=msg.options.get("cwd")
         )
 
     async def _handle_open(self, msg: OpenMessage) -> None:
+        # Validate the profile up front so an unknown name fails cleanly
+        # (profile_unknown) before we register a session.
+        self._supervisor.get_profile(msg.profile)
         existing = self._sessions.try_get(msg.session_id)
         if existing is not None and not msg.resume:
             raise SessionExistsError(msg.session_id)
@@ -385,6 +391,7 @@ class Connection:
             "type": "session.opened",
             "id": msg.id,
             "session_id": msg.session_id,
+            "profile": msg.profile or "default",
             "subprocess_pid": sess.backend.pid,
             "last_seq": sess.seq,
             "view_only": False,
@@ -620,6 +627,34 @@ class Connection:
         await self._emit_frame(frame)
 
     # ------------------------------------------------------------------
+    # Profiles (#17)
+    # ------------------------------------------------------------------
+
+    async def _handle_profile_list(self, msg) -> None:
+        await self._emit_frame(
+            {"type": "profiles", "id": msg.id, "profiles": self._supervisor.profile_list()}
+        )
+
+    async def _handle_profile_start(self, msg) -> None:
+        # get_profile raises ProfileUnknownError (→ profile_unknown) for a bad name.
+        self._supervisor.get_profile(msg.name)
+        try:
+            proc = await self._supervisor.start(msg.name)
+        except SpawnFailedError as exc:
+            await self._emit_error(SPAWN_FAILED, exc.message, id=msg.id)
+            return
+        await self._emit_frame(
+            {"type": "profile.started", "id": msg.id, "name": msg.name, "pid": proc.pid}
+        )
+
+    async def _handle_profile_stop(self, msg) -> None:
+        self._supervisor.get_profile(msg.name)
+        stopped = await self._supervisor.stop(msg.name)
+        await self._emit_frame(
+            {"type": "profile.stopped", "id": msg.id, "name": msg.name, "was_running": stopped}
+        )
+
+    # ------------------------------------------------------------------
     # Writer side
     # ------------------------------------------------------------------
 
@@ -768,7 +803,9 @@ class Daemon:
         self._connections: set[Connection] = set()
         self._shutdown_event = asyncio.Event()
         self._reaper_task: asyncio.Task | None = None
+        self._proc_reaper_task: asyncio.Task | None = None
         self._agents: dict[str, str] = {}
+        self._supervisor = Supervisor(config, logger)
         self._start_time: float = time.monotonic()
 
     async def start(self) -> None:
@@ -781,6 +818,9 @@ class Daemon:
         )
         os.chmod(self._config.socket_path, 0o600)
         self._reaper_task = make_reaper(self._sessions, self._log)
+        self._proc_reaper_task = asyncio.create_task(
+            self._reap_idle_processes(), name="blemees-proc-reaper"
+        )
         self._log.info(
             "daemon.start",
             socket=self._config.socket_path,
@@ -797,6 +837,7 @@ class Daemon:
             sessions=self._sessions,
             logger=self._log,
             agents=self._agents,
+            supervisor=self._supervisor,
             shutdown_event=self._shutdown_event,
             lookup_connection=self._lookup_connection,
             status_snapshot=self._status_snapshot,
@@ -830,6 +871,7 @@ class Daemon:
             "uptime_s": round(now - self._start_time, 3),
             "socket_path": self._config.socket_path,
             "agents": dict(self._agents),
+            "profiles": self._supervisor.profile_list(),
             "connections": len(self._connections),
             "sessions": {
                 "total": total,
@@ -847,6 +889,19 @@ class Daemon:
                 "max_line_bytes": self._config.max_line_bytes,
             },
         }
+
+    async def _reap_idle_processes(self) -> None:
+        """Periodically close profile agent processes with no sessions."""
+        while True:
+            try:
+                await asyncio.sleep(30.0)
+                reaped = await self._supervisor.reap_idle(self._config.idle_timeout_s)
+                if reaped:
+                    self._log.info("profile.reaped", profiles=reaped)
+            except asyncio.CancelledError:
+                return
+            except Exception:  # pragma: no cover - defensive
+                self._log.exception("profile.reaper_error")
 
     async def serve_forever(self) -> None:
         assert self._server is not None
@@ -903,16 +958,21 @@ class Daemon:
             except TimeoutError:
                 self._log.warning("daemon.shutdown_grace_expired", still_running=len(active))
 
-        # Force phase: kill anything still alive.
+        # Force phase: drop sessions, then terminate all profile agent processes.
         try:
             await asyncio.wait_for(self._sessions.shutdown(), timeout=_SHUTDOWN_BUDGET_S)
         except TimeoutError:
             self._log.warning("daemon.shutdown_timeout")
+        try:
+            await asyncio.wait_for(self._supervisor.close_all(), timeout=_SHUTDOWN_BUDGET_S)
+        except TimeoutError:
+            self._log.warning("daemon.shutdown_supervisor_timeout")
 
-        if self._reaper_task is not None:
-            self._reaper_task.cancel()
-            with contextlib.suppress(BaseException):
-                await self._reaper_task
+        for task in (self._reaper_task, self._proc_reaper_task):
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(BaseException):
+                    await task
 
         # Unlink the socket file.
         try:

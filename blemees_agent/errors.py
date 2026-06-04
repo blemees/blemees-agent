@@ -11,6 +11,8 @@ PROTOCOL_MISMATCH = "protocol_mismatch"
 INVALID_MESSAGE = "invalid_message"
 UNKNOWN_MESSAGE = "unknown_message"
 UNKNOWN_BACKEND = "unknown_backend"
+PROFILE_UNKNOWN = "profile_unknown"
+AGENT_UNAVAILABLE = "agent_unavailable"
 UNSAFE_FLAG = "unsafe_flag"
 SESSION_UNKNOWN = "session_unknown"
 SESSION_EXISTS = "session_exists"
@@ -63,6 +65,12 @@ class UnknownBackendError(BlemeesError):
     def __init__(self, backend: str) -> None:
         super().__init__(UNKNOWN_BACKEND, f"unknown backend: {backend!r}")
         self.backend = backend
+
+
+class ProfileUnknownError(BlemeesError):
+    def __init__(self, profile: str) -> None:
+        super().__init__(PROFILE_UNKNOWN, f"no such profile: {profile!r}")
+        self.profile = profile
 
 
 class SessionUnknownError(BlemeesError):

@@ -32,6 +32,7 @@ from acp.schema import (
 class FakeAgent(acp.Agent):
     def __init__(self) -> None:
         self._conn: acp.AgentSideConnection | None = None
+        self._session_seq = 0
 
     def on_connect(self, conn: acp.AgentSideConnection) -> None:
         self._conn = conn
@@ -43,7 +44,9 @@ class FakeAgent(acp.Agent):
         )
 
     async def new_session(self, cwd, additional_directories=None, mcp_servers=None, **kw):
-        return NewSessionResponse(session_id="fake-session-1")
+        # Unique id per session so one process can multiplex several.
+        self._session_seq += 1
+        return NewSessionResponse(session_id=f"fake-session-{self._session_seq}")
 
     async def load_session(
         self, cwd, session_id, additional_directories=None, mcp_servers=None, **kw

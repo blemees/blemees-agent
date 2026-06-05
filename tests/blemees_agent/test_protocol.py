@@ -12,8 +12,10 @@ from blemees_agent.protocol import (
     encode,
     error_frame,
     hello_ack,
+    parse_attach,
     parse_cancel,
     parse_close,
+    parse_detach,
     parse_hello,
     parse_line,
     parse_list,
@@ -22,8 +24,6 @@ from blemees_agent.protocol import (
     parse_prompt,
     parse_session_info,
     parse_status,
-    parse_unwatch,
-    parse_watch,
 )
 
 # ---------------------------------------------------------------------------
@@ -258,14 +258,25 @@ def test_parse_status_rejects_extra_keys():
         parse_status({"type": "status", "extra": 1})
 
 
-def test_parse_watch_rejects_extra_keys():
-    with pytest.raises(ProtocolError, match="unexpected field"):
-        parse_watch({"type": "session.watch", "session_id": "s1", "extra": 1})
+def test_parse_attach_role_and_default():
+    assert parse_attach({"type": "session.attach", "session_id": "s1"}).role == "viewer"
+    m = parse_attach({"type": "session.attach", "session_id": "s1", "as": "owner"})
+    assert m.role == "owner"
 
 
-def test_parse_unwatch_rejects_extra_keys():
+def test_parse_attach_rejects_bad_role():
+    with pytest.raises(ProtocolError):
+        parse_attach({"type": "session.attach", "session_id": "s1", "as": "boss"})
+
+
+def test_parse_attach_rejects_extra_keys():
     with pytest.raises(ProtocolError, match="unexpected field"):
-        parse_unwatch({"type": "session.unwatch", "session_id": "s1", "extra": 1})
+        parse_attach({"type": "session.attach", "session_id": "s1", "extra": 1})
+
+
+def test_parse_detach_rejects_extra_keys():
+    with pytest.raises(ProtocolError, match="unexpected field"):
+        parse_detach({"type": "session.detach", "session_id": "s1", "extra": 1})
 
 
 def test_parse_session_info_rejects_extra_keys():

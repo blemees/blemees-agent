@@ -52,8 +52,10 @@ from .protocol import (
     encode,
     error_frame,
     hello_ack,
+    parse_attach,
     parse_cancel,
     parse_close,
+    parse_detach,
     parse_hello,
     parse_line,
     parse_list,
@@ -64,8 +66,6 @@ from .protocol import (
     parse_prompt,
     parse_session_info,
     parse_status,
-    parse_unwatch,
-    parse_watch,
 )
 from .session import SessionTable, make_reaper
 from .supervisor import Supervisor
@@ -282,10 +282,10 @@ class Connection:
                 await self._handle_ping(parse_ping(obj))
             elif msg_type == "status":
                 await self._handle_status(parse_status(obj))
-            elif msg_type == "session.watch":
-                await self._handle_watch(parse_watch(obj))
-            elif msg_type == "session.unwatch":
-                await self._handle_unwatch(parse_unwatch(obj))
+            elif msg_type == "session.attach":
+                await self._handle_attach(parse_attach(obj))
+            elif msg_type == "session.detach":
+                await self._handle_detach(parse_detach(obj))
             elif msg_type == "session.info":
                 await self._handle_session_info(parse_session_info(obj))
             elif msg_type == "profile.list":
@@ -558,8 +558,16 @@ class Connection:
         frame = {"type": "status_reply", "id": msg.id, **snap}
         await self._emit_frame(frame)
 
-    async def _handle_watch(self, msg) -> None:
-        """Subscribe to a session's event stream without driving it."""
+    async def _handle_attach(self, msg) -> None:
+        """Attach this connection to an existing session as owner or viewer.
+
+        * ``viewer`` — read-only subscriber; receives the live fan-out and an
+          optional replay, but cannot drive (prompt/cancel/close stay
+          owner-only). Multiple viewers per session are allowed.
+        * ``owner`` — take ownership (takeover): the previous owner is notified
+          with ``session.taken`` and dropped to detached before the writer is
+          switched. The new owner gets the replay + live stream and may drive.
+        """
         sess = self._sessions.try_get(msg.session_id)
         if sess is None:
             await self._emit_error(
@@ -569,37 +577,82 @@ class Connection:
                 session_id=msg.session_id,
             )
             return
+
+        if msg.role == "viewer":
+            summary = await sess.add_watcher(
+                self.id, self._enqueue_to_writer, last_seen_seq=msg.last_seen_seq
+            )
+            self._watched_sessions.add(msg.session_id)
+            await self._emit_frame(
+                {
+                    "type": "session.attached",
+                    "id": msg.id,
+                    "session_id": msg.session_id,
+                    "role": "viewer",
+                    "last_seq": sess.seq,
+                }
+            )
+            self._log.info(
+                "session.attached",
+                session_id=msg.session_id,
+                role="viewer",
+                replayed=summary.get("replayed", 0),
+            )
+            return
+
+        # owner: takeover — notify the prior owner before switching the writer.
+        prev_id = sess.connection_id
+        if prev_id is not None and prev_id != self.id and self._lookup_connection is not None:
+            prev = self._lookup_connection(prev_id)
+            if prev is not None:
+                await prev.notify_session_taken(msg.session_id, by_peer_pid=self._peer_pid)
+        self._owned_sessions.add(msg.session_id)
         await self._emit_frame(
             {
-                "type": "session.watching",
+                "type": "session.attached",
                 "id": msg.id,
                 "session_id": msg.session_id,
+                "role": "owner",
                 "last_seq": sess.seq,
             }
         )
-        summary = await sess.add_watcher(
-            self.id, self._enqueue_to_writer, last_seen_seq=msg.last_seen_seq
+        summary = await sess.attach(
+            self.id,
+            self._enqueue_to_writer,
+            last_seen_seq=(msg.last_seen_seq if msg.last_seen_seq is not None else 0),
         )
-        self._watched_sessions.add(msg.session_id)
         self._log.info(
-            "session.watched",
+            "session.attached",
             session_id=msg.session_id,
+            role="owner",
             replayed=summary.get("replayed", 0),
         )
 
-    async def _handle_unwatch(self, msg) -> None:
-        """Unsubscribe a prior ``agent.watch``. No-op if not watching."""
-        sess = self._sessions.try_get(msg.session_id)
-        removed = False
-        if sess is not None:
-            removed = sess.remove_watcher(self.id)
-        self._watched_sessions.discard(msg.session_id)
+    async def _handle_detach(self, msg) -> None:
+        """Detach this connection from a session, leaving it running.
+
+        Owner detach unhooks the writer (the session stays alive and
+        reattachable); viewer detach unsubscribes. Either way the agent
+        session keeps running.
+        """
+        was_attached = False
+        if msg.session_id in self._owned_sessions:
+            self._owned_sessions.discard(msg.session_id)
+            sess = self._sessions.try_get(msg.session_id)
+            if sess is not None and sess.connection_id == self.id:
+                sess.detach_writer()
+            was_attached = True
+        else:
+            sess = self._sessions.try_get(msg.session_id)
+            if sess is not None and sess.remove_watcher(self.id):
+                was_attached = True
+            self._watched_sessions.discard(msg.session_id)
         await self._emit_frame(
             {
-                "type": "session.unwatched",
+                "type": "session.detached",
                 "id": msg.id,
                 "session_id": msg.session_id,
-                "was_watching": removed,
+                "was_attached": was_attached,
             }
         )
 

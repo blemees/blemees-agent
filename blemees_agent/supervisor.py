@@ -24,12 +24,21 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import shutil
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .backends.acp import AcpAgentProcess, AcpSessionHandle
 from .config import Config
-from .errors import ProfileUnknownError
+from .errors import (
+    AgentUnavailableError,
+    ProfileExistsError,
+    ProfileProtectedError,
+    ProfileUnknownError,
+)
+
+if TYPE_CHECKING:
+    from .registry import Registry
 
 DEFAULT_PROFILE = "default"
 DEFAULT_AGENT = "default"
@@ -86,6 +95,39 @@ def _agent_from_spec(name: str, spec: dict[str, Any], fallback_command: str) -> 
     )
 
 
+def _profile_from_spec(name: str, pspec: dict[str, Any], fallback_command: str) -> Profile | None:
+    """Build one :class:`Profile` from a raw spec dict (config table or the
+    over-wire ``profile`` object, #25).
+
+    Agent shape, most specific first: an ``agents`` table (multi-agent), a
+    single ``agent`` object (becomes the ``default`` agent), or flat sugar
+    where the profile body itself is the single ``default`` agent's spec.
+    """
+    agents_spec = pspec.get("agents")
+    if isinstance(agents_spec, dict) and agents_spec:
+        agents = {
+            aname: _agent_from_spec(aname, aspec, fallback_command)
+            for aname, aspec in agents_spec.items()
+            if isinstance(aspec, dict)
+        }
+    elif isinstance(pspec.get("agent"), dict):
+        agents = {DEFAULT_AGENT: _agent_from_spec(DEFAULT_AGENT, pspec["agent"], fallback_command)}
+    else:
+        agents = {DEFAULT_AGENT: _agent_from_spec(DEFAULT_AGENT, pspec, fallback_command)}
+    if not agents:
+        return None
+    policy = pspec.get("permission_policy")
+    notify = pspec.get("notify")
+    return Profile(
+        name=name,
+        agents=agents,
+        permission_policy=(
+            dict(policy) if isinstance(policy, dict) else {"mode": "relay", "detached": "stall"}
+        ),
+        notify=dict(notify) if isinstance(notify, dict) else {},
+    )
+
+
 def _profiles_from_config(config: Config) -> dict[str, Profile]:
     """Build the profile registry: a synthesised ``default`` + config-file ones."""
     profiles: dict[str, Profile] = {
@@ -103,43 +145,43 @@ def _profiles_from_config(config: Config) -> dict[str, Profile]:
     for pname, pspec in (config.profiles or {}).items():
         if not isinstance(pspec, dict):
             continue
-        agents_spec = pspec.get("agents")
-        if isinstance(agents_spec, dict) and agents_spec:
-            agents = {
-                aname: _agent_from_spec(aname, aspec, config.agent_command)
-                for aname, aspec in agents_spec.items()
-                if isinstance(aspec, dict)
-            }
-        else:
-            # Flat sugar: the profile body defines a single "default" agent.
-            agents = {DEFAULT_AGENT: _agent_from_spec(DEFAULT_AGENT, pspec, config.agent_command)}
-        if agents:
-            policy = pspec.get("permission_policy")
-            notify = pspec.get("notify")
-            profiles[pname] = Profile(
-                name=pname,
-                agents=agents,
-                permission_policy=(
-                    dict(policy)
-                    if isinstance(policy, dict)
-                    else {"mode": "relay", "detached": "stall"}
-                ),
-                notify=dict(notify) if isinstance(notify, dict) else {},
-            )
+        profile = _profile_from_spec(pname, pspec, config.agent_command)
+        if profile is not None:
+            profiles[pname] = profile
     return profiles
 
 
 class Supervisor:
     """Owns the profile/agent registry and one ACP process per agent."""
 
-    def __init__(self, config: Config, logger: Any) -> None:
+    def __init__(self, config: Config, logger: Any, registry: Registry | None = None) -> None:
         self._config = config
         self._log = logger
+        self._registry = registry
         self._profiles: dict[str, Profile] = _profiles_from_config(config)
+        # Names that come from config (synthesised default + [profiles.*]); these
+        # are config-managed and can't be mutated/deleted over the wire (#25).
+        self._static_names: set[str] = set(self._profiles)
         # (profile, agent) → process
         self._processes: dict[tuple[str, str], AcpAgentProcess] = {}
         # (profile, agent) → monotonic time its last session closed (idle clock)
         self._idle_since: dict[tuple[str, str], float] = {}
+
+    def load_persisted(self) -> None:
+        """Adopt over-wire profiles persisted in the registry (#25). Call after
+        ``registry.load()``. A persisted name colliding with a config-managed
+        one is skipped — config wins."""
+        if self._registry is None:
+            return
+        for spec in self._registry.all_profiles():
+            name = spec.get("name")
+            if not isinstance(name, str) or name in self._static_names:
+                if name in self._static_names:
+                    self._log.warning("profile.persisted_shadowed_by_config", profile=name)
+                continue
+            profile = _profile_from_spec(name, spec, self._config.agent_command)
+            if profile is not None:
+                self._profiles[name] = profile
 
     # -- registry -------------------------------------------------------
 
@@ -213,6 +255,9 @@ class Supervisor:
 
     async def start(self, name: str | None) -> list[AcpAgentProcess]:
         profile = self.get_profile(name)
+        # Surface a missing binary as agent_unavailable rather than a spawn
+        # crash partway through starting the profile's agents (#25).
+        self._validate_agents_available(profile)
         started: list[AcpAgentProcess] = []
         for agent in profile.agents.values():
             proc = self._process_for(profile, agent)
@@ -232,6 +277,62 @@ class Supervisor:
                 stopped += 1
         return stopped
 
+    # -- over-wire CRUD (#25) -------------------------------------------
+
+    def _validate_agents_available(self, profile: Profile) -> None:
+        """Raise :class:`AgentUnavailableError` if any agent binary is missing.
+
+        ``shutil.which`` resolves both bare names on ``$PATH`` and explicit
+        paths, so a typo'd profile fails cleanly here rather than as a spawn
+        crash on first ``session.open``."""
+        for agent in profile.agents.values():
+            if shutil.which(agent.command) is None:
+                raise AgentUnavailableError(agent.command, profile=profile.name)
+
+    def _ensure_mutable(self, name: str) -> None:
+        if name in self._static_names:
+            raise ProfileProtectedError(name)
+
+    def create_profile(self, name: str, spec: dict[str, Any]) -> Profile:
+        if name in self._profiles:
+            raise ProfileExistsError(name)
+        profile = _profile_from_spec(name, spec, self._config.agent_command)
+        if profile is None:
+            raise ProfileUnknownError(name)  # malformed spec → no agents
+        self._validate_agents_available(profile)
+        self._profiles[name] = profile
+        self._persist_profile(name, spec)
+        return profile
+
+    async def update_profile(self, name: str, spec: dict[str, Any]) -> Profile:
+        if name not in self._profiles:
+            raise ProfileUnknownError(name)
+        self._ensure_mutable(name)
+        profile = _profile_from_spec(name, spec, self._config.agent_command)
+        if profile is None:
+            raise ProfileUnknownError(name)
+        self._validate_agents_available(profile)
+        # Drop running processes so the next open respawns with the new config.
+        await self.stop(name)
+        self._profiles[name] = profile
+        self._persist_profile(name, spec)
+        return profile
+
+    async def delete_profile(self, name: str) -> None:
+        if name not in self._profiles:
+            raise ProfileUnknownError(name)
+        self._ensure_mutable(name)
+        await self.stop(name)
+        self._profiles.pop(name, None)
+        if self._registry is not None:
+            self._registry.remove_profile(name)
+            self._registry.save()
+
+    def _persist_profile(self, name: str, spec: dict[str, Any]) -> None:
+        if self._registry is not None:
+            self._registry.upsert_profile(name, spec)
+            self._registry.save()
+
     def profile_list(self) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         for pname, profile in self._profiles.items():
@@ -247,7 +348,14 @@ class Supervisor:
                         "sessions": proc.session_count() if proc else 0,
                     }
                 )
-            rows.append({"name": pname, "agents": agents})
+            rows.append(
+                {
+                    "name": pname,
+                    "agents": agents,
+                    # config-managed profiles can't be edited over the wire (#25).
+                    "source": "config" if pname in self._static_names else "dynamic",
+                }
+            )
         return rows
 
     # -- reaping / shutdown --------------------------------------------

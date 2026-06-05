@@ -146,6 +146,16 @@ class ProfileActionMessage:
 
 
 @dataclasses.dataclass(slots=True)
+class ProfileMutateMessage:
+    # profile.create / profile.update (#25). ``profile`` is the raw spec dict
+    # (agent(s), model, permission_policy, mcp_servers, notify); ``name`` is the
+    # profile's name (from the frame's top-level ``name`` or ``profile.name``).
+    id: str | None
+    name: str
+    profile: dict[str, Any]
+
+
+@dataclasses.dataclass(slots=True)
 class PromptMessage:
     session_id: str
     # The user turn: a blemees message envelope ``{"role":"user","content":...}``
@@ -288,6 +298,18 @@ def parse_profile_action(obj: dict[str, Any]) -> ProfileActionMessage:
     if not isinstance(name, str) or not name:
         raise ProtocolError("profile action requires non-empty 'name'")
     return ProfileActionMessage(id=_opt_str_id(obj), name=name)
+
+
+def parse_profile_mutate(obj: dict[str, Any]) -> ProfileMutateMessage:
+    _reject_extra_keys(obj, frozenset({"type", "id", "name", "profile"}))
+    profile = obj.get("profile")
+    if not isinstance(profile, dict):
+        raise ProtocolError("profile create/update requires a 'profile' object")
+    # The name may be carried at the top level or inside the profile object.
+    name = obj.get("name") or profile.get("name")
+    if not isinstance(name, str) or not name:
+        raise ProtocolError("profile create/update requires a non-empty 'name'")
+    return ProfileMutateMessage(id=_opt_str_id(obj), name=name, profile=profile)
 
 
 def parse_prompt(obj: dict[str, Any]) -> PromptMessage:

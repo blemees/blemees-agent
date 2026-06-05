@@ -384,9 +384,18 @@ objects.
 
 → {"type":"profile.start","id":"p3","name":"claude-sonnet"}   // explicit, else lazy on first open
 → {"type":"profile.stop","id":"p4","name":"claude-sonnet"}
-→ {"type":"profile.update","id":"p5","name":"…","profile":{…}}
-→ {"type":"profile.delete","id":"p6","name":"…"}
+→ {"type":"profile.update","id":"p5","name":"…","profile":{…}}   ← {"type":"profile.updated",…}
+→ {"type":"profile.delete","id":"p6","name":"…"}                 ← {"type":"profile.deleted",…}
 ```
+Over-wire profiles (`create`/`update`/`delete`) persist to the registry and
+survive a restart, coexisting with config-file profiles. Each `profile.list`
+row carries `source: "config" | "dynamic"`; the synthesised `default` and
+config-file profiles are **config-managed** and reject `update`/`delete`
+(`profile_protected`). The `profile` object accepts an `agents` table, a single
+`agent` object, or flat agent fields (same shape as the config file, §2.2).
+`create` validates each agent binary is on `$PATH` (else `agent_unavailable`)
+and rejects an existing name (`profile_exists`). `delete` of a profile that
+still has live sessions is refused (`profile_in_use`) — close them first.
 
 ### 9.3 Sessions
 ```json
@@ -473,6 +482,9 @@ plus the ACP-era changes:
 | `protocol_mismatch` | Bad protocol version. | Yes |
 | `invalid_message` / `unknown_message` | Malformed / unknown frame. | No |
 | `profile_unknown` | No such profile. | No |
+| `profile_exists` | `profile.create` named an existing profile. | No |
+| `profile_protected` | `profile.update`/`delete` targeted a config-managed profile. | No |
+| `profile_in_use` | `profile.delete` while the profile still has live sessions. | No |
 | `agent_unavailable` | Profile's agent binary missing on `$PATH`. | No |
 | `spawn_failed` | Agent process failed to launch / `initialize` failed. | No |
 | `session_unknown` / `session_exists` / `session_busy` | Session table errors. | No |

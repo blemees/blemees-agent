@@ -52,6 +52,9 @@ class Registry:
     def __init__(self, path: Path | str | None) -> None:
         self._path = Path(path) if path else None
         self._records: dict[str, dict[str, Any]] = {}
+        # Over-wire profiles (#25): the raw profile spec keyed by name, persisted
+        # alongside sessions so dynamically-created profiles survive a restart.
+        self._profiles: dict[str, dict[str, Any]] = {}
 
     @property
     def persistent(self) -> bool:
@@ -71,11 +74,20 @@ class Registry:
                     self._records[rec["session_id"]] = {
                         k: rec.get(k) for k in _RECORD_FIELDS if k in rec
                     }
+        profiles = data.get("profiles") if isinstance(data, dict) else None
+        if isinstance(profiles, list):
+            for spec in profiles:
+                if isinstance(spec, dict) and isinstance(spec.get("name"), str):
+                    self._profiles[spec["name"]] = dict(spec)
 
     def save(self) -> None:
         if self._path is None:
             return
-        payload = {"version": 1, "sessions": list(self._records.values())}
+        payload = {
+            "version": 1,
+            "sessions": list(self._records.values()),
+            "profiles": list(self._profiles.values()),
+        }
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self._path.with_suffix(".json.tmp")
@@ -114,3 +126,18 @@ class Registry:
 
     def all(self) -> list[dict[str, Any]]:
         return [dict(r) for r in self._records.values()]
+
+    # -- over-wire profiles (#25) ---------------------------------------
+
+    def upsert_profile(self, name: str, spec: dict[str, Any]) -> None:
+        self._profiles[name] = {**spec, "name": name}
+
+    def remove_profile(self, name: str) -> bool:
+        return self._profiles.pop(name, None) is not None
+
+    def get_profile_spec(self, name: str) -> dict[str, Any] | None:
+        spec = self._profiles.get(name)
+        return dict(spec) if spec is not None else None
+
+    def all_profiles(self) -> list[dict[str, Any]]:
+        return [dict(s) for s in self._profiles.values()]

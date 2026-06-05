@@ -1,12 +1,26 @@
 # blemees-agentd — Headless agent daemon
 
-**Version:** 0.1
-**Protocol:** `blemees/2`
-**Language:** Python 3.11+, stdlib only (no runtime deps). Type-hinted.
+**Protocol:** `blemees/3`
+**Language:** Python 3.11+ (one runtime dep: `agent-client-protocol`). Type-hinted.
 **Target OS:** Linux, macOS. Windows not supported.
 
-This document is both the README and the authoritative protocol spec.
-Machine-readable JSON Schemas live under [`blemees/schemas/`](blemees/schemas/) and ship inside the wheel — clients can resolve them via `importlib.resources.files("blemees.schemas")`. The unified event vocabulary is documented in [`docs/agent-events.md`](docs/agent-events.md).
+> ## ⚠️ blemees/3 — ACP architecture (current)
+>
+> As of 0.11.0 the daemon is an **ACP supervisor + semantic proxy**: it acts as
+> a client of the [Agent Client Protocol](https://agentclientprotocol.com),
+> spawning ACP agent subprocesses (`claude-agent-acp`, `codex-acp`,
+> `gemini --experimental-acp`) and multiplexing sessions onto them. The model
+> is **Profile → Agent → Session** (#17). The bespoke per-backend translators
+> (`agent.*` vocabulary, `blemees/2`) are retired.
+>
+> **Authoritative wire docs:** [`docs/acp-migration-spec.md`](docs/acp-migration-spec.md) §9
+> (frames), with machine-readable **JSON Schemas** shipped in the wheel under
+> `blemees_agent/schemas/{inbound,outbound}/` — load them via
+> `blemees_agent.schemas.iter_schemas()`. Design rationale:
+> [`docs/acp-migration-plan.md`](docs/acp-migration-plan.md).
+>
+> **Sections 5–6 below describe the retired `blemees/2` wire and are kept for
+> historical reference only — they no longer match the daemon.**
 
 ---
 
@@ -125,15 +139,22 @@ sends an arbitrary JSON frame for protocol experiments.
 
 ## 1. Overview
 
-`blemees-agentd` is a per-user daemon that exposes one or more agent backends
-— currently Claude Code (`claude -p`) and Codex (`codex mcp-server`) — as a
-long-running, multi-session backend over a Unix domain socket. It is a
-thin, general-purpose wrapper: clients get a headless agent they can
-reach from any language, any process.
+`blemees-agentd` is a per-user daemon that supervises **ACP agent
+subprocesses** (`claude-agent-acp`, `codex-acp`, `gemini --experimental-acp`)
+and exposes them as a long-running, multi-session backend over a Unix domain
+socket. It is the **client** side of the
+[Agent Client Protocol](https://agentclientprotocol.com): it spawns one
+process per configured agent, multiplexes ACP sessions onto it, and proxies a
+blemees-native control+data envelope (carrying verbatim ACP payloads) to its
+own clients. Clients get a headless agent reachable from any language.
 
-The daemon is **a translation layer, not a re-interpreter.** It does
-not inject a system prompt, does not implement a tool protocol, does
-not filter events. It:
+> The rest of this section and §§2–6 predate the ACP migration and describe the
+> retired `blemees/2` translator. See [`docs/acp-migration-spec.md`](docs/acp-migration-spec.md)
+> for the current `blemees/3` architecture and wire protocol.
+
+The (retired) blemees/2 daemon was **a translation layer, not a
+re-interpreter.** It did not inject a system prompt, implement a tool
+protocol, or filter events. It:
 
 1. Listens on a Unix socket.
 2. Lets clients open, drive, interrupt, resume, and close sessions on

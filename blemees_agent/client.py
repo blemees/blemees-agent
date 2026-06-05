@@ -156,6 +156,8 @@ class BlemeesClient:
         options: dict[str, Any] | None = None,
         resume: bool = False,
         last_seen_seq: int | None = None,
+        profile: str | None = None,
+        agent: str | None = None,
     ) -> AsyncIterator[Session]:
         self._next_req += 1
         req_id = f"req_{self._next_req}"
@@ -173,6 +175,10 @@ class BlemeesClient:
             frame["resume"] = True
         if last_seen_seq is not None:
             frame["last_seen_seq"] = last_seen_seq
+        if profile is not None:
+            frame["profile"] = profile
+        if agent is not None:
+            frame["agent"] = agent
         await self._send(frame)
         reply = await fut
         if reply.get("type") == "error":

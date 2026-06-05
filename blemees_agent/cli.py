@@ -22,7 +22,7 @@ Usage:
 At the REPL:
 
     blemees-agentctl> help
-    blemees-agentctl> open new cwd=/home/u/proj model=sonnet
+    blemees-agentctl> open new profile=claude cwd=/home/u/proj
     blemees-agentctl> send <id> hello there
     blemees-agentctl> interrupt <id>
     blemees-agentctl> close <id> --delete
@@ -65,8 +65,9 @@ Commands — each sends one wire frame, responses are printed as they arrive:
   session-info <id>            session.info session_id=<id>
 
   open <id|new> [k=v ...]      session.open session_id=<id> …
-                               id 'new' generates a uuid. k=v pairs become
-                               options.* (e.g. cwd=/proj model=sonnet).
+                               id 'new' generates a uuid. profile=/agent=
+                               select the (profile, agent); other k=v pairs
+                               become options.* (e.g. cwd=/proj).
                                Values coerce true/false/int/json.
   resume <id> [k=v ...]        open with resume=true (shortcut)
   close <id> [--delete]        session.close session_id=<id> delete=…
@@ -260,11 +261,14 @@ class Harness:
     async def open(self, session_id: str, fields: dict[str, Any]) -> str:
         if session_id == "new":
             session_id = str(uuid.uuid4())
-        # blemees/3: a session opens against the daemon's configured ACP
-        # agent. Well-known keys are pulled out; the rest become `options`
-        # (e.g. `open new cwd=/proj model=sonnet`).
+        # blemees/3: a session opens under a (profile, agent); the agent's
+        # config (binary, model, …) lives in the daemon. Well-known keys are
+        # pulled to the top level; the rest become `options` (e.g. `cwd`).
+        # Example: `open new profile=claude cwd=/proj`.
         resume = fields.pop("resume", False)
         last_seen_seq = fields.pop("last_seen_seq", None)
+        profile = fields.pop("profile", None)
+        agent = fields.pop("agent", None)
         frame: dict[str, Any] = {
             "type": "session.open",
             "id": _req_id(),
@@ -275,6 +279,10 @@ class Harness:
             frame["resume"] = True
         if last_seen_seq is not None:
             frame["last_seen_seq"] = last_seen_seq
+        if profile is not None:
+            frame["profile"] = profile
+        if agent is not None:
+            frame["agent"] = agent
         await self._send(frame)
         return session_id
 

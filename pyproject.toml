@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "blemees-agent"
-version = "0.10.2"
+version = "0.11.0"
 description = "Headless agent daemon exposing local agent CLIs (Claude Code, Codex) over a Unix socket."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -58,6 +58,9 @@ asyncio_mode = "auto"
 markers = [
     "requires_claude: needs a real `claude` binary authenticated in the test environment",
     "requires_codex: needs a real `codex` binary, authenticated via `codex login`",
+    "requires_claude_acp: needs a real, authenticated `claude-agent-acp` ACP agent (#26)",
+    "requires_codex_acp: needs a real, authenticated `codex-acp` ACP agent (#26)",
+    "requires_gemini_acp: needs a real, authenticated `gemini --experimental-acp` agent (#26)",
 ]
 
 [tool.ruff]

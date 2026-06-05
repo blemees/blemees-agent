@@ -29,6 +29,9 @@ _RECORD_FIELDS = (
     "session_id",
     "profile",
     "agent",
+    # The agent's own session id, persisted so a restart can resume it via
+    # ACP session/load (#23).
+    "native_session_id",
     "cwd",
     "model",
     "mode",

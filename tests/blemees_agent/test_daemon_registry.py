@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import sys
 from pathlib import Path
 
@@ -166,6 +167,108 @@ async def test_event_log_replays_across_restart(state_dir):
                     timeout=10.0,
                 )
                 assert replayed["stop_reason"] == "end_turn"
+            finally:
+                await c.close()
+
+
+async def test_resume_rehydrates_loadsession_agent_across_restart(state_dir):
+    """#23: a loadSession-capable session reloads its agent context across a
+    restart — the prior native session id (from the persistent registry) is
+    rehydrated via session/load, the session is not view-only, and a new turn
+    drives to completion."""
+    sock1 = short_socket_path("blemeesd-res1")
+    sock2 = short_socket_path("blemeesd-res2")
+    with socket_cleanup(sock1), socket_cleanup(sock2):
+        # First daemon: drive a session so the agent's native id is persisted.
+        async with _daemon(state_dir, sock1):
+            c = await _connect(sock1)
+            try:
+                await _drive(c, "s-resume")
+            finally:
+                await c.close()
+        # The agent's native session id was persisted for resume.
+        rec = json.loads((state_dir / "registry.json").read_text())["sessions"][0]
+        assert rec["session_id"] == "s-resume"
+        assert rec["native_session_id"] == "fake-session-1"
+
+        # Second daemon over the same state dir: resume reloads that session.
+        async with _daemon(state_dir, sock2):
+            c = await _connect(sock2)
+            try:
+                await c.send(
+                    {
+                        "type": "session.open",
+                        "id": "o",
+                        "session_id": "s-resume",
+                        "resume": True,
+                        "options": {},
+                    }
+                )
+                opened = await c.wait_for(lambda e: e.get("type") == "session.opened")
+                assert opened["view_only"] is False
+                # Reloaded the prior native session rather than minting a new one.
+                assert opened.get("native_session_id") == "fake-session-1"
+                # Drivable: a fresh turn streams a result to completion.
+                await c.send(
+                    {"type": "session.prompt", "session_id": "s-resume", "prompt": "say pong"}
+                )
+                result = await c.wait_for(lambda e: e.get("type") == "session.result", timeout=30.0)
+                assert result["stop_reason"] == "end_turn"
+            finally:
+                await c.close()
+
+
+async def test_resume_without_loadsession_is_view_only_across_restart(state_dir, monkeypatch):
+    """#23: resuming against an agent that can't reload yields a view-only
+    session — flagged in session.opened / session.info / session.list, and a
+    prompt is rejected with the ``view_only`` error rather than starting a
+    blank turn."""
+    monkeypatch.setenv("BLEMEES_FAKE_NO_LOAD", "1")
+    sock1 = short_socket_path("blemeesd-vo1")
+    sock2 = short_socket_path("blemeesd-vo2")
+    with socket_cleanup(sock1), socket_cleanup(sock2):
+        async with _daemon(state_dir, sock1):
+            c = await _connect(sock1)
+            try:
+                await _drive(c, "s-vonly")
+            finally:
+                await c.close()
+
+        async with _daemon(state_dir, sock2):
+            c = await _connect(sock2)
+            try:
+                await c.send(
+                    {
+                        "type": "session.open",
+                        "id": "o",
+                        "session_id": "s-vonly",
+                        "resume": True,
+                        "options": {},
+                    }
+                )
+                opened = await c.wait_for(lambda e: e.get("type") == "session.opened")
+                assert opened["view_only"] is True
+                # No live ACP session was reloaded, so the opened frame must not
+                # advertise a native id even though one survives in the sidecar.
+                assert "native_session_id" not in opened
+
+                # session.info and session.list both report view-only.
+                await c.send({"type": "session.info", "id": "i", "session_id": "s-vonly"})
+                info = await c.wait_for(lambda e: e.get("type") == "session.info_reply")
+                assert info["view_only"] is True
+
+                await c.send({"type": "session.list", "id": "l"})
+                listing = await c.wait_for(lambda e: e.get("type") == "sessions")
+                row = next(r for r in listing["sessions"] if r["session_id"] == "s-vonly")
+                assert row["view_only"] is True
+
+                # Driving it is rejected up front with the view_only error.
+                await c.send(
+                    {"type": "session.prompt", "session_id": "s-vonly", "prompt": "say pong"}
+                )
+                err = await c.wait_for(lambda e: e.get("type") == "error")
+                assert err["code"] == "view_only"
+                assert err["session_id"] == "s-vonly"
             finally:
                 await c.close()
 

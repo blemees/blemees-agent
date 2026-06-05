@@ -175,6 +175,7 @@ class Supervisor:
         on_event: Any,
         cwd: str | None,
         permission_cb: Any = None,
+        resume_native_id: str | None = None,
     ) -> AcpSessionHandle:
         """Return a per-session handle bound to the (profile, agent)'s lazy process."""
         profile, agent = self.resolve(profile_name, agent_name)
@@ -186,6 +187,7 @@ class Supervisor:
             cwd=cwd or agent.cwd,
             on_close=self._on_session_close,
             permission_cb=permission_cb,
+            resume_native_id=resume_native_id,
         )
 
     async def _on_session_close(self, proc: AcpAgentProcess) -> None:

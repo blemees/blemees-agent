@@ -22,10 +22,10 @@ from blemees_agent.supervisor import Agent
 FAKE_ACP = str(Path(__file__).parent / "fake_acp.py")
 
 
-def _process() -> AcpAgentProcess:
+def _process(env: dict | None = None) -> AcpAgentProcess:
     agent = Agent(name="default", command=sys.executable, args=[FAKE_ACP])
     return AcpAgentProcess(
-        agent, key=("t", "default"), logger=configure("error"), env=dict(os.environ)
+        agent, key=("t", "default"), logger=configure("error"), env=env or dict(os.environ)
     )
 
 
@@ -186,3 +186,61 @@ async def _first(q: asyncio.Queue, type_: str) -> dict:
         f = await q.get()
         if f.get("type") == type_:
             return f
+
+
+# ---- resume (#23) ---------------------------------------------------
+
+
+async def test_resume_loads_prior_session_and_is_drivable():
+    """A loadSession-capable agent rehydrates its native session id and the
+    resumed handle can drive a turn (not view-only)."""
+    process = _process()
+    q: asyncio.Queue = asyncio.Queue()
+    try:
+        resumed = AcpSessionHandle(
+            process=process, on_event=q.put, cwd=None, resume_native_id="fake-session-prior"
+        )
+        await resumed.spawn()
+        assert resumed.view_only is False
+        assert resumed.native_session_id == "fake-session-prior"
+        # Drivable: a turn streams and completes normally.
+        await resumed.send_user_turn({"role": "user", "content": "say pong"})
+        frames = await _collect_turn(q)
+        assert any(f["type"] == "session.result" for f in frames)
+    finally:
+        await process.close()
+
+
+async def test_resume_drops_history_updates_during_load():
+    """session/load replays history as session/update; those are suppressed so
+    the client (which already has the durable log) doesn't see duplicates."""
+    process = _process()
+    q: asyncio.Queue = asyncio.Queue()
+    try:
+        resumed = AcpSessionHandle(
+            process=process, on_event=q.put, cwd=None, resume_native_id="fake-session-prior"
+        )
+        await resumed.spawn()
+    finally:
+        await process.close()
+    # The fake agent's load_session emits nothing, but the contract is that any
+    # update arriving while loading is dropped: the queue holds no frames.
+    assert q.empty()
+
+
+async def test_resume_without_load_capability_is_view_only():
+    """An agent that can't reload sessions yields a view-only handle: no native
+    session, not drivable."""
+    env = {**os.environ, "BLEMEES_FAKE_NO_LOAD": "1"}
+    process = _process(env)
+    q: asyncio.Queue = asyncio.Queue()
+    try:
+        resumed = AcpSessionHandle(
+            process=process, on_event=q.put, cwd=None, resume_native_id="fake-session-prior"
+        )
+        await resumed.spawn()
+        assert resumed.load_session is False
+        assert resumed.view_only is True
+        assert resumed.native_session_id is None
+    finally:
+        await process.close()

@@ -213,6 +213,14 @@ class StatusMessage:
     id: str | None
 
 
+@dataclasses.dataclass(slots=True)
+class NotifyTestMessage:
+    # Fire a synthetic notification through the configured sinks (#24). The
+    # optional ``profile`` selects whose webhook URL to use (global fallback).
+    id: str | None
+    profile: str | None
+
+
 def parse_hello(obj: dict[str, Any]) -> HelloMessage:
     _reject_extra_keys(obj, frozenset({"type", "protocol", "client"}))
     protocol = obj.get("protocol")
@@ -321,6 +329,14 @@ def parse_ping(obj: dict[str, Any]) -> PingMessage:
 def parse_status(obj: dict[str, Any]) -> StatusMessage:
     _reject_extra_keys(obj, frozenset({"type", "id"}))
     return StatusMessage(id=_opt_str_id(obj))
+
+
+def parse_notify_test(obj: dict[str, Any]) -> NotifyTestMessage:
+    _reject_extra_keys(obj, frozenset({"type", "id", "profile"}))
+    profile = obj.get("profile")
+    if profile is not None and (not isinstance(profile, str) or not profile):
+        raise ProtocolError("'profile' must be a non-empty string when set")
+    return NotifyTestMessage(id=_opt_str_id(obj), profile=profile)
 
 
 def parse_attach(obj: dict[str, Any]) -> AttachMessage:

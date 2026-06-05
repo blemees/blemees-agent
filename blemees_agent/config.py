@@ -65,6 +65,10 @@ class Config:
     # client-disconnect soft-detach policy (§5.9). 0 disables (hard-kill
     # immediately).
     shutdown_grace_s: int = 30
+    # Notify service (#24, §6): global fallback webhook URL the daemon POSTs
+    # the notification payload to when a session enters ``needs_attention``
+    # and its profile defines no webhook of its own. ``None`` = no fallback.
+    notify_webhook_url: str | None = None
 
 
 def default_socket_path() -> str:
@@ -104,6 +108,7 @@ def _env_overrides() -> dict[str, Any]:
         "BLEMEES_AGENTD_EVENT_LOG_DIR": "event_log_dir",
         "BLEMEES_AGENTD_STATE_DIR": "state_dir",
         "BLEMEES_AGENTD_SHUTDOWN_GRACE": "shutdown_grace_s",
+        "BLEMEES_AGENTD_NOTIFY_WEBHOOK_URL": "notify_webhook_url",
     }
     out: dict[str, Any] = {}
     for env_name, field in mapping.items():

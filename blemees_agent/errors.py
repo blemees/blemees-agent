@@ -21,6 +21,8 @@ SESSION_BUSY = "session_busy"
 SPAWN_FAILED = "spawn_failed"
 BACKEND_CRASHED = "backend_crashed"
 AUTH_FAILED = "auth_failed"
+# The ACP agent reported it needs the user to authenticate (JSON-RPC -32000).
+AUTH_REQUIRED = "auth_required"
 OVERSIZE_MESSAGE = "oversize_message"
 SLOW_CONSUMER = "slow_consumer"
 DAEMON_SHUTDOWN = "daemon_shutdown"
@@ -95,6 +97,15 @@ class SessionBusyError(BlemeesError):
 class SpawnFailedError(BlemeesError):
     def __init__(self, message: str) -> None:
         super().__init__(SPAWN_FAILED, message)
+
+
+class AuthRequiredError(BlemeesError):
+    """The ACP agent rejected a request because the user must authenticate
+    (the SDK raises ``RequestError`` with JSON-RPC code -32000). Distinct from
+    a generic spawn failure so the notify service can route it (#24, §6)."""
+
+    def __init__(self, message: str = "the agent requires authentication") -> None:
+        super().__init__(AUTH_REQUIRED, message)
 
 
 class OversizeMessageError(BlemeesError):

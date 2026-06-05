@@ -22,6 +22,7 @@ from typing import Any
 from . import PROTOCOL_VERSION, __version__
 from .config import Config
 from .errors import (
+    AUTH_REQUIRED,
     DAEMON_SHUTDOWN,
     INTERNAL,
     INVALID_MESSAGE,
@@ -35,6 +36,7 @@ from .errors import (
     UNKNOWN_MESSAGE,
     UNSAFE_FLAG,
     VIEW_ONLY,
+    AuthRequiredError,
     BlemeesError,
     OversizeMessageError,
     ProtocolError,
@@ -45,6 +47,7 @@ from .errors import (
     UnsafeFlagError,
 )
 from .logging import StructuredLogger
+from .notify import NotifyService, WebhookSink
 from .protocol import (
     _MISSING,
     OpenMessage,
@@ -60,6 +63,7 @@ from .protocol import (
     parse_hello,
     parse_line,
     parse_list,
+    parse_notify_test,
     parse_open,
     parse_permission_response,
     parse_ping,
@@ -131,6 +135,7 @@ class Connection:
         supervisor: Supervisor,
         registry: Registry,
         shutdown_event: asyncio.Event,
+        notify: NotifyService,
         lookup_connection: Callable[[int], Connection | None] | None = None,
         status_snapshot: Callable[[], dict[str, Any]] | None = None,
     ) -> None:
@@ -143,6 +148,7 @@ class Connection:
         self._supervisor = supervisor
         self._registry = registry
         self._shutdown = shutdown_event
+        self._notify = notify
         self._lookup_connection = lookup_connection
         self._status_snapshot = status_snapshot
 
@@ -301,6 +307,8 @@ class Connection:
                 await self._handle_profile_start(parse_profile_action(obj))
             elif msg_type == "profile.stop":
                 await self._handle_profile_stop(parse_profile_action(obj))
+            elif msg_type == "notify.test":
+                await self._handle_notify_test(parse_notify_test(obj))
             elif msg_type == "hello":
                 await self._emit_error(INVALID_MESSAGE, "duplicate hello", id=obj.get("id"))
             else:
@@ -375,8 +383,12 @@ class Connection:
             sess = self._sessions.new_session(msg)
             await self._sessions.register(sess)
 
-        # The session inherits its profile's permission policy (#20).
+        # The session inherits its profile's permission policy (#20) and is
+        # wired to the notify service + its resolved profile name (#24) so the
+        # attention state machine can fire the per-profile webhook.
         sess.permission_policy = dict(profile.permission_policy)
+        sess.notify = self._notify
+        sess.profile_name = profile.name
 
         # On resume, rehydrate the agent's prior session via session/load (#23).
         # The prior agent session id comes from the live session or, across a
@@ -400,6 +412,15 @@ class Connection:
             )
             try:
                 await backend.spawn()
+            except AuthRequiredError as exc:
+                # The owner is here (interactive open) — surface auth distinctly
+                # so they can re-authenticate (#24). No webhook: §6 fires only
+                # when detached, and the detached path is the mid-turn trigger.
+                await self._sessions.remove(msg.session_id, delete_file=False)
+                await self._emit_error(
+                    AUTH_REQUIRED, exc.message, id=msg.id, session_id=msg.session_id
+                )
+                return
             except SpawnFailedError as exc:
                 await self._sessions.remove(msg.session_id, delete_file=False)
                 await self._emit_error(
@@ -498,6 +519,9 @@ class Connection:
             )
             try:
                 await backend.spawn()
+            except AuthRequiredError as exc:
+                await self._emit_error(AUTH_REQUIRED, exc.message, session_id=msg.session_id)
+                return
             except SpawnFailedError as exc:
                 await self._emit_error(SPAWN_FAILED, exc.message, session_id=msg.session_id)
                 return
@@ -596,6 +620,7 @@ class Connection:
             row.update(sess.live_summary(owner_pid=owner_pid))
             row["running"] = sess.backend is not None and sess.backend.running
             row["needs_attention"] = sess.needs_attention
+            row["attention_reason"] = sess.attention_reason
             row["turns"] = sess.turns
 
         sessions = sorted(
@@ -806,6 +831,7 @@ class Connection:
                 frame.setdefault("profile", rec.get("profile"))
                 frame.setdefault("agent", rec.get("agent"))
             frame["needs_attention"] = sess.needs_attention
+            frame["attention_reason"] = sess.attention_reason
             frame["view_only"] = bool(sess.extra.get("view_only", False))
         else:
             frame.update(
@@ -821,6 +847,7 @@ class Connection:
                     "subprocess_running": False,
                     "view_only": bool(rec.get("view_only", False)),
                     "needs_attention": False,
+                    "attention_reason": None,
                 }
             )
         await self._emit_frame(frame)
@@ -860,6 +887,22 @@ class Connection:
                 "id": msg.id,
                 "name": msg.name,
                 "agents_stopped": stopped,
+            }
+        )
+
+    async def _handle_notify_test(self, msg) -> None:
+        """Fire a synthetic notification through the sinks so the user can
+        verify their webhook is reachable (#24). Reports the resolved URL (if
+        any) so a misconfigured profile is obvious."""
+        profile = msg.profile or "default"
+        notification = await self._notify.test(profile=profile)
+        await self._emit_frame(
+            {
+                "type": "notify.test_result",
+                "id": msg.id,
+                "profile": profile,
+                "webhook_configured": self._supervisor.webhook_url_for(profile) is not None,
+                "notification": notification.to_payload(),
             }
         )
 
@@ -1024,6 +1067,12 @@ class Daemon:
         self._supervisor = Supervisor(config, logger)
         registry_path = Path(config.state_dir) / "registry.json" if config.state_dir else None
         self._registry = Registry(registry_path)
+        # Notify service (#24, §6): one webhook sink resolving the per-profile
+        # URL (global fallback). The sink no-ops for profiles with no URL.
+        self._notify = NotifyService(
+            sinks=[WebhookSink(self._supervisor.webhook_url_for, logger)],
+            logger=logger,
+        )
         self._start_time: float = time.monotonic()
 
     async def start(self) -> None:
@@ -1059,6 +1108,7 @@ class Daemon:
             supervisor=self._supervisor,
             registry=self._registry,
             shutdown_event=self._shutdown_event,
+            notify=self._notify,
             lookup_connection=self._lookup_connection,
             status_snapshot=self._status_snapshot,
         )
@@ -1100,6 +1150,9 @@ class Daemon:
                 "active_turns": active,
                 "by_backend": by_backend,
             },
+            # Outstanding needs_attention set (#24): one entry per session
+            # currently awaiting its owner, so an attaching client sees the queue.
+            "attention": self._notify.outstanding(),
             "config": {
                 "ring_buffer_size": self._config.ring_buffer_size,
                 "event_log_enabled": bool(self._log_dir),

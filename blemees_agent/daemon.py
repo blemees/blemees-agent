@@ -27,6 +27,7 @@ from .errors import (
     INTERNAL,
     INVALID_MESSAGE,
     OVERSIZE_MESSAGE,
+    PROFILE_IN_USE,
     PROTOCOL_MISMATCH,
     SESSION_BUSY,
     SESSION_UNKNOWN,
@@ -69,6 +70,7 @@ from .protocol import (
     parse_ping,
     parse_profile_action,
     parse_profile_list,
+    parse_profile_mutate,
     parse_prompt,
     parse_session_info,
     parse_status,
@@ -307,6 +309,12 @@ class Connection:
                 await self._handle_profile_start(parse_profile_action(obj))
             elif msg_type == "profile.stop":
                 await self._handle_profile_stop(parse_profile_action(obj))
+            elif msg_type == "profile.create":
+                await self._handle_profile_create(parse_profile_mutate(obj))
+            elif msg_type == "profile.update":
+                await self._handle_profile_update(parse_profile_mutate(obj))
+            elif msg_type == "profile.delete":
+                await self._handle_profile_delete(parse_profile_action(obj))
             elif msg_type == "notify.test":
                 await self._handle_notify_test(parse_notify_test(obj))
             elif msg_type == "hello":
@@ -890,6 +898,30 @@ class Connection:
             }
         )
 
+    async def _handle_profile_create(self, msg) -> None:
+        # create_profile raises (profile_exists / agent_unavailable) → handled
+        # by the dispatch-level BlemeesError catch.
+        self._supervisor.create_profile(msg.name, msg.profile)
+        await self._emit_frame({"type": "profile.created", "id": msg.id, "name": msg.name})
+
+    async def _handle_profile_update(self, msg) -> None:
+        await self._supervisor.update_profile(msg.name, msg.profile)
+        await self._emit_frame({"type": "profile.updated", "id": msg.id, "name": msg.name})
+
+    async def _handle_profile_delete(self, msg) -> None:
+        # Refuse to delete a profile that still has live sessions (attached or
+        # detached) — they'd be orphaned. The client must close them first (#25).
+        live = [s for s in self._sessions._sessions.values() if s.profile_name == msg.name]
+        if live:
+            await self._emit_error(
+                PROFILE_IN_USE,
+                f"profile {msg.name!r} has {len(live)} live session(s); close them first",
+                id=msg.id,
+            )
+            return
+        await self._supervisor.delete_profile(msg.name)
+        await self._emit_frame({"type": "profile.deleted", "id": msg.id, "name": msg.name})
+
     async def _handle_notify_test(self, msg) -> None:
         """Fire a synthetic notification through the sinks so the user can
         verify their webhook is reachable (#24). Reports the resolved URL (if
@@ -1064,9 +1096,10 @@ class Daemon:
         self._reaper_task: asyncio.Task | None = None
         self._proc_reaper_task: asyncio.Task | None = None
         self._agents: dict[str, str] = {}
-        self._supervisor = Supervisor(config, logger)
         registry_path = Path(config.state_dir) / "registry.json" if config.state_dir else None
         self._registry = Registry(registry_path)
+        # Supervisor reads/writes over-wire profiles through the registry (#25).
+        self._supervisor = Supervisor(config, logger, registry=self._registry)
         # Notify service (#24, §6): one webhook sink resolving the per-profile
         # URL (global fallback). The sink no-ops for profiles with no URL.
         self._notify = NotifyService(
@@ -1078,6 +1111,8 @@ class Daemon:
     async def start(self) -> None:
         self._agents = detect_agents(self._config)
         self._registry.load()
+        # Adopt over-wire profiles persisted by a prior run (#25).
+        self._supervisor.load_persisted()
         _prepare_socket_path(self._config.socket_path, self._log)
 
         self._server = await asyncio.start_unix_server(

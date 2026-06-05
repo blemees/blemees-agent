@@ -12,6 +12,9 @@ INVALID_MESSAGE = "invalid_message"
 UNKNOWN_MESSAGE = "unknown_message"
 UNKNOWN_BACKEND = "unknown_backend"
 PROFILE_UNKNOWN = "profile_unknown"
+PROFILE_EXISTS = "profile_exists"
+PROFILE_PROTECTED = "profile_protected"
+PROFILE_IN_USE = "profile_in_use"
 AGENT_UNAVAILABLE = "agent_unavailable"
 VIEW_ONLY = "view_only"
 UNSAFE_FLAG = "unsafe_flag"
@@ -73,6 +76,33 @@ class UnknownBackendError(BlemeesError):
 class ProfileUnknownError(BlemeesError):
     def __init__(self, profile: str) -> None:
         super().__init__(PROFILE_UNKNOWN, f"no such profile: {profile!r}")
+        self.profile = profile
+
+
+class ProfileExistsError(BlemeesError):
+    def __init__(self, profile: str) -> None:
+        super().__init__(PROFILE_EXISTS, f"profile already exists: {profile!r}")
+        self.profile = profile
+
+
+class ProfileProtectedError(BlemeesError):
+    """An over-wire mutation targeted a config-managed profile (#25). Those
+    come from the config file and can't be changed/deleted over the wire."""
+
+    def __init__(self, profile: str) -> None:
+        super().__init__(PROFILE_PROTECTED, f"profile is config-managed, not editable: {profile!r}")
+        self.profile = profile
+
+
+class AgentUnavailableError(BlemeesError):
+    """A profile references an agent binary that isn't on ``$PATH`` (#25).
+    Raised at create/start time so a bad profile surfaces a clean error
+    rather than a spawn crash later."""
+
+    def __init__(self, command: str, *, profile: str | None = None) -> None:
+        where = f" for profile {profile!r}" if profile else ""
+        super().__init__(AGENT_UNAVAILABLE, f"agent binary not found on PATH{where}: {command!r}")
+        self.command = command
         self.profile = profile
 
 

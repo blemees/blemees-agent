@@ -54,6 +54,12 @@ class Config:
     # When set, outbound frames are appended to ``<event_log_dir>/<session>.jsonl``.
     # Survives daemon restarts; seeds the ring buffer on reopen. Opt-in.
     event_log_dir: str | None = None
+    # Daemon state dir (#21): holds the persistent session registry
+    # (``registry.json``). ``load()`` defaults it to
+    # ``$XDG_STATE_HOME/blemees/agentd``; ``None`` (the dataclass default) means
+    # an in-memory registry that doesn't survive restarts — used by tests that
+    # construct ``Config`` directly so they don't touch the real state dir.
+    state_dir: str | None = None
     # On daemon shutdown, how long (seconds) to let in-flight turns run to
     # completion before force-killing their subprocesses. Mirrors the
     # client-disconnect soft-detach policy (§5.9). 0 disables (hard-kill
@@ -69,6 +75,12 @@ def default_socket_path() -> str:
         return f"/tmp/blemees-agentd-{os.getuid()}.sock"
     # Fallback for Linux without XDG_RUNTIME_DIR set.
     return f"/tmp/blemees-agentd-{os.getuid()}.sock"
+
+
+def default_state_dir() -> str:
+    xdg = os.environ.get("XDG_STATE_HOME")
+    base = Path(xdg) if xdg else Path.home() / ".local" / "state"
+    return str(base / "blemees" / "agentd")
 
 
 def _load_toml(path: Path) -> dict[str, Any]:
@@ -90,6 +102,7 @@ def _env_overrides() -> dict[str, Any]:
         "BLEMEES_AGENTD_IDLE_TIMEOUT": "idle_timeout_s",
         "BLEMEES_AGENTD_RING_BUFFER_SIZE": "ring_buffer_size",
         "BLEMEES_AGENTD_EVENT_LOG_DIR": "event_log_dir",
+        "BLEMEES_AGENTD_STATE_DIR": "state_dir",
         "BLEMEES_AGENTD_SHUTDOWN_GRACE": "shutdown_grace_s",
     }
     out: dict[str, Any] = {}
@@ -116,6 +129,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log-level", dest="log_level", help="debug|info|warning|error")
     parser.add_argument("--log-file", dest="log_file", help="Log file path (default stderr)")
     parser.add_argument("--config", dest="config_path", help="TOML config file")
+    parser.add_argument("--state-dir", dest="state_dir", help="Daemon state dir (registry, logs)")
     parser.add_argument("--version", action="store_true", help="Print version and exit")
     return parser
 
@@ -140,6 +154,7 @@ def load(argv: list[str] | None = None) -> tuple[Config, bool]:
     merged.update(env_values)
     merged.update(cli_values)
     merged.setdefault("socket_path", default_socket_path())
+    merged.setdefault("state_dir", default_state_dir())
 
     fields = {f.name: f for f in dataclasses.fields(Config)}
     cleaned: dict[str, Any] = {}

@@ -286,7 +286,12 @@ class AcpAgentProcess:
         return sid
 
     async def resume_session(
-        self, *, native_session_id: str, cwd: str | None, on_event: EventCallback, permission_cb: Any
+        self,
+        *,
+        native_session_id: str,
+        cwd: str | None,
+        on_event: EventCallback,
+        permission_cb: Any,
     ) -> str:
         """Rehydrate a prior agent session via ACP ``session/load`` (#23).
 

@@ -37,6 +37,12 @@ from .protocol import OpenMessage
 WriterFn = Callable[[dict], Awaitable[None]]
 
 
+def _new_request_id() -> str:
+    import uuid
+
+    return f"perm_{uuid.uuid4().hex[:12]}"
+
+
 @dataclass(slots=True)
 class Session:
     session_id: str
@@ -100,6 +106,18 @@ class Session:
     title: str | None = None
 
     extra: dict[str, Any] = field(default_factory=dict)
+
+    # Permission relay state (#20). ``permission_policy`` is the session's
+    # profile policy: ``{"mode": relay|allow|deny, "detached": stall|allow|deny}``.
+    # ``pending_permissions`` maps a relayed request id → the future the
+    # agent's request_permission call awaits; resolved by the owner's
+    # ``session.permission_response``. ``remembered_permission`` records an
+    # ``allow_always``/``reject_always`` decision for the rest of the session.
+    permission_policy: dict[str, Any] = field(
+        default_factory=lambda: {"mode": "relay", "detached": "stall"}
+    )
+    pending_permissions: dict[str, asyncio.Future] = field(default_factory=dict)
+    remembered_permission: str | None = None  # None | "allow" | "deny"
 
     # ------------------------------------------------------------------
     # Event dispatch
@@ -287,6 +305,98 @@ class Session:
                 dead.append(conn_id)
         for conn_id in dead:
             self._watchers.pop(conn_id, None)
+
+    # ------------------------------------------------------------------
+    # Permission relay (#20)
+    # ------------------------------------------------------------------
+
+    async def decide_permission(
+        self, options: list[dict[str, Any]], tool_call: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Decide a tool-permission request per the session's policy.
+
+        ``options`` is ``[{option_id, name, kind}]``. Returns a neutral
+        decision ``{"outcome": "selected"|"cancelled", "option_id": str|None}``
+        that the backend maps to an ACP ``RequestPermissionResponse``.
+
+        Policy: ``allow``/``deny`` (or a remembered ``*_always``) auto-answer;
+        ``relay`` forwards a ``session.request_permission`` frame to the owner
+        and awaits ``session.permission_response``. With no owner attached,
+        the profile's ``detached`` setting applies (``stall`` waits — marking
+        the session ``needs_attention`` — while ``allow``/``deny`` resolve now).
+        """
+        auto = self._policy_decision(options)
+        if auto is not None:
+            return auto
+
+        stalled = False
+        if self.connection_id is None:
+            detached = (self.permission_policy or {}).get("detached", "stall")
+            if detached in ("allow", "deny"):
+                return self._auto_decision(options, detached)
+            stalled = True
+            await self.on_event({"type": "session.needs_attention", "reason": "permission_pending"})
+
+        request_id = _new_request_id()
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        self.pending_permissions[request_id] = fut
+        await self.on_event(
+            {
+                "type": "session.request_permission",
+                "request_id": request_id,
+                "options": options,
+                "tool_call": tool_call,
+            }
+        )
+        try:
+            decision = await fut
+        finally:
+            self.pending_permissions.pop(request_id, None)
+            if stalled:
+                await self.on_event({"type": "session.attention_cleared"})
+        self._maybe_remember(options, decision)
+        return decision
+
+    def resolve_permission(self, request_id: str, outcome: str, option_id: str | None) -> bool:
+        """Resolve a pending relayed permission from the owner's response."""
+        fut = self.pending_permissions.get(request_id)
+        if fut is None or fut.done():
+            return False
+        fut.set_result({"outcome": outcome, "option_id": option_id})
+        return True
+
+    def cancel_pending_permissions(self) -> None:
+        for fut in self.pending_permissions.values():
+            if not fut.done():
+                fut.cancel()
+        self.pending_permissions.clear()
+
+    def _policy_decision(self, options: list[dict[str, Any]]) -> dict[str, Any] | None:
+        if self.remembered_permission in ("allow", "deny"):
+            return self._auto_decision(options, self.remembered_permission)
+        mode = (self.permission_policy or {}).get("mode", "relay")
+        if mode in ("allow", "deny"):
+            return self._auto_decision(options, mode)
+        return None  # relay
+
+    @staticmethod
+    def _auto_decision(options: list[dict[str, Any]], kind: str) -> dict[str, Any]:
+        prefix = "allow" if kind == "allow" else "reject"
+        opt = next((o for o in options if str(o.get("kind", "")).startswith(prefix)), None)
+        if opt is not None:
+            return {"outcome": "selected", "option_id": opt["option_id"]}
+        return {"outcome": "cancelled", "option_id": None}
+
+    def _maybe_remember(self, options: list[dict[str, Any]], decision: dict[str, Any]) -> None:
+        if decision.get("outcome") != "selected":
+            return
+        opt = next((o for o in options if o["option_id"] == decision.get("option_id")), None)
+        if opt is None:
+            return
+        if opt.get("kind") == "allow_always":
+            self.remembered_permission = "allow"
+        elif opt.get("kind") == "reject_always":
+            self.remembered_permission = "deny"
 
     # ------------------------------------------------------------------
     # Title (derived from first user message)
@@ -600,6 +710,7 @@ class SessionTable:
             sess = self._sessions.pop(session_id, None)
         if sess is None:
             return
+        sess.cancel_pending_permissions()
         if sess.backend is not None:
             await sess.backend.close()
         if sess.log is not None:

@@ -60,6 +60,7 @@ from .protocol import (
     parse_line,
     parse_list,
     parse_open,
+    parse_permission_response,
     parse_ping,
     parse_profile_action,
     parse_profile_list,
@@ -286,6 +287,8 @@ class Connection:
                 await self._handle_attach(parse_attach(obj))
             elif msg_type == "session.detach":
                 await self._handle_detach(parse_detach(obj))
+            elif msg_type == "session.permission_response":
+                await self._handle_permission_response(parse_permission_response(obj))
             elif msg_type == "session.info":
                 await self._handle_session_info(parse_session_info(obj))
             elif msg_type == "profile.list":
@@ -320,15 +323,20 @@ class Connection:
     # Handlers
     # ------------------------------------------------------------------
 
-    def _make_backend(self, msg: OpenMessage, *, on_event):
+    def _make_backend(self, msg: OpenMessage, *, on_event, permission_cb):
         """Construct the per-session ACP handle bound to the agent's process.
 
         Model is Profile → Agent → Session (#17): the supervisor owns one ACP
         process per agent and multiplexes sessions onto it; the handle is the
-        per-session view.
+        per-session view. ``permission_cb`` is the session's policy/relay
+        decision callback (#20).
         """
         return self._supervisor.make_handle(
-            msg.profile, msg.agent, on_event=on_event, cwd=msg.options.get("cwd")
+            msg.profile,
+            msg.agent,
+            on_event=on_event,
+            cwd=msg.options.get("cwd"),
+            permission_cb=permission_cb,
         )
 
     async def _handle_open(self, msg: OpenMessage) -> None:
@@ -361,11 +369,16 @@ class Connection:
             sess = self._sessions.new_session(msg)
             await self._sessions.register(sess)
 
+        # The session inherits its profile's permission policy (#20).
+        sess.permission_policy = dict(profile.permission_policy)
+
         # (Re)spawn the backend first so we have a pid for the ack. Any
         # events the child emits before we attach buffer into the session's
         # ring and get delivered below.
         if sess.backend is None or not sess.backend.running:
-            backend = self._make_backend(msg, on_event=sess.on_event)
+            backend = self._make_backend(
+                msg, on_event=sess.on_event, permission_cb=sess.decide_permission
+            )
             try:
                 await backend.spawn()
             except SpawnFailedError as exc:
@@ -429,7 +442,9 @@ class Connection:
         sess = self._sessions.get(msg.session_id)
         if sess.backend is None or not sess.backend.running:
             # Respawn transparently.
-            backend = self._make_backend(sess.open_msg, on_event=sess.on_event)
+            backend = self._make_backend(
+                sess.open_msg, on_event=sess.on_event, permission_cb=sess.decide_permission
+            )
             try:
                 await backend.spawn()
             except SpawnFailedError as exc:
@@ -655,6 +670,20 @@ class Connection:
                 "was_attached": was_attached,
             }
         )
+
+    async def _handle_permission_response(self, msg) -> None:
+        """Resolve a relayed permission request (#20). Owner-only.
+
+        Routes the owner's ``selected``/``cancelled`` decision back to the
+        agent's awaiting ``request_permission`` via the session's pending
+        future. Non-owners and unknown request ids are ignored.
+        """
+        if msg.session_id not in self._owned_sessions:
+            return
+        sess = self._sessions.try_get(msg.session_id)
+        if sess is None:
+            return
+        sess.resolve_permission(msg.request_id, msg.outcome, msg.option_id)
 
     async def _handle_session_info(self, msg) -> None:
         """Reply with the session's metadata + per-turn snapshot.

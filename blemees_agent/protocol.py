@@ -186,6 +186,14 @@ class DetachMessage:
 
 
 @dataclasses.dataclass(slots=True)
+class PermissionResponseMessage:
+    session_id: str
+    request_id: str
+    outcome: str  # "selected" | "cancelled"
+    option_id: str | None
+
+
+@dataclasses.dataclass(slots=True)
 class SessionInfoMessage:
     id: str | None
     session_id: str
@@ -332,6 +340,25 @@ def parse_attach(obj: dict[str, Any]) -> AttachMessage:
 def parse_detach(obj: dict[str, Any]) -> DetachMessage:
     _reject_extra_keys(obj, frozenset({"type", "id", "session_id"}))
     return DetachMessage(id=_opt_str_id(obj), session_id=_require_session_id(obj, "session.detach"))
+
+
+def parse_permission_response(obj: dict[str, Any]) -> PermissionResponseMessage:
+    _reject_extra_keys(obj, frozenset({"type", "session_id", "request_id", "outcome", "option_id"}))
+    session_id = _require_session_id(obj, "session.permission_response")
+    request_id = obj.get("request_id")
+    if not isinstance(request_id, str) or not request_id:
+        raise ProtocolError("session.permission_response requires 'request_id'")
+    outcome = obj.get("outcome")
+    if outcome not in ("selected", "cancelled"):
+        raise ProtocolError("'outcome' must be 'selected' or 'cancelled'")
+    option_id = obj.get("option_id")
+    if option_id is not None and not isinstance(option_id, str):
+        raise ProtocolError("'option_id' must be a string")
+    if outcome == "selected" and not option_id:
+        raise ProtocolError("'option_id' is required when outcome is 'selected'")
+    return PermissionResponseMessage(
+        session_id=session_id, request_id=request_id, outcome=outcome, option_id=option_id
+    )
 
 
 def parse_session_info(obj: dict[str, Any]) -> SessionInfoMessage:

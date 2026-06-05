@@ -75,7 +75,8 @@ class Notification:
 class Sink(Protocol):
     """Consumes notifications. Implementations must be best-effort."""
 
-    async def emit(self, notification: Notification) -> None: ...
+    async def emit(self, notification: Notification) -> None:
+        raise NotImplementedError
 
 
 class WebhookSink:

@@ -72,8 +72,8 @@ Commands — each sends one wire frame, responses are printed as they arrive:
   close <id> [--delete]        session.close session_id=<id> delete=…
   interrupt <id>               session.cancel session_id=<id>
 
-  watch <id> [last_seen_seq=N] session.watch (observer mode)
-  unwatch <id>                 session.unwatch
+  attach <id> [as=owner|viewer] [last_seen_seq=N]   session.attach
+  detach <id>                  session.detach
 
   send <id> <text...>          session.prompt with prompt=<text>
   send-json <id> <json>        session.prompt with prompt=<json content blocks>
@@ -284,17 +284,18 @@ class Harness:
     async def interrupt(self, session_id: str) -> None:
         await self._send({"type": "session.cancel", "session_id": session_id})
 
-    async def watch(self, session_id: str, fields: dict[str, Any]) -> None:
+    async def attach(self, session_id: str, fields: dict[str, Any]) -> None:
         frame: dict[str, Any] = {
-            "type": "session.watch",
+            "type": "session.attach",
             "id": _req_id(),
             "session_id": session_id,
+            "as": fields.pop("as", "viewer"),
         }
         frame.update(fields)
         await self._send(frame)
 
-    async def unwatch(self, session_id: str) -> None:
-        await self._send({"type": "session.unwatch", "id": _req_id(), "session_id": session_id})
+    async def detach(self, session_id: str) -> None:
+        await self._send({"type": "session.detach", "id": _req_id(), "session_id": session_id})
 
     async def send_user(self, session_id: str, text: str) -> None:
         await self._send({"type": "session.prompt", "session_id": session_id, "prompt": text})
@@ -397,10 +398,10 @@ async def dispatch(h: Harness, line: str) -> bool:
         await h.interrupt(rest.split()[0])
         return True
 
-    if cmd == "watch":
+    if cmd == "attach":
         tokens = shlex.split(rest)
         if not tokens:
-            print("usage: watch <id> [last_seen_seq=N]")
+            print("usage: attach <id> [as=owner|viewer] [last_seen_seq=N]")
             return True
         sid, *fields = tokens
         try:
@@ -408,14 +409,14 @@ async def dispatch(h: Harness, line: str) -> bool:
         except ValueError as e:
             print(f"error: {e}")
             return True
-        await h.watch(sid, parsed)
+        await h.attach(sid, parsed)
         return True
 
-    if cmd == "unwatch":
+    if cmd == "detach":
         if not rest:
-            print("usage: unwatch <id>")
+            print("usage: detach <id>")
             return True
-        await h.unwatch(rest.split()[0])
+        await h.detach(rest.split()[0])
         return True
 
     if cmd == "send":

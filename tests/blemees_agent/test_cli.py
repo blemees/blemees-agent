@@ -180,12 +180,13 @@ async def test_blank_line_and_comment_are_noops(h):
     assert h.sent == []
 
 
-async def test_watch_unwatch(h):
-    await dispatch(h, "watch my-session last_seen_seq=10")
-    await dispatch(h, "unwatch my-session")
-    assert h.sent[0]["type"] == "session.watch"
+async def test_attach_detach(h):
+    await dispatch(h, "attach my-session as=owner last_seen_seq=10")
+    await dispatch(h, "detach my-session")
+    assert h.sent[0]["type"] == "session.attach"
+    assert h.sent[0]["as"] == "owner"
     assert h.sent[0]["last_seen_seq"] == 10
-    assert h.sent[1]["type"] == "session.unwatch"
+    assert h.sent[1]["type"] == "session.detach"
 
 
 async def test_pretty_and_quiet_toggles(h):

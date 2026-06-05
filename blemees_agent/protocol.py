@@ -172,14 +172,15 @@ class ListMessage:
 
 
 @dataclasses.dataclass(slots=True)
-class WatchMessage:
+class AttachMessage:
     id: str | None
     session_id: str
+    role: str  # "owner" | "viewer"
     last_seen_seq: int | None
 
 
 @dataclasses.dataclass(slots=True)
-class UnwatchMessage:
+class DetachMessage:
     id: str | None
     session_id: str
 
@@ -314,20 +315,23 @@ def parse_status(obj: dict[str, Any]) -> StatusMessage:
     return StatusMessage(id=_opt_str_id(obj))
 
 
-def parse_watch(obj: dict[str, Any]) -> WatchMessage:
-    _reject_extra_keys(obj, frozenset({"type", "id", "session_id", "last_seen_seq"}))
-    session_id = _require_session_id(obj, "session.watch")
+def parse_attach(obj: dict[str, Any]) -> AttachMessage:
+    _reject_extra_keys(obj, frozenset({"type", "id", "session_id", "as", "last_seen_seq"}))
+    session_id = _require_session_id(obj, "session.attach")
+    role = obj.get("as", "viewer")
+    if role not in ("owner", "viewer"):
+        raise ProtocolError("'as' must be 'owner' or 'viewer'")
     last_seen_seq = obj.get("last_seen_seq")
     if last_seen_seq is not None and (not isinstance(last_seen_seq, int) or last_seen_seq < 0):
         raise ProtocolError("'last_seen_seq' must be a non-negative integer")
-    return WatchMessage(id=_opt_str_id(obj), session_id=session_id, last_seen_seq=last_seen_seq)
-
-
-def parse_unwatch(obj: dict[str, Any]) -> UnwatchMessage:
-    _reject_extra_keys(obj, frozenset({"type", "id", "session_id"}))
-    return UnwatchMessage(
-        id=_opt_str_id(obj), session_id=_require_session_id(obj, "session.unwatch")
+    return AttachMessage(
+        id=_opt_str_id(obj), session_id=session_id, role=role, last_seen_seq=last_seen_seq
     )
+
+
+def parse_detach(obj: dict[str, Any]) -> DetachMessage:
+    _reject_extra_keys(obj, frozenset({"type", "id", "session_id"}))
+    return DetachMessage(id=_opt_str_id(obj), session_id=_require_session_id(obj, "session.detach"))
 
 
 def parse_session_info(obj: dict[str, Any]) -> SessionInfoMessage:

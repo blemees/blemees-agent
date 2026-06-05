@@ -91,3 +91,39 @@ async def test_prompt_without_open_is_unknown_session(acp_daemon):
     finally:
         await client.close()
     assert err["code"] == "session_unknown"
+
+
+async def test_cancel_over_the_wire(acp_daemon):
+    client = await _connect(acp_daemon)
+    try:
+        await client.send({"type": "session.open", "id": "o", "session_id": SID, "options": {}})
+        await client.wait_for(lambda e: e.get("type") == "session.opened")
+        await client.send({"type": "session.prompt", "session_id": SID, "prompt": "hang please"})
+        await client.wait_for(lambda e: e.get("type") == "session.update")
+        await client.send({"type": "session.cancel", "session_id": SID})
+        # Both the cancel ack and the turn-end cancelled result arrive.
+        cancelled_ack = await client.wait_for(lambda e: e.get("type") == "session.cancelled")
+        assert cancelled_ack["was_idle"] is False
+        result = await client.wait_for(lambda e: e.get("type") == "session.result", timeout=10.0)
+        assert result["stop_reason"] == "cancelled"
+    finally:
+        await client.close()
+
+
+async def test_crash_mid_turn_then_recover(acp_daemon):
+    client = await _connect(acp_daemon)
+    try:
+        await client.send({"type": "session.open", "id": "o", "session_id": SID, "options": {}})
+        await client.wait_for(lambda e: e.get("type") == "session.opened")
+
+        # "die" hard-exits the agent process mid-turn.
+        await client.send({"type": "session.prompt", "session_id": SID, "prompt": "die now"})
+        err = await client.wait_for(lambda e: e.get("type") == "session.error", timeout=10.0)
+        assert err["code"] == "agent_crashed"
+
+        # Next prompt transparently respawns the agent and completes.
+        await client.send({"type": "session.prompt", "session_id": SID, "prompt": "say pong"})
+        result = await client.wait_for(lambda e: e.get("type") == "session.result", timeout=30.0)
+        assert result["stop_reason"] == "end_turn"
+    finally:
+        await client.close()

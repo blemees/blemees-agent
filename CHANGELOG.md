@@ -39,7 +39,7 @@ no `blemees/2` compatibility shims.
   `blemees_agent/schemas/{inbound,outbound}/` and the machine-readable
   contract again. (#30)
 - **e2e matrix + latency bench** — opt-in (`BLEMEES_E2E=1`) end-to-end tests
-  per ACP agent (`requires_claude_acp`/`requires_codex_acp`/`requires_gemini_acp`,
+  per ACP agent (`requires_claude_acp`/`requires_codex_acp`/`requires_gemini_acp`/`requires_cursor_acp`,
   skipped unless installed + authenticated) covering turn, multi-turn memory,
   attach/viewer, and interrupt; `python -m blemees_agent.bench` measures warm
   prompt → first `agent_message_chunk`. (#26)

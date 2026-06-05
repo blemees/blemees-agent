@@ -61,6 +61,7 @@ markers = [
     "requires_claude_acp: needs a real, authenticated `claude-agent-acp` ACP agent (#26)",
     "requires_codex_acp: needs a real, authenticated `codex-acp` ACP agent (#26)",
     "requires_gemini_acp: needs a real, authenticated `gemini --experimental-acp` agent (#26)",
+    "requires_cursor_acp: needs a real, authenticated cursor `agent acp` ACP agent (#26)",
 ]
 
 [tool.ruff]

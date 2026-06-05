@@ -9,7 +9,7 @@
 > As of 0.11.0 the daemon is an **ACP supervisor + semantic proxy**: it acts as
 > a client of the [Agent Client Protocol](https://agentclientprotocol.com),
 > spawning ACP agent subprocesses (`claude-agent-acp`, `codex-acp`,
-> `gemini --experimental-acp`) and multiplexing sessions onto them. The model
+> `gemini --experimental-acp`, `cursor-agent`) and multiplexing sessions onto them. The model
 > is **Profile → Agent → Session** (#17). The bespoke per-backend translators
 > (`agent.*` vocabulary, `blemees/2`) are retired.
 >
@@ -140,7 +140,7 @@ sends an arbitrary JSON frame for protocol experiments.
 ## 1. Overview
 
 `blemees-agentd` is a per-user daemon that supervises **ACP agent
-subprocesses** (`claude-agent-acp`, `codex-acp`, `gemini --experimental-acp`)
+subprocesses** (`claude-agent-acp`, `codex-acp`, `gemini --experimental-acp`, `cursor-agent`)
 and exposes them as a long-running, multi-session backend over a Unix domain
 socket. It is the **client** side of the
 [Agent Client Protocol](https://agentclientprotocol.com): it spawns one

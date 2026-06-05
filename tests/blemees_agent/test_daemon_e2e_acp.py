@@ -40,14 +40,24 @@ class AgentSpec:
     name: str
     command: str
     args: list[str] = field(default_factory=list)
+    # Alternative binary names to accept (e.g. cursor ships as both
+    # `cursor-agent` and `agent`); the first one on PATH wins.
+    aliases: tuple[str, ...] = ()
+
+    def resolved_command(self) -> str | None:
+        for candidate in (self.command, *self.aliases):
+            if shutil.which(candidate):
+                return candidate
+        return None
 
 
-# The three ACP agents the migration targets (#15 spike). `command` is the
-# binary the daemon spawns; `args` puts it in ACP mode.
+# The ACP agents the migration validated (#15 spike). `command` is the binary
+# the daemon spawns; `args` puts it in ACP mode.
 AGENTS = [
     AgentSpec("claude_acp", "claude-agent-acp"),
     AgentSpec("codex_acp", "codex-acp", ["acp"]),
     AgentSpec("gemini_acp", "gemini", ["--experimental-acp"]),
+    AgentSpec("cursor_acp", "cursor-agent", ["acp"], aliases=("agent",)),
 ]
 
 # Opt-in: these hit real agents (slow, cost tokens, need a logged-in session),
@@ -59,8 +69,9 @@ _E2E_ENABLED = os.environ.get("BLEMEES_E2E") == "1"
 def _skip_reason(spec: AgentSpec) -> str | None:
     if not _E2E_ENABLED:
         return "set BLEMEES_E2E=1 to run real-agent e2e tests"
-    if shutil.which(spec.command) is None:
-        return f"{spec.command!r} not on PATH"
+    if spec.resolved_command() is None:
+        names = " / ".join((spec.command, *spec.aliases))
+        return f"none of [{names}] on PATH"
     return None
 
 
@@ -84,7 +95,7 @@ async def _daemon(spec: AgentSpec):
     with socket_cleanup(sock):
         cfg = Config(
             socket_path=str(sock),
-            agent_command=spec.command,
+            agent_command=spec.resolved_command() or spec.command,
             agent_args=list(spec.args),
             idle_timeout_s=60,
         )
@@ -109,13 +120,14 @@ async def _connect(sock: str) -> _StreamClient:
     return c
 
 
-async def _wait_or_skip(c: _StreamClient, pred, *, what: str, timeout: float):
+async def _wait_or_skip(c: _StreamClient, pred, *, what: str, timeout: float) -> dict:
     """wait_for, but an unresponsive agent → skip (it isn't authenticated /
     available here), matching this suite's 'installed + authenticated' gate."""
     try:
         return await c.wait_for(pred, timeout=timeout)
     except TimeoutError:
         pytest.skip(f"agent unresponsive waiting for {what} ({timeout}s) — authenticated?")
+        raise  # unreachable (pytest.skip raises); explicit for static analysis
 
 
 async def _open(c: _StreamClient, sid: str) -> dict:

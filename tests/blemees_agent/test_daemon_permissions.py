@@ -64,6 +64,22 @@ async def _open(c, sid, profile=None):
     await c.wait_for(lambda e: e.get("type") == "session.opened")
 
 
+async def _collect_to_result(c, *, timeout=30.0):
+    """Collect frames through session.result, plus a short tail.
+
+    ACP may flush a final session.update after the prompt response on the
+    wire, so draining a tail avoids missing the agent's last chunk.
+    """
+    frames = await c.wait_for(
+        lambda e: e.get("type") == "session.result", collect=True, timeout=timeout
+    )
+    while True:
+        try:
+            frames.append(await c.recv(timeout=0.5))
+        except TimeoutError:
+            return frames
+
+
 def _last_text(frames) -> str:
     return "".join(
         f["update"]["content"]["text"]
@@ -91,9 +107,7 @@ async def test_relay_to_owner_then_allow(perm_daemon):
                 "option_id": "allow",
             }
         )
-        frames = await c.wait_for(
-            lambda e: e.get("type") == "session.result", collect=True, timeout=30.0
-        )
+        frames = await _collect_to_result(c)
     finally:
         await c.close()
     assert next(f for f in frames if f["type"] == "session.result")["stop_reason"] == "end_turn"
@@ -105,9 +119,7 @@ async def test_allow_policy_auto_no_relay(perm_daemon):
     try:
         await _open(c, "s-allow", profile="allowp")
         await c.send({"type": "session.prompt", "session_id": "s-allow", "prompt": "permit please"})
-        frames = await c.wait_for(
-            lambda e: e.get("type") == "session.result", collect=True, timeout=30.0
-        )
+        frames = await _collect_to_result(c)
     finally:
         await c.close()
     # No relay frame was sent; the agent received an allow decision.
@@ -120,9 +132,7 @@ async def test_deny_policy_auto_no_relay(perm_daemon):
     try:
         await _open(c, "s-deny", profile="denyp")
         await c.send({"type": "session.prompt", "session_id": "s-deny", "prompt": "permit please"})
-        frames = await c.wait_for(
-            lambda e: e.get("type") == "session.result", collect=True, timeout=30.0
-        )
+        frames = await _collect_to_result(c)
     finally:
         await c.close()
     assert not any(f.get("type") == "session.request_permission" for f in frames)

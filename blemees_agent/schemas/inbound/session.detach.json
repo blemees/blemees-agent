@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blemees/schemas/inbound/session.detach.json",
+  "title": "session.detach",
+  "description": "Detach this connection from a session without closing it (#19). An owner detach soft-detaches (any in-flight turn runs on); a viewer detach unsubscribes.",
+  "type": "object",
+  "properties": {
+    "type": { "const": "session.detach" },
+    "id": { "$ref": "https://blemees/schemas/_common.json#/$defs/RequestId" },
+    "session_id": { "$ref": "https://blemees/schemas/_common.json#/$defs/SessionId" }
+  },
+  "required": ["type", "session_id"],
+  "additionalProperties": false
+}

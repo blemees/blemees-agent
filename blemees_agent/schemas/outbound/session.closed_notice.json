@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blemees/schemas/outbound/session.closed_notice.json",
+  "title": "session.closed_notice",
+  "description": "Pushed to watchers/viewers when a session is closed by its owner, so they can flip to a closed-state view.",
+  "type": "object",
+  "properties": {
+    "type": { "const": "session.closed_notice" },
+    "session_id": { "$ref": "https://blemees/schemas/_common.json#/$defs/SessionId" },
+    "reason": { "type": "string", "description": "Why it closed, e.g. owner_closed." }
+  },
+  "required": ["type", "session_id"],
+  "additionalProperties": true
+}

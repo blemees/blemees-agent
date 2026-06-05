@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blemees/schemas/outbound/session.attached.json",
+  "title": "session.attached",
+  "description": "Reply to session.attach. `role` is the granted role; `last_seq` is the highest seq at attach time (compare to last_seen_seq to know if a replay is in flight).",
+  "type": "object",
+  "properties": {
+    "type": { "const": "session.attached" },
+    "id": { "$ref": "https://blemees/schemas/_common.json#/$defs/RequestId" },
+    "session_id": { "$ref": "https://blemees/schemas/_common.json#/$defs/SessionId" },
+    "role": { "type": "string", "enum": ["owner", "viewer"] },
+    "last_seq": { "type": "integer", "minimum": 0 }
+  },
+  "required": ["type", "session_id"],
+  "additionalProperties": true
+}

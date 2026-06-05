@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blemees/schemas/inbound/profile.start.json",
+  "title": "profile.start",
+  "description": "Eagerly start a profile's agent processes (else they start lazily on first open). Validates each binary is on $PATH first (agent_unavailable). Replied with profile.started.",
+  "type": "object",
+  "properties": {
+    "type": { "const": "profile.start" },
+    "id": { "$ref": "https://blemees/schemas/_common.json#/$defs/RequestId" },
+    "name": { "$ref": "https://blemees/schemas/_common.json#/$defs/ProfileName" }
+  },
+  "required": ["type", "name"],
+  "additionalProperties": false
+}

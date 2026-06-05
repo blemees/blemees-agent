@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blemees/schemas/outbound/notify.test_result.json",
+  "title": "notify.test_result",
+  "description": "Reply to notify.test (#24). `webhook_configured` reports whether the profile (or global fallback) resolves to a URL; `notification` is the synthetic payload that was dispatched.",
+  "type": "object",
+  "properties": {
+    "type": { "const": "notify.test_result" },
+    "id": { "$ref": "https://blemees/schemas/_common.json#/$defs/RequestId" },
+    "profile": { "$ref": "https://blemees/schemas/_common.json#/$defs/ProfileName" },
+    "webhook_configured": { "type": "boolean" },
+    "notification": { "$ref": "https://blemees/schemas/_common.json#/$defs/Notification" }
+  },
+  "required": ["type", "profile", "webhook_configured", "notification"],
+  "additionalProperties": true
+}

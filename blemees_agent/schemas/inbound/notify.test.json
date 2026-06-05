@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blemees/schemas/inbound/notify.test.json",
+  "title": "notify.test",
+  "description": "Fire a synthetic notification through the configured sinks so the user can verify routing (#24). Does not enter the needs_attention queue. Replied with notify.test_result.",
+  "type": "object",
+  "properties": {
+    "type": { "const": "notify.test" },
+    "id": { "$ref": "https://blemees/schemas/_common.json#/$defs/RequestId" },
+    "profile": {
+      "$ref": "https://blemees/schemas/_common.json#/$defs/ProfileName",
+      "description": "Which profile's webhook URL to use (global fallback otherwise). Defaults to `default`."
+    }
+  },
+  "required": ["type"],
+  "additionalProperties": false
+}

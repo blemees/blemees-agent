@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blemees/schemas/inbound/profile.stop.json",
+  "title": "profile.stop",
+  "description": "Stop a profile's agent processes. Replied with profile.stopped.",
+  "type": "object",
+  "properties": {
+    "type": { "const": "profile.stop" },
+    "id": { "$ref": "https://blemees/schemas/_common.json#/$defs/RequestId" },
+    "name": { "$ref": "https://blemees/schemas/_common.json#/$defs/ProfileName" }
+  },
+  "required": ["type", "name"],
+  "additionalProperties": false
+}

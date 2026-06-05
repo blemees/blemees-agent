@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blemees/schemas/inbound/profile.delete.json",
+  "title": "profile.delete",
+  "description": "Delete a dynamic profile (#25). Config-managed profiles are rejected (profile_protected); a profile with live sessions is rejected (profile_in_use). Replied with profile.deleted.",
+  "type": "object",
+  "properties": {
+    "type": { "const": "profile.delete" },
+    "id": { "$ref": "https://blemees/schemas/_common.json#/$defs/RequestId" },
+    "name": { "$ref": "https://blemees/schemas/_common.json#/$defs/ProfileName" }
+  },
+  "required": ["type", "name"],
+  "additionalProperties": false
+}

@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blemees/schemas/outbound/profiles.json",
+  "title": "profiles",
+  "description": "Reply to profile.list. Each row carries its agents (with running state + session counts) and `source` (config | dynamic, #25).",
+  "type": "object",
+  "properties": {
+    "type": { "const": "profiles" },
+    "id": { "$ref": "https://blemees/schemas/_common.json#/$defs/RequestId" },
+    "profiles": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": { "$ref": "https://blemees/schemas/_common.json#/$defs/ProfileName" },
+          "source": { "type": "string", "enum": ["config", "dynamic"] },
+          "agents": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": { "type": "string" },
+                "agent": { "type": "string" },
+                "model": { "type": ["string", "null"] },
+                "running": { "type": "boolean" },
+                "sessions": { "type": "integer", "minimum": 0 }
+              },
+              "required": ["name"],
+              "additionalProperties": true
+            }
+          }
+        },
+        "required": ["name"],
+        "additionalProperties": true
+      }
+    }
+  },
+  "required": ["type", "profiles"],
+  "additionalProperties": true
+}

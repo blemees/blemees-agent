@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blemees/schemas/inbound/hello.json",
+  "title": "hello",
+  "description": "First frame on every connection; must arrive before any other frame. The daemon speaks a single protocol version at a time.",
+  "type": "object",
+  "properties": {
+    "type": { "const": "hello" },
+    "protocol": {
+      "const": "blemees/3",
+      "description": "Protocol version. The daemon rejects a mismatch with protocol_mismatch (fatal)."
+    },
+    "client": { "type": "string", "description": "Free-form client identifier. Informational." }
+  },
+  "required": ["type", "protocol"],
+  "additionalProperties": false
+}

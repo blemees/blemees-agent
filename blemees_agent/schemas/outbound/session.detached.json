@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blemees/schemas/outbound/session.detached.json",
+  "title": "session.detached",
+  "description": "Reply to session.detach. `was_attached` indicates whether this connection actually owned/viewed the session.",
+  "type": "object",
+  "properties": {
+    "type": { "const": "session.detached" },
+    "id": { "$ref": "https://blemees/schemas/_common.json#/$defs/RequestId" },
+    "session_id": { "$ref": "https://blemees/schemas/_common.json#/$defs/SessionId" },
+    "was_attached": { "type": "boolean" }
+  },
+  "required": ["type", "session_id"],
+  "additionalProperties": true
+}

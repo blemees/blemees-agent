@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blemees/schemas/inbound/session.open.json",
+  "title": "session.open",
+  "description": "Open a new session or reattach an existing one under a (profile, agent). With `resume:true` the daemon rehydrates the agent session via ACP session/load (#23) and may replay missed frames with seq > last_seen_seq. Defaults to profile/agent `default`/`default`.",
+  "type": "object",
+  "properties": {
+    "type": { "const": "session.open" },
+    "id": { "$ref": "https://blemees/schemas/_common.json#/$defs/RequestId" },
+    "session_id": { "$ref": "https://blemees/schemas/_common.json#/$defs/SessionId" },
+    "resume": {
+      "type": "boolean",
+      "default": false,
+      "description": "Reattach an existing session (rehydrate model context, replay events)."
+    },
+    "last_seen_seq": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Highest seq the client has observed; the daemon replays buffered frames with a greater seq. Omit to skip replay."
+    },
+    "profile": { "$ref": "https://blemees/schemas/_common.json#/$defs/ProfileName" },
+    "agent": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Agent within the profile; defaults to the profile's `default`/sole agent."
+    },
+    "alias": { "type": "string", "description": "Optional human-friendly identifier for the session." },
+    "options": {
+      "type": "object",
+      "description": "Open-time options (e.g. `cwd`).",
+      "additionalProperties": true
+    }
+  },
+  "required": ["type", "session_id"],
+  "additionalProperties": false
+}

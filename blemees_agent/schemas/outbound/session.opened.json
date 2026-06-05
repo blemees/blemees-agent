@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blemees/schemas/outbound/session.opened.json",
+  "title": "session.opened",
+  "description": "Reply to a successful session.open. `last_seq` is the highest seq produced so far. `native_session_id` is the agent's own ACP sessionId, present only when it differs from `session_id` and the session is drivable (omitted for view-only sessions, #23/#24).",
+  "type": "object",
+  "properties": {
+    "type": { "const": "session.opened" },
+    "id": { "$ref": "https://blemees/schemas/_common.json#/$defs/RequestId" },
+    "session_id": { "$ref": "https://blemees/schemas/_common.json#/$defs/SessionId" },
+    "profile": { "$ref": "https://blemees/schemas/_common.json#/$defs/ProfileName" },
+    "agent": { "type": "string" },
+    "subprocess_pid": { "type": ["integer", "null"] },
+    "last_seq": { "type": "integer", "minimum": 0 },
+    "view_only": {
+      "type": "boolean",
+      "description": "True when the session was resumed against an agent that couldn't reload it: readable but not drivable (#23)."
+    },
+    "native_session_id": { "type": "string" }
+  },
+  "required": ["type", "session_id"],
+  "additionalProperties": true
+}

@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blemees/schemas/outbound/profile.updated.json",
+  "title": "profile.updated",
+  "description": "Reply confirming a profile.update (#25).",
+  "type": "object",
+  "properties": {
+    "type": { "const": "profile.updated" },
+    "id": { "$ref": "https://blemees/schemas/_common.json#/$defs/RequestId" },
+    "name": { "$ref": "https://blemees/schemas/_common.json#/$defs/ProfileName" }
+  },
+  "required": ["type", "name"],
+  "additionalProperties": true
+}

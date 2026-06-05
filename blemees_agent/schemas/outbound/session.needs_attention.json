@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blemees/schemas/outbound/session.needs_attention.json",
+  "title": "session.needs_attention",
+  "description": "Emitted when a detached session enters needs_attention (#24, §6). The matching webhook fires server-side; `reason` says why.",
+  "type": "object",
+  "properties": {
+    "type": { "const": "session.needs_attention" },
+    "session_id": { "$ref": "https://blemees/schemas/_common.json#/$defs/SessionId" },
+    "seq": { "$ref": "https://blemees/schemas/_common.json#/$defs/Seq" },
+    "reason": { "$ref": "https://blemees/schemas/_common.json#/$defs/AttentionReason" }
+  },
+  "required": ["type", "reason"],
+  "additionalProperties": true
+}

@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blemees/schemas/outbound/session.info_reply.json",
+  "title": "session.info_reply",
+  "description": "Reply to session.info: one session's detail, merging live state (when running) with the registry record (when cold). Usage/turn fields are advisory — absence means \"not known\".",
+  "type": "object",
+  "properties": {
+    "type": { "const": "session.info_reply" },
+    "id": { "$ref": "https://blemees/schemas/_common.json#/$defs/RequestId" },
+    "session_id": { "$ref": "https://blemees/schemas/_common.json#/$defs/SessionId" },
+    "profile": { "$ref": "https://blemees/schemas/_common.json#/$defs/ProfileName" },
+    "agent": { "type": "string" },
+    "model": { "type": ["string", "null"] },
+    "cwd": { "type": ["string", "null"] },
+    "turns": { "type": "integer", "minimum": 0 },
+    "attached": { "type": "boolean" },
+    "subprocess_running": { "type": "boolean" },
+    "needs_attention": { "type": "boolean" },
+    "attention_reason": {
+      "oneOf": [
+        { "$ref": "https://blemees/schemas/_common.json#/$defs/AttentionReason" },
+        { "type": "null" }
+      ]
+    },
+    "view_only": { "type": "boolean" }
+  },
+  "required": ["type"],
+  "additionalProperties": true
+}

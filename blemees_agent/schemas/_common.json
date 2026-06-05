@@ -1,0 +1,154 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blemees/schemas/_common.json",
+  "title": "Shared definitions for blemees/3 wire frames",
+  "description": "Reusable $defs referenced by the per-frame schemas. Not a frame schema itself.",
+  "type": "object",
+  "$defs": {
+    "SessionId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Client-owned session identifier, opaque to the daemon. Distinct from the agent's own `native_session_id` (the ACP sessionId), which the daemon reports back on session.opened when it differs."
+    },
+    "RequestId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Opaque correlation id set by the client on a request frame; echoed on the matching reply."
+    },
+    "Seq": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Monotonic per-session sequence number the daemon injects on every session-stream frame (those routed through Session.on_event)."
+    },
+    "PeerPid": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Peer PID captured via SO_PEERCRED; may be absent where the platform doesn't expose it."
+    },
+    "ProfileName": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Profile name. `default` is synthesised; others come from the config file or over-wire profile.create (#25)."
+    },
+    "AttentionReason": {
+      "type": "string",
+      "enum": ["permission_pending", "auth_required", "agent_crashed"],
+      "description": "Why a session entered needs_attention (#24, §6). The notify `test` reason is emitted only on notify.test_result, never as a session attention edge."
+    },
+    "ErrorCode": {
+      "type": "string",
+      "description": "Machine-readable error code (spec §9.8).",
+      "enum": [
+        "protocol_mismatch",
+        "invalid_message",
+        "unknown_message",
+        "unknown_backend",
+        "profile_unknown",
+        "profile_exists",
+        "profile_protected",
+        "profile_in_use",
+        "agent_unavailable",
+        "view_only",
+        "unsafe_flag",
+        "session_unknown",
+        "session_exists",
+        "session_busy",
+        "spawn_failed",
+        "agent_crashed",
+        "backend_crashed",
+        "auth_failed",
+        "auth_required",
+        "oversize_message",
+        "slow_consumer",
+        "daemon_shutdown",
+        "internal"
+      ]
+    },
+    "MessageContent": {
+      "description": "A user turn: a plain string, or an array of ACP content blocks. The daemon currently forwards text blocks to the agent and rejects non-text blocks (invalid_message).",
+      "oneOf": [
+        { "type": "string" },
+        {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": { "type": { "type": "string" } },
+            "required": ["type"],
+            "additionalProperties": true
+          }
+        }
+      ]
+    },
+    "AgentSpec": {
+      "type": "object",
+      "description": "One agent's config inside a profile spec. `agent_command` (or `command`) is the ACP binary; the rest are optional knobs applied after session/new.",
+      "properties": {
+        "agent_command": { "type": "string" },
+        "command": { "type": "string" },
+        "agent_args": { "type": "array", "items": { "type": "string" } },
+        "args": { "type": "array", "items": { "type": "string" } },
+        "model": { "type": "string" },
+        "mode": { "type": "string" },
+        "cwd": { "type": "string" },
+        "mcp_servers": { "type": "array", "items": { "type": "object" } },
+        "env": { "type": "object", "additionalProperties": { "type": "string" } }
+      },
+      "additionalProperties": true
+    },
+    "ProfileSpec": {
+      "type": "object",
+      "description": "An over-wire profile definition (#25). Agent shape, most specific first: an `agents` table (multi-agent), a single `agent` object (the `default` agent), or flat agent fields directly on the object. `name` may live here or at the frame's top level.",
+      "properties": {
+        "name": { "$ref": "#/$defs/ProfileName" },
+        "agents": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/AgentSpec" }
+        },
+        "agent": { "$ref": "#/$defs/AgentSpec" },
+        "permission_policy": {
+          "type": "object",
+          "properties": {
+            "mode": { "type": "string", "enum": ["relay", "allow", "deny"] },
+            "detached": { "type": "string", "enum": ["stall", "allow", "deny"] }
+          },
+          "additionalProperties": true
+        },
+        "notify": {
+          "type": "object",
+          "properties": { "webhook_url": { "type": "string" } },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "Notification": {
+      "type": "object",
+      "description": "The notify payload (#24, §6) — the body POSTed to a webhook and the shape carried in status.attention[] and notify.test_result.notification.",
+      "properties": {
+        "type": { "const": "blemees.notify" },
+        "reason": {
+          "type": "string",
+          "enum": ["permission_pending", "auth_required", "agent_crashed", "test"]
+        },
+        "profile": { "$ref": "#/$defs/ProfileName" },
+        "session_id": { "$ref": "#/$defs/SessionId" },
+        "title": { "type": "string" },
+        "detail": { "type": "string" },
+        "ts_ms": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["type", "reason", "profile", "session_id", "title", "detail", "ts_ms"],
+      "additionalProperties": true
+    },
+    "PermissionOption": {
+      "type": "object",
+      "description": "One choice in a relayed permission request, mirrored from ACP PermissionOption.",
+      "properties": {
+        "option_id": { "type": "string" },
+        "name": { "type": "string" },
+        "kind": { "type": "string" }
+      },
+      "required": ["option_id", "kind"],
+      "additionalProperties": true
+    }
+  }
+}

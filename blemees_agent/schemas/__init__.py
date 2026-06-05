@@ -1,9 +1,11 @@
 """JSON Schemas for the blemees/3 wire protocol.
 
-> **blemees/3 migration (#16):** the `blemees-agent/1` (`agent.*`) schemas
-> were removed in the clean break. The `blemees/3` `session.*` schemas are
-> not yet authored — `iter_schemas()` currently yields nothing. Re-authoring
-> them is a tracked follow-up; `protocol.py` is the contract in the interim.
+One Draft 2020-12 schema per frame under ``inbound/`` and ``outbound/`` (file
+name = frame ``type`` + ``.json``), plus shared ``$defs`` in ``_common.json``.
+These are the machine-readable contract (#30); ``protocol.py`` is the matching
+Python source of truth. Inbound schemas are strict
+(``additionalProperties: false``); outbound schemas are permissive so the
+daemon can grow an envelope without breaking clients.
 """
 
 from __future__ import annotations

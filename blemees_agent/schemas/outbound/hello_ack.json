@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blemees/schemas/outbound/hello_ack.json",
+  "title": "hello_ack",
+  "description": "Reply to a successful hello. Advertises the daemon build, detected ACP agents, and configured profile names.",
+  "type": "object",
+  "properties": {
+    "type": { "const": "hello_ack" },
+    "daemon": { "type": "string", "description": "Daemon build string, e.g. blemees-agentd/<version>." },
+    "protocol": { "const": "blemees/3" },
+    "pid": { "type": "integer", "minimum": 0 },
+    "agents": {
+      "type": "object",
+      "description": "Detected ACP agent binaries (name → version-ish), best-effort.",
+      "additionalProperties": { "type": "string" }
+    },
+    "profiles": {
+      "type": "array",
+      "items": { "$ref": "https://blemees/schemas/_common.json#/$defs/ProfileName" },
+      "description": "Configured profile names (#17)."
+    }
+  },
+  "required": ["type", "protocol"],
+  "additionalProperties": true
+}

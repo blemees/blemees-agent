@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blemees/schemas/outbound/session.cancelled.json",
+  "title": "session.cancelled",
+  "description": "Acknowledges a session.cancel. `was_idle` is true when there was no in-flight turn to interrupt.",
+  "type": "object",
+  "properties": {
+    "type": { "const": "session.cancelled" },
+    "session_id": { "$ref": "https://blemees/schemas/_common.json#/$defs/SessionId" },
+    "was_idle": { "type": "boolean" }
+  },
+  "required": ["type", "session_id"],
+  "additionalProperties": true
+}

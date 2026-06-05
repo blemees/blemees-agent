@@ -364,6 +364,14 @@ perms, socket-path resolution order identical (`$BLEMEES_AGENTD_SOCKET` →
 Two planes, both `blemees-agentd.*`-namespaced; the data plane embeds ACP
 objects.
 
+The frame set below is also shipped as **machine-readable JSON Schemas** (#30):
+one Draft 2020-12 schema per frame under `blemees_agent/schemas/{inbound,outbound}/`
+(file name = frame `type` + `.json`), loadable via
+`blemees_agent.schemas.iter_schemas()`. Inbound schemas are strict
+(`additionalProperties: false`, mirroring the daemon's key parsing); outbound
+schemas are permissive. They are the contract clients validate against without
+reading `protocol.py`.
+
 ### 9.1 Handshake
 ```json
 → {"type":"hello","client":"blemees-tui/0.2","protocol":"blemees/3"}

@@ -35,9 +35,11 @@ def test_touch_updates_turns_and_activity():
 def test_remove():
     reg = Registry(None)
     reg.upsert("s1")
-    assert reg.remove("s1") is True
+    removed = reg.remove("s1")
+    assert removed is True
     assert reg.get("s1") is None
-    assert reg.remove("s1") is False
+    removed_again = reg.remove("s1")
+    assert removed_again is False
 
 
 def test_in_memory_when_no_path():

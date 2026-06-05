@@ -99,6 +99,8 @@ class _SessionState:
         self.on_event = on_event
         self.turn_active = False
         self.turn_task: asyncio.Task | None = None
+        self.cancelled = False  # user interrupted this turn → finalize as cancelled
+        self.notified_crash = False  # agent_crashed already emitted for this turn
 
 
 class _ProcessClient(acp.Client):
@@ -114,7 +116,8 @@ class _ProcessClient(acp.Client):
 
     async def session_update(self, session_id: str, update: Any, **_kw: Any) -> None:
         st = self._p.sessions.get(session_id)
-        if st is None:
+        if st is None or st.cancelled or st.notified_crash:
+            # Drop late updates for a cancelled/crashed turn.
             return
         await st.on_event(
             {
@@ -147,6 +150,8 @@ class AcpAgentProcess:
         self._conn: Any = None
         self._rpc_queue: Any = None
         self._stderr_task: asyncio.Task | None = None
+        self._exit_task: asyncio.Task | None = None
+        self._closing = False  # set on intentional close() so the exit watcher is silent
         self._start_lock = asyncio.Lock()
         self.sessions: dict[str, _SessionState] = {}
         self.load_session: bool = False
@@ -170,6 +175,9 @@ class AcpAgentProcess:
         async with self._start_lock:
             if self.running:
                 return
+            # (Re)spawn: a prior crash left stale ACP session ids; drop them.
+            self._closing = False
+            self.sessions.clear()
             try:
                 self._proc = await asyncio.create_subprocess_exec(
                     self.agent.command,
@@ -203,12 +211,44 @@ class AcpAgentProcess:
             except Exception as exc:  # noqa: BLE001 — init failure is a spawn failure
                 await self.close()
                 raise SpawnFailedError(f"ACP initialize failed: {exc}") from exc
+            self._exit_task = asyncio.create_task(
+                self._watch_exit(self._proc), name=f"acp-exit-{self._label}"
+            )
             self._log.info(
                 "acp.process_started",
                 agent=self._label,
                 command=self.agent.command,
                 load_session=self.load_session,
             )
+
+    async def _watch_exit(self, proc: asyncio.subprocess.Process) -> None:
+        """Detect unexpected agent-process death and recover the sessions.
+
+        On crash: emit ``session.error{agent_crashed}`` to every live session,
+        cancel in-flight turns, and drop the (now-dead) ACP session ids. The
+        daemon respawns this process on the next ``session.prompt`` (a fresh
+        ACP session per daemon session; conversational resume is #23).
+        """
+        with contextlib.suppress(asyncio.CancelledError):
+            await proc.wait()
+        if self._closing or proc is not self._proc:
+            return  # intentional close, or already replaced by a respawn
+        self._log.warning("acp.process_crashed", agent=self._label, returncode=proc.returncode)
+        crashed = list(self.sessions.items())
+        self.sessions.clear()
+        for _sid, st in crashed:
+            if st.turn_task is not None and not st.turn_task.done():
+                st.turn_task.cancel()
+            if not st.notified_crash:
+                st.notified_crash = True
+                with contextlib.suppress(Exception):
+                    await st.on_event(
+                        {
+                            "type": "session.error",
+                            "code": "agent_crashed",
+                            "message": "ACP agent process exited unexpectedly",
+                        }
+                    )
 
     async def new_session(self, *, cwd: str | None, on_event: EventCallback) -> str:
         await self.ensure_started()
@@ -274,6 +314,8 @@ class AcpAgentProcess:
         if st.turn_active:
             raise SessionBusyError("a turn is already in flight")
         st.turn_active = True
+        st.cancelled = False
+        st.notified_crash = False
         st.turn_task = asyncio.create_task(
             self._run_turn(acp_session_id, blocks), name=f"acp-turn-{acp_session_id}"
         )
@@ -293,19 +335,34 @@ class AcpAgentProcess:
                 frame["usage"] = usage.model_dump(mode="json", by_alias=True, exclude_none=True)
             await st.on_event(frame)
         except asyncio.CancelledError:
+            # User interrupt → finalize the turn as cancelled (the agent may
+            # never respond to session/cancel). Process teardown/crash → stay
+            # silent; close()/the exit watcher own those frames.
+            if st.cancelled:
+                await st.on_event({"type": "session.result", "stop_reason": "cancelled"})
+                return
             raise
         except Exception as exc:  # noqa: BLE001 — surface transport/agent errors as a frame
-            await st.on_event(
-                {"type": "session.error", "code": "agent_crashed", "message": str(exc)}
-            )
+            if not st.notified_crash:
+                st.notified_crash = True
+                await st.on_event(
+                    {"type": "session.error", "code": "agent_crashed", "message": str(exc)}
+                )
         finally:
             st.turn_active = False
 
     async def cancel(self, acp_session_id: str) -> bool:
         st = self.sessions.get(acp_session_id)
-        if st is None or not st.turn_active or self._conn is None:
+        if st is None or not st.turn_active:
             return False
-        await self._conn.cancel(session_id=acp_session_id)
+        st.cancelled = True
+        # Best-effort notify the agent; we finalize locally regardless since
+        # agents don't reliably respond to session/cancel.
+        if self._conn is not None:
+            with contextlib.suppress(Exception):
+                await self._conn.cancel(session_id=acp_session_id)
+        if st.turn_task is not None and not st.turn_task.done():
+            st.turn_task.cancel()
         return True
 
     async def end_session(self, acp_session_id: str) -> None:
@@ -318,6 +375,10 @@ class AcpAgentProcess:
                 await st.turn_task
 
     async def close(self) -> None:
+        self._closing = True
+        if self._exit_task is not None:
+            self._exit_task.cancel()
+            self._exit_task = None
         for st in list(self.sessions.values()):
             if st.turn_task is not None and not st.turn_task.done():
                 st.turn_task.cancel()

@@ -130,6 +130,45 @@ async def test_one_process_multiplexes_two_sessions():
     assert any(f["type"] == "session.result" for f in fb)
 
 
+async def test_cancel_finalizes_as_cancelled():
+    process = _process()
+    q: asyncio.Queue = asyncio.Queue()
+    handle = await _handle(process, q)
+    try:
+        await handle.send_user_turn({"role": "user", "content": "hang please"})
+        await asyncio.sleep(0.2)
+        assert await handle.interrupt() is True
+        result = await asyncio.wait_for(_first(q, "session.result"), timeout=10.0)
+        assert result["stop_reason"] == "cancelled"
+        assert handle.turn_active is False
+    finally:
+        await process.close()
+
+
+async def test_three_sessions_stream_independently():
+    process = _process()
+    queues = [asyncio.Queue() for _ in range(3)]
+    handles = [await _handle(process, q) for q in queues]
+    try:
+        ids = {h.native_session_id for h in handles}
+        assert len(ids) == 3  # distinct ACP session ids
+        assert process.session_count() == 3
+        for h in handles:
+            await h.send_user_turn({"role": "user", "content": "say pong"})
+        results = []
+        for q in queues:
+            frames = await _collect_turn(q)
+            text = "".join(
+                f["update"]["content"]["text"] for f in frames if f["type"] == "session.update"
+            )
+            results.append((text, next(f for f in frames if f["type"] == "session.result")))
+    finally:
+        await process.close()
+    # Each session got its own complete, uncrossed stream.
+    assert all(text == "PONG done" for text, _ in results)
+    assert all(r["stop_reason"] == "end_turn" for _, r in results)
+
+
 async def test_agent_failure_surfaces_session_error():
     process = _process()
     q: asyncio.Queue = asyncio.Queue()

@@ -11,6 +11,7 @@ is driven by the prompt text so a single stub covers several scenarios:
 * contains "finish"→ emit one chunk, sleep ~0.5s, finish ``end_turn`` (graceful
                      shutdown: turn completes within the grace window).
 * contains "boom"  → raise, so the turn surfaces as an agent error.
+* contains "die"   → hard-exit the process mid-turn (crash/recovery tests).
 
 Run as: ``python fake_acp.py`` (stdio).
 """
@@ -18,6 +19,7 @@ Run as: ``python fake_acp.py`` (stdio).
 from __future__ import annotations
 
 import asyncio
+import os
 
 import acp
 from acp import run_agent, update_agent_message_text
@@ -62,6 +64,9 @@ class FakeAgent(acp.Agent):
 
         if "boom" in text:
             raise RuntimeError("synthetic agent failure")
+
+        if "die" in text:
+            os._exit(1)  # hard crash mid-turn, no response
 
         assert self._conn is not None
 

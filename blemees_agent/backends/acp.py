@@ -105,6 +105,7 @@ class _SessionState:
         self.turn_task: asyncio.Task | None = None
         self.cancelled = False  # user interrupted this turn → finalize as cancelled
         self.notified_crash = False  # agent_crashed already emitted for this turn
+        self.loading = False  # session/load is replaying history → drop those updates
 
 
 class _ProcessClient(acp.Client):
@@ -120,8 +121,10 @@ class _ProcessClient(acp.Client):
 
     async def session_update(self, session_id: str, update: Any, **_kw: Any) -> None:
         st = self._p.sessions.get(session_id)
-        if st is None or st.cancelled or st.notified_crash:
-            # Drop late updates for a cancelled/crashed turn.
+        if st is None or st.cancelled or st.notified_crash or st.loading:
+            # Drop updates for a cancelled/crashed turn, or the history the
+            # agent replays during session/load (the client already has it
+            # from the durable event log, #22).
             return
         await st.on_event(
             {
@@ -281,6 +284,30 @@ class AcpAgentProcess:
         self.sessions[sid] = _SessionState(on_event, permission_cb)
         await self._apply_selection(sid, ns)
         return sid
+
+    async def resume_session(
+        self, *, native_session_id: str, cwd: str | None, on_event: EventCallback, permission_cb: Any
+    ) -> str:
+        """Rehydrate a prior agent session via ACP ``session/load`` (#23).
+
+        The agent replays the conversation as ``session/update`` notifications;
+        we suppress them (the client already has the history from the durable
+        event log) and keep only the model-side context warm so the next turn
+        continues the conversation.
+        """
+        await self.ensure_started()
+        st = _SessionState(on_event, permission_cb)
+        st.loading = True
+        self.sessions[native_session_id] = st
+        try:
+            await self._conn.load_session(
+                cwd=cwd or self.agent.cwd or ".",
+                session_id=native_session_id,
+                mcp_servers=_mcp_servers(self.agent),
+            )
+        finally:
+            st.loading = False
+        return native_session_id
 
     async def _apply_selection(self, sid: str, ns: Any) -> None:
         """Apply the profile's model/mode after session/new (finding B, #15).
@@ -467,14 +494,19 @@ class AcpSessionHandle:
         cwd: str | None,
         on_close: Any = None,
         permission_cb: Any = None,
+        resume_native_id: str | None = None,
     ) -> None:
         self._process = process
         self._on_event = on_event
         self._cwd = cwd
         self._on_close = on_close  # supervisor callback for idle-reap accounting
         self._permission_cb = permission_cb
+        self._resume_native_id = resume_native_id  # resume this agent session, if set (#23)
         self.native_session_id: str | None = None
         self.load_session: bool = False
+        # True when resume was requested but the agent can't session/load:
+        # the session is viewable (replayed history) but not drivable.
+        self.view_only: bool = False
         self.model: str | None = process.agent.model
 
     @property
@@ -490,6 +522,23 @@ class AcpSessionHandle:
         return bool(self.native_session_id and self._process.is_turn_active(self.native_session_id))
 
     async def spawn(self) -> None:
+        if self._resume_native_id is not None:
+            await self._process.ensure_started()
+            self.load_session = self._process.load_session
+            if self._process.load_session:
+                # Rehydrate the agent's conversation (#23).
+                self.native_session_id = await self._process.resume_session(
+                    native_session_id=self._resume_native_id,
+                    cwd=self._cwd,
+                    on_event=self._on_event,
+                    permission_cb=self._permission_cb,
+                )
+            else:
+                # Agent can't reload — viewable (from the event log) but not
+                # drivable. No ACP session is created.
+                self.view_only = True
+                self.native_session_id = None
+            return
         self.native_session_id = await self._process.new_session(
             cwd=self._cwd, on_event=self._on_event, permission_cb=self._permission_cb
         )

@@ -42,9 +42,12 @@ class FakeAgent(acp.Agent):
         self._conn = conn
 
     async def initialize(self, protocol_version, client_capabilities=None, client_info=None, **kw):
+        # ``BLEMEES_FAKE_NO_LOAD`` simulates an agent that can't reload prior
+        # sessions, so the daemon falls back to view-only on resume (#23).
+        can_load = os.environ.get("BLEMEES_FAKE_NO_LOAD") != "1"
         return InitializeResponse(
             protocol_version=protocol_version,
-            agent_capabilities=AgentCapabilities(load_session=True),
+            agent_capabilities=AgentCapabilities(load_session=can_load),
         )
 
     async def new_session(self, cwd, additional_directories=None, mcp_servers=None, **kw):

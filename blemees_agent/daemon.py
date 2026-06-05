@@ -34,6 +34,7 @@ from .errors import (
     UNKNOWN_BACKEND,
     UNKNOWN_MESSAGE,
     UNSAFE_FLAG,
+    VIEW_ONLY,
     BlemeesError,
     OversizeMessageError,
     ProtocolError,
@@ -326,13 +327,14 @@ class Connection:
     # Handlers
     # ------------------------------------------------------------------
 
-    def _make_backend(self, msg: OpenMessage, *, on_event, permission_cb):
+    def _make_backend(self, msg: OpenMessage, *, on_event, permission_cb, resume_native_id=None):
         """Construct the per-session ACP handle bound to the agent's process.
 
         Model is Profile → Agent → Session (#17): the supervisor owns one ACP
         process per agent and multiplexes sessions onto it; the handle is the
         per-session view. ``permission_cb`` is the session's policy/relay
-        decision callback (#20).
+        decision callback (#20). ``resume_native_id`` rehydrates a prior agent
+        session via session/load (#23).
         """
         return self._supervisor.make_handle(
             msg.profile,
@@ -340,6 +342,7 @@ class Connection:
             on_event=on_event,
             cwd=msg.options.get("cwd"),
             permission_cb=permission_cb,
+            resume_native_id=resume_native_id,
         )
 
     async def _handle_open(self, msg: OpenMessage) -> None:
@@ -375,12 +378,25 @@ class Connection:
         # The session inherits its profile's permission policy (#20).
         sess.permission_policy = dict(profile.permission_policy)
 
+        # On resume, rehydrate the agent's prior session via session/load (#23).
+        # The prior agent session id comes from the live session or, across a
+        # restart, the persistent registry.
+        resume_native_id: str | None = None
+        if msg.resume:
+            rec = self._registry.get(msg.session_id)
+            resume_native_id = sess.native_session_id or (
+                rec.get("native_session_id") if rec else None
+            )
+
         # (Re)spawn the backend first so we have a pid for the ack. Any
         # events the child emits before we attach buffer into the session's
         # ring and get delivered below.
         if sess.backend is None or not sess.backend.running:
             backend = self._make_backend(
-                msg, on_event=sess.on_event, permission_cb=sess.decide_permission
+                msg,
+                on_event=sess.on_event,
+                permission_cb=sess.decide_permission,
+                resume_native_id=resume_native_id,
             )
             try:
                 await backend.spawn()
@@ -391,12 +407,15 @@ class Connection:
                 )
                 return
             sess.backend = backend
-            # Surface what the ACP agent reported at new_session: its own
-            # session id and whether it supports session/load (#23).
-            sess.native_session_id = getattr(backend, "native_session_id", None)
+            # Surface what the ACP agent reported: its own session id, whether
+            # it supports session/load, and (on resume) whether the session is
+            # view-only because the agent can't reload it (#23).
+            if getattr(backend, "native_session_id", None):
+                sess.native_session_id = backend.native_session_id
             if getattr(backend, "model", None):
                 sess.last_model = backend.model
             sess.extra["load_session"] = bool(getattr(backend, "load_session", False))
+            sess.extra["view_only"] = bool(getattr(backend, "view_only", False))
 
         self._owned_sessions.add(msg.session_id)
 
@@ -405,16 +424,21 @@ class Connection:
             msg.session_id,
             profile=profile.name,
             agent=agent.name,
+            native_session_id=sess.native_session_id,
             cwd=msg.options.get("cwd") or agent.cwd,
             model=agent.model,
-            view_only=False,
+            view_only=bool(sess.extra.get("view_only", False)),
         )
         self._registry.save()
 
         # Send ack before the event stream so clients can match the reply
         # before they start consuming (possibly replayed) frames.
-        # ``native_session_id`` is the agent's own session id; included only
-        # when it differs from the daemon's session id.
+        # ``native_session_id`` is the agent's own *live* session id; included
+        # only when it differs from the daemon's session id. A view-only
+        # session has no live ACP session (the agent couldn't reload it, #23),
+        # so we never advertise a native id for it even though one survives in
+        # the persisted sidecar — doing so would imply a drivable session.
+        view_only = bool(sess.extra.get("view_only", False))
         opened_frame: dict[str, Any] = {
             "type": "session.opened",
             "id": msg.id,
@@ -423,9 +447,9 @@ class Connection:
             "agent": agent.name,
             "subprocess_pid": sess.backend.pid,
             "last_seq": sess.seq,
-            "view_only": False,
+            "view_only": view_only,
         }
-        if sess.native_session_id and sess.native_session_id != msg.session_id:
+        if not view_only and sess.native_session_id and sess.native_session_id != msg.session_id:
             opened_frame["native_session_id"] = sess.native_session_id
         await self._emit_frame(opened_frame)
 
@@ -454,10 +478,23 @@ class Connection:
 
             raise SessionUnknownError(msg.session_id)
         sess = self._sessions.get(msg.session_id)
+        # A view-only session (resumed against an agent that can't reload it,
+        # #23) can be read but not driven — reject prompts up front.
+        if sess.extra.get("view_only"):
+            await self._emit_error(
+                VIEW_ONLY,
+                "session is view-only: the agent could not reload its prior context",
+                session_id=msg.session_id,
+            )
+            return
         if sess.backend is None or not sess.backend.running:
-            # Respawn transparently.
+            # Respawn transparently, rehydrating the agent's prior session if
+            # we have its native id (#23).
             backend = self._make_backend(
-                sess.open_msg, on_event=sess.on_event, permission_cb=sess.decide_permission
+                sess.open_msg,
+                on_event=sess.on_event,
+                permission_cb=sess.decide_permission,
+                resume_native_id=sess.native_session_id,
             )
             try:
                 await backend.spawn()
@@ -465,6 +502,18 @@ class Connection:
                 await self._emit_error(SPAWN_FAILED, exc.message, session_id=msg.session_id)
                 return
             sess.backend = backend
+            if getattr(backend, "view_only", False):
+                # The respawn couldn't reload context either — degrade to
+                # view-only rather than start a blank turn silently.
+                sess.extra["view_only"] = True
+                await self._emit_error(
+                    VIEW_ONLY,
+                    "session is view-only: the agent could not reload its prior context",
+                    session_id=msg.session_id,
+                )
+                return
+            if getattr(backend, "native_session_id", None):
+                sess.native_session_id = backend.native_session_id
 
         try:
             await sess.backend.send_user_turn(msg.message)

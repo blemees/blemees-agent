@@ -118,6 +118,9 @@ class Session:
     )
     pending_permissions: dict[str, asyncio.Future] = field(default_factory=dict)
     remembered_permission: str | None = None  # None | "allow" | "deny"
+    # True while a relayed permission is waiting with no owner attached (#20/#24);
+    # surfaced on session.list / session.info.
+    needs_attention: bool = False
 
     # ------------------------------------------------------------------
     # Event dispatch
@@ -335,6 +338,7 @@ class Session:
             if detached in ("allow", "deny"):
                 return self._auto_decision(options, detached)
             stalled = True
+            self.needs_attention = True
             await self.on_event({"type": "session.needs_attention", "reason": "permission_pending"})
 
         request_id = _new_request_id()
@@ -353,6 +357,7 @@ class Session:
         finally:
             self.pending_permissions.pop(request_id, None)
             if stalled:
+                self.needs_attention = False
                 await self.on_event({"type": "session.attention_cleared"})
         self._maybe_remember(options, decision)
         return decision

@@ -68,6 +68,7 @@ from .protocol import (
     parse_session_info,
     parse_status,
 )
+from .registry import Registry
 from .session import SessionTable, make_reaper
 from .supervisor import Supervisor
 
@@ -127,6 +128,7 @@ class Connection:
         logger: StructuredLogger,
         agents: dict[str, str],
         supervisor: Supervisor,
+        registry: Registry,
         shutdown_event: asyncio.Event,
         lookup_connection: Callable[[int], Connection | None] | None = None,
         status_snapshot: Callable[[], dict[str, Any]] | None = None,
@@ -138,6 +140,7 @@ class Connection:
         self._sessions = sessions
         self._agents = agents
         self._supervisor = supervisor
+        self._registry = registry
         self._shutdown = shutdown_event
         self._lookup_connection = lookup_connection
         self._status_snapshot = status_snapshot
@@ -397,6 +400,17 @@ class Connection:
 
         self._owned_sessions.add(msg.session_id)
 
+        # Record the session in the persistent registry (#21).
+        self._registry.upsert(
+            msg.session_id,
+            profile=profile.name,
+            agent=agent.name,
+            cwd=msg.options.get("cwd") or agent.cwd,
+            model=agent.model,
+            view_only=False,
+        )
+        self._registry.save()
+
         # Send ack before the event stream so clients can match the reply
         # before they start consuming (possibly replayed) frames.
         # ``native_session_id`` is the agent's own session id; included only
@@ -491,30 +505,55 @@ class Connection:
         )
 
     async def _handle_list(self, msg) -> None:
-        """Enumerate live sessions known to the daemon (optionally by cwd).
+        """Enumerate sessions from the persistent registry, overlaid with live state.
 
-        blemees/3 (#16) lists only sessions currently in the daemon's
-        ``SessionTable``. On-disk / cross-restart discovery moves to the
-        persistent registry in #21 (the daemon no longer scans agent-owned
-        transcript directories).
+        Registry-backed (#21): the union of sessions recorded across runs and
+        sessions currently live. Live sessions overlay ``attached`` / ``running``
+        / ``turn_active`` / ``last_seq`` / ``owner_pid`` / ``needs_attention``
+        onto their record. ``cwd`` filters both. The daemon never scans
+        agent-owned transcript directories.
         """
+        rows: dict[str, dict[str, Any]] = {}
+        # Base rows from the registry (cold/persisted).
+        for rec in self._registry.all():
+            if msg.cwd is not None and rec.get("cwd") != msg.cwd:
+                continue
+            rows[rec["session_id"]] = {
+                "session_id": rec["session_id"],
+                "profile": rec.get("profile"),
+                "agent": rec.get("agent"),
+                "model": rec.get("model"),
+                "cwd": rec.get("cwd"),
+                "turns": rec.get("turns", 0),
+                "started_at_ms": rec.get("created_at_ms"),
+                "last_active_at_ms": rec.get("last_active_at_ms"),
+                "view_only": bool(rec.get("view_only", False)),
+                "attached": False,
+                "running": False,
+            }
+        # Live overlay.
         live_iter = (
             self._sessions.iter_by_cwd(msg.cwd)
             if msg.cwd is not None
             else list(self._sessions._sessions.values())
         )
-        rows: list[dict[str, Any]] = []
         for sess in live_iter:
             owner_pid: int | None = None
             if sess.connection_id is not None and self._lookup_connection is not None:
                 owner = self._lookup_connection(sess.connection_id)
                 if owner is not None:
                     owner_pid = owner._peer_pid
-            rows.append(sess.live_summary(owner_pid=owner_pid))
+            row = rows.setdefault(sess.session_id, {"session_id": sess.session_id})
+            row.update(sess.live_summary(owner_pid=owner_pid))
+            row["running"] = sess.backend is not None and sess.backend.running
+            row["needs_attention"] = sess.needs_attention
+            row["turns"] = sess.turns
 
-        rows.sort(key=lambda r: r.get("last_active_at_ms") or 0, reverse=True)
-        self._log.info("session.list", cwd=msg.cwd, count=len(rows))
-        reply: dict[str, Any] = {"type": "sessions", "id": msg.id, "sessions": rows}
+        sessions = sorted(
+            rows.values(), key=lambda r: r.get("last_active_at_ms") or 0, reverse=True
+        )
+        self._log.info("session.list", cwd=msg.cwd, count=len(sessions))
+        reply: dict[str, Any] = {"type": "sessions", "id": msg.id, "sessions": sessions}
         if msg.cwd is not None:
             reply["cwd"] = msg.cwd
         await self._emit_frame(reply)
@@ -546,6 +585,9 @@ class Connection:
                 }
             )
         await self._sessions.remove(msg.session_id, delete_file=msg.delete)
+        if msg.delete:
+            self._registry.remove(msg.session_id)
+            self._registry.save()
         await self._emit_frame(
             {"type": "session.closed", "id": msg.id, "session_id": msg.session_id}
         )
@@ -688,12 +730,14 @@ class Connection:
     async def _handle_session_info(self, msg) -> None:
         """Reply with the session's metadata + per-turn snapshot.
 
-        blemees/3 (#16) serves only sessions live in the daemon. On-disk /
-        cross-restart info moves to the persistent registry in #21. Token
-        usage is optional — present only when the ACP agent reported it.
+        Live sessions report the in-memory snapshot (incl. profile/agent and
+        optional usage); sessions known only to the persistent registry (from
+        a prior run, not yet respawned) report their stored metadata with
+        ``attached``/``running`` false (#21).
         """
         sess = self._sessions.try_get(msg.session_id)
-        if sess is None:
+        rec = self._registry.get(msg.session_id)
+        if sess is None and rec is None:
             await self._emit_error(
                 SESSION_UNKNOWN,
                 f"no such session: {msg.session_id}",
@@ -701,13 +745,35 @@ class Connection:
                 session_id=msg.session_id,
             )
             return
-        subproc_running = sess.backend is not None and sess.backend.running
-        snap = sess.usage_snapshot(
-            attached=sess.connection_id is not None,
-            subprocess_running=subproc_running,
-        )
         frame: dict[str, Any] = {"type": "session.info_reply", "id": msg.id}
-        frame.update(snap)
+        if sess is not None:
+            running = sess.backend is not None and sess.backend.running
+            frame.update(
+                sess.usage_snapshot(
+                    attached=sess.connection_id is not None, subprocess_running=running
+                )
+            )
+            if rec is not None:
+                frame.setdefault("profile", rec.get("profile"))
+                frame.setdefault("agent", rec.get("agent"))
+            frame["needs_attention"] = sess.needs_attention
+            frame["view_only"] = bool(sess.extra.get("view_only", False))
+        else:
+            frame.update(
+                {
+                    "session_id": msg.session_id,
+                    "profile": rec.get("profile"),
+                    "agent": rec.get("agent"),
+                    "model": rec.get("model"),
+                    "cwd": rec.get("cwd"),
+                    "turns": rec.get("turns", 0),
+                    "last_turn_at_ms": rec.get("last_active_at_ms"),
+                    "attached": False,
+                    "subprocess_running": False,
+                    "view_only": bool(rec.get("view_only", False)),
+                    "needs_attention": False,
+                }
+            )
         await self._emit_frame(frame)
 
     # ------------------------------------------------------------------
@@ -900,10 +966,13 @@ class Daemon:
         self._proc_reaper_task: asyncio.Task | None = None
         self._agents: dict[str, str] = {}
         self._supervisor = Supervisor(config, logger)
+        registry_path = Path(config.state_dir) / "registry.json" if config.state_dir else None
+        self._registry = Registry(registry_path)
         self._start_time: float = time.monotonic()
 
     async def start(self) -> None:
         self._agents = detect_agents(self._config)
+        self._registry.load()
         _prepare_socket_path(self._config.socket_path, self._log)
 
         self._server = await asyncio.start_unix_server(
@@ -932,6 +1001,7 @@ class Daemon:
             logger=self._log,
             agents=self._agents,
             supervisor=self._supervisor,
+            registry=self._registry,
             shutdown_event=self._shutdown_event,
             lookup_connection=self._lookup_connection,
             status_snapshot=self._status_snapshot,
@@ -992,6 +1062,10 @@ class Daemon:
                 reaped = await self._supervisor.reap_idle(self._config.idle_timeout_s)
                 if reaped:
                     self._log.info("profile.reaped", profiles=reaped)
+                # Persist current turn counters / activity for live sessions (#21).
+                for sess in list(self._sessions._sessions.values()):
+                    self._registry.touch(sess.session_id, turns=sess.turns, model=sess.last_model)
+                self._registry.save()
             except asyncio.CancelledError:
                 return
             except Exception:  # pragma: no cover - defensive

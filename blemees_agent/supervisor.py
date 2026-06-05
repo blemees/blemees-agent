@@ -60,6 +60,9 @@ class Profile:
     permission_policy: dict[str, Any] = dataclasses.field(
         default_factory=lambda: {"mode": "relay", "detached": "stall"}
     )
+    # Notify config for this profile's sessions (#24, §6). Currently
+    # ``{"webhook_url": str}``; absent falls back to the daemon-global URL.
+    notify: dict[str, Any] = dataclasses.field(default_factory=dict)
 
     @property
     def default_agent(self) -> Agent:
@@ -112,6 +115,7 @@ def _profiles_from_config(config: Config) -> dict[str, Profile]:
             agents = {DEFAULT_AGENT: _agent_from_spec(DEFAULT_AGENT, pspec, config.agent_command)}
         if agents:
             policy = pspec.get("permission_policy")
+            notify = pspec.get("notify")
             profiles[pname] = Profile(
                 name=pname,
                 agents=agents,
@@ -120,6 +124,7 @@ def _profiles_from_config(config: Config) -> dict[str, Profile]:
                     if isinstance(policy, dict)
                     else {"mode": "relay", "detached": "stall"}
                 ),
+                notify=dict(notify) if isinstance(notify, dict) else {},
             )
     return profiles
 
@@ -155,6 +160,16 @@ class Supervisor:
 
     def profile_names(self) -> list[str]:
         return list(self._profiles)
+
+    def webhook_url_for(self, profile_name: str | None) -> str | None:
+        """The notify webhook URL for a profile: its own, else the global
+        fallback from config (#24, §6). Unknown profiles get the fallback."""
+        profile = self._profiles.get(profile_name or DEFAULT_PROFILE)
+        if profile is not None:
+            url = profile.notify.get("webhook_url")
+            if url:
+                return url
+        return self._config.notify_webhook_url
 
     # -- processes ------------------------------------------------------
 

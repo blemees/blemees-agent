@@ -32,6 +32,7 @@ from typing import Any
 from .backends import AgentBackend
 from .errors import SessionExistsError, SessionUnknownError
 from .event_log import DurableEventLog, RingBuffer, event_log_path
+from .notify import AGENT_CRASHED, AUTH_REQUIRED, PERMISSION_PENDING, NotifyService
 from .protocol import OpenMessage
 
 WriterFn = Callable[[dict], Awaitable[None]]
@@ -41,6 +42,14 @@ def _new_request_id() -> str:
     import uuid
 
     return f"perm_{uuid.uuid4().hex[:12]}"
+
+
+def _permission_detail(tool_call: dict[str, Any]) -> str:
+    """A human-readable line for a permission notification (#24)."""
+    title = tool_call.get("title") if isinstance(tool_call, dict) else None
+    return (
+        f"permission needed: {title}" if title else "the agent is waiting for a permission decision"
+    )
 
 
 @dataclass(slots=True)
@@ -118,9 +127,15 @@ class Session:
     )
     pending_permissions: dict[str, asyncio.Future] = field(default_factory=dict)
     remembered_permission: str | None = None  # None | "allow" | "deny"
-    # True while a relayed permission is waiting with no owner attached (#20/#24);
-    # surfaced on session.list / session.info.
+    # True while the session needs its owner and none is attached (#20/#24);
+    # surfaced on session.list / session.info. ``attention_reason`` records why
+    # (permission_pending | auth_required | agent_crashed).
     needs_attention: bool = False
+    attention_reason: str | None = None
+    # Notify service + the resolved profile name, injected by the daemon on
+    # open so the attention state machine can fire the per-profile webhook (#24).
+    notify: NotifyService | None = None
+    profile_name: str | None = None
 
     # ------------------------------------------------------------------
     # Event dispatch
@@ -173,6 +188,15 @@ class Session:
             sub = self.backend
             if sub is not None:
                 asyncio.create_task(sub.close(), name=f"backend-soft-kill-{self.session_id}")
+        # An error delivered to a session whose owner has left needs the
+        # owner's attention — fire the notify trigger (#24). enter_attention
+        # self-gates on "no owner attached", so an error watched live is silent.
+        if frame.get("type") == "session.error":
+            code = frame.get("code")
+            if code in (AGENT_CRASHED, AUTH_REQUIRED):
+                await self.enter_attention(
+                    code, frame.get("message") or "the agent reported an error"
+                )
 
     # ------------------------------------------------------------------
     # Attach / detach
@@ -195,6 +219,9 @@ class Session:
 
         summary = {"replayed": 0, "gap_from": 0, "gap_to": 0}
         if last_seen_seq is None:
+            # An owner is present again — the session no longer needs attention
+            # (#24). Cleared after any replay so the frame lands newest.
+            await self.clear_attention()
             return summary
 
         to_replay = self.ring.since(last_seen_seq)
@@ -235,6 +262,7 @@ class Session:
             )
             summary["gap_from"] = last_seen_seq + 1
             summary["gap_to"] = old_seq
+        await self.clear_attention()
         return summary
 
     def detach_writer(self) -> None:
@@ -310,6 +338,42 @@ class Session:
             self._watchers.pop(conn_id, None)
 
     # ------------------------------------------------------------------
+    # Attention state machine (#24, §6)
+    # ------------------------------------------------------------------
+
+    async def enter_attention(self, reason: str, detail: str) -> None:
+        """Enter ``needs_attention`` and fire a notification — but only while
+        no owner is attached (the state means "needs the owner, none here").
+
+        Idempotent on the entry edge: re-entering with the same reason while
+        already flagged does nothing, so a sink fires once per real edge.
+        """
+        if self.connection_id is not None:
+            return  # owner is present; they see it live, no push needed
+        if self.needs_attention and self.attention_reason == reason:
+            return
+        self.needs_attention = True
+        self.attention_reason = reason
+        await self.on_event({"type": "session.needs_attention", "reason": reason})
+        if self.notify is not None:
+            await self.notify.fire(
+                reason=reason,
+                profile=self.profile_name or "default",
+                session_id=self.session_id,
+                detail=detail,
+            )
+
+    async def clear_attention(self) -> None:
+        """Leave ``needs_attention`` (owner attached or the cause resolved)."""
+        if not self.needs_attention:
+            return
+        self.needs_attention = False
+        self.attention_reason = None
+        if self.notify is not None:
+            self.notify.clear(self.session_id)
+        await self.on_event({"type": "session.attention_cleared"})
+
+    # ------------------------------------------------------------------
     # Permission relay (#20)
     # ------------------------------------------------------------------
 
@@ -338,8 +402,7 @@ class Session:
             if detached in ("allow", "deny"):
                 return self._auto_decision(options, detached)
             stalled = True
-            self.needs_attention = True
-            await self.on_event({"type": "session.needs_attention", "reason": "permission_pending"})
+            await self.enter_attention(PERMISSION_PENDING, _permission_detail(tool_call))
 
         request_id = _new_request_id()
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
@@ -357,8 +420,7 @@ class Session:
         finally:
             self.pending_permissions.pop(request_id, None)
             if stalled:
-                self.needs_attention = False
-                await self.on_event({"type": "session.attention_cleared"})
+                await self.clear_attention()
         self._maybe_remember(options, decision)
         return decision
 

@@ -279,6 +279,20 @@ Webhook payload (shape):
 }
 ```
 
+**Config.** The webhook URL is per-profile (`[profiles.<p>.notify] webhook_url`)
+with a daemon-global fallback (`notify_webhook_url` / `BLEMEES_AGENTD_NOTIFY_WEBHOOK_URL`).
+A profile with no URL and no global fallback simply doesn't POST. Sinks are
+best-effort: a failing or slow endpoint is logged and never blocks or breaks
+the trigger that fired it.
+
+**Implementation note.** `needs_attention` is entered only while no owner is
+attached (a live owner sees the error/permission on the wire), so all three
+triggers gate on detachment. The canonical detached cases are a relayed
+permission with no owner and an error (`agent_crashed` / `auth_required`)
+delivered to a session whose owner has left; entry fires once per edge and
+clears when an owner re-attaches or the cause resolves. `notify.test` (§9.7)
+fires a synthetic event without entering the queue.
+
 ---
 
 ## 7. Durability, registry, replay
@@ -432,10 +446,25 @@ Owner → daemon, answering a permission request:
 ← {"type":"status_reply","id":"…","daemon":"…","protocol":"blemees/3","uptime_s":…,
    "agents":{…},"profiles":[{"name":"…","running":true,"sessions":2}],
    "sessions":{"total":5,"attached":4,"needs_attention":1,"by_profile":{…}},
+   "attention":[{"type":"blemees.notify","reason":"permission_pending","session_id":"…",…}],
    "config":{"state_dir":"…","ring_buffer_size":1024,"profile_idle_s":900,…}}
 ```
+`attention` is the outstanding `needs_attention` set (§6) — one notification
+payload per session currently awaiting its owner, so an attaching client sees
+the queue immediately.
 
-### 9.7 Errors
+### 9.7 Notify (§6)
+```json
+→ {"type":"notify.test","id":"…","profile":"…"}
+← {"type":"notify.test_result","id":"…","profile":"…","webhook_configured":true,
+   "notification":{"type":"blemees.notify","reason":"test",…}}
+```
+`notify.test` fires a synthetic notification through the configured sinks so
+the user can verify routing; it does not enter the `attention` queue.
+`webhook_configured` reports whether the profile (or global fallback) resolves
+to a URL.
+
+### 9.8 Errors
 `error{code,message,session_id?,id?}`. Codes carried over from `blemees/2`
 plus the ACP-era changes:
 

@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 from blemees_agent.backends.acp import AcpAgentProcess, AcpSessionHandle, _to_content_blocks
-from blemees_agent.errors import ProtocolError, SessionBusyError
+from blemees_agent.errors import AuthRequiredError, ProtocolError, SessionBusyError
 from blemees_agent.logging import configure
 from blemees_agent.supervisor import Agent
 
@@ -242,5 +242,37 @@ async def test_resume_without_load_capability_is_view_only():
         assert resumed.load_session is False
         assert resumed.view_only is True
         assert resumed.native_session_id is None
+    finally:
+        await process.close()
+
+
+# ---- auth_required mapping (#24) ------------------------------------
+
+
+async def test_turn_auth_error_maps_to_auth_required_code():
+    """A mid-turn ACP auth rejection surfaces as session.error{auth_required},
+    distinct from a generic crash, so the notify service can route it."""
+    process = _process()
+    q: asyncio.Queue = asyncio.Queue()
+    try:
+        handle = AcpSessionHandle(process=process, on_event=q.put, cwd=None)
+        await handle.spawn()
+        await handle.send_user_turn({"role": "user", "content": "needauth"})
+        err = await asyncio.wait_for(_first(q, "session.error"), timeout=10.0)
+        assert err["code"] == "auth_required"
+    finally:
+        await process.close()
+
+
+async def test_new_session_auth_error_raises_auth_required():
+    """When the agent rejects session/new with the ACP auth error, spawn
+    raises AuthRequiredError rather than a generic SpawnFailedError (#24)."""
+    env = {**os.environ, "BLEMEES_FAKE_AUTH_REQUIRED": "1"}
+    process = _process(env)
+    q: asyncio.Queue = asyncio.Queue()
+    try:
+        handle = AcpSessionHandle(process=process, on_event=q.put, cwd=None)
+        with pytest.raises(AuthRequiredError):
+            await handle.spawn()
     finally:
         await process.close()

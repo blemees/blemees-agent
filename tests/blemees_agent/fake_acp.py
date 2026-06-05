@@ -51,6 +51,10 @@ class FakeAgent(acp.Agent):
         )
 
     async def new_session(self, cwd, additional_directories=None, mcp_servers=None, **kw):
+        # ``BLEMEES_FAKE_AUTH_REQUIRED`` makes session/new reject with the ACP
+        # auth error so the daemon surfaces ``auth_required`` at open (#24).
+        if os.environ.get("BLEMEES_FAKE_AUTH_REQUIRED") == "1":
+            raise acp.RequestError.auth_required({"detail": "log in first"})
         # Unique id per session so one process can multiplex several.
         self._session_seq += 1
         return NewSessionResponse(session_id=f"fake-session-{self._session_seq}")
@@ -70,10 +74,37 @@ class FakeAgent(acp.Agent):
         if "boom" in text:
             raise RuntimeError("synthetic agent failure")
 
+        if "needauth" in text:
+            # Reject mid-turn with the ACP auth error (#24): the backend maps
+            # this to a session.error{code: auth_required} frame.
+            raise acp.RequestError.auth_required({"detail": "session expired"})
+
         if "die" in text:
             os._exit(1)  # hard crash mid-turn, no response
 
         assert self._conn is not None
+
+        if "stall" in text:
+            # Emit a chunk so the client can confirm the turn is in flight and
+            # detach, then (after a beat) request permission — which now has no
+            # owner and stalls, exercising the detached needs_attention path.
+            await self._conn.session_update(session_id, update_agent_message_text("working"))
+            await asyncio.sleep(0.3)
+            resp = await self._conn.request_permission(
+                session_id=session_id,
+                tool_call=ToolCallUpdate(
+                    tool_call_id="tc-stall", title="Run a command", status="pending"
+                ),
+                options=[
+                    PermissionOption(option_id="allow", name="Allow", kind="allow_once"),
+                    PermissionOption(option_id="deny", name="Deny", kind="reject_once"),
+                ],
+            )
+            decided = getattr(resp.outcome, "option_id", None) or "cancelled"
+            await self._conn.session_update(
+                session_id, update_agent_message_text(f"perm:{decided}")
+            )
+            return PromptResponse(stop_reason="end_turn")
 
         if "permit" in text:
             resp = await self._conn.request_permission(

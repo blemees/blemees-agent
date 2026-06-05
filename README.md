@@ -1259,6 +1259,7 @@ vars override. Env prefix: `BLEMEES_AGENTD_`.
 | `max_concurrent_sessions` | — | — | `64` |
 | `stderr_rate_lines` | — | — | `50` |
 | `stderr_rate_window_s` | — | — | `10` |
+| `notify_webhook_url` | — | `BLEMEES_AGENTD_NOTIFY_WEBHOOK_URL` | none (global fallback for the notify webhook; per-profile `[profiles.<p>.notify] webhook_url` overrides) |
 
 A backend whose binary cannot be located at startup is simply omitted
 from the `agent.hello_ack.backends` map; the daemon serves whichever

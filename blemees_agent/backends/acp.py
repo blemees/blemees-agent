@@ -42,11 +42,27 @@ from acp.schema import (
     RequestPermissionResponse,
 )
 
-from ..errors import ProtocolError, SessionBusyError, SpawnFailedError
+from ..errors import AuthRequiredError, ProtocolError, SessionBusyError, SpawnFailedError
 from . import EventCallback
 
 if TYPE_CHECKING:
     from ..supervisor import Agent
+
+# JSON-RPC error code the ACP SDK uses for "authentication required"
+# (``acp.RequestError.auth_required``); see #24.
+_ACP_AUTH_REQUIRED_CODE = -32000
+
+
+def _translate_request_error(exc: Exception) -> Exception:
+    """Map an ACP auth rejection to :class:`AuthRequiredError`, else passthrough.
+
+    The agent signals "the user must authenticate" by returning JSON-RPC
+    ``-32000``; surfacing it distinctly lets the notify service route it as
+    ``auth_required`` rather than a generic spawn failure (#24, §6).
+    """
+    if isinstance(exc, acp.RequestError) and exc.code == _ACP_AUTH_REQUIRED_CODE:
+        return AuthRequiredError(f"ACP agent requires authentication: {exc}")
+    return exc
 
 
 def _to_content_blocks(message: dict[str, Any]) -> list[Any]:
@@ -232,6 +248,9 @@ class AcpAgentProcess:
                 self.load_session = bool(getattr(caps, "load_session", False))
             except Exception as exc:  # noqa: BLE001 — init failure is a spawn failure
                 await self.close()
+                translated = _translate_request_error(exc)
+                if isinstance(translated, AuthRequiredError):
+                    raise translated from exc
                 raise SpawnFailedError(f"ACP initialize failed: {exc}") from exc
             self._exit_task = asyncio.create_task(
                 self._watch_exit(self._proc), name=f"acp-exit-{self._label}"
@@ -276,10 +295,13 @@ class AcpAgentProcess:
         self, *, cwd: str | None, on_event: EventCallback, permission_cb: Any = None
     ) -> str:
         await self.ensure_started()
-        ns = await self._conn.new_session(
-            cwd=cwd or self.agent.cwd or ".",
-            mcp_servers=_mcp_servers(self.agent),
-        )
+        try:
+            ns = await self._conn.new_session(
+                cwd=cwd or self.agent.cwd or ".",
+                mcp_servers=_mcp_servers(self.agent),
+            )
+        except acp.RequestError as exc:
+            raise _translate_request_error(exc) from exc
         sid = ns.session_id
         self.sessions[sid] = _SessionState(on_event, permission_cb)
         await self._apply_selection(sid, ns)
@@ -310,6 +332,9 @@ class AcpAgentProcess:
                 session_id=native_session_id,
                 mcp_servers=_mcp_servers(self.agent),
             )
+        except acp.RequestError as exc:
+            self.sessions.pop(native_session_id, None)
+            raise _translate_request_error(exc) from exc
         finally:
             st.loading = False
         return native_session_id
@@ -398,9 +423,14 @@ class AcpAgentProcess:
         except Exception as exc:  # noqa: BLE001 — surface transport/agent errors as a frame
             if not st.notified_crash:
                 st.notified_crash = True
-                await st.on_event(
-                    {"type": "session.error", "code": "agent_crashed", "message": str(exc)}
+                # An auth rejection mid-turn is distinct from a crash so the
+                # notify service can route it as ``auth_required`` (#24).
+                code = (
+                    "auth_required"
+                    if isinstance(exc, acp.RequestError) and exc.code == _ACP_AUTH_REQUIRED_CODE
+                    else "agent_crashed"
                 )
+                await st.on_event({"type": "session.error", "code": code, "message": str(exc)})
         finally:
             st.turn_active = False
 

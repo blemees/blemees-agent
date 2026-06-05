@@ -953,11 +953,18 @@ class Daemon:
     def __init__(self, config: Config, logger: StructuredLogger) -> None:
         self._config = config
         self._log = logger
+        # Durable per-session event log (#22): always-on under
+        # ``<state_dir>/sessions`` so the event stream survives a daemon
+        # restart (mirrors the registry). An explicit ``event_log_dir`` still
+        # overrides; with neither set the log is ring-only (in-memory).
+        self._log_dir = config.event_log_dir or (
+            str(Path(config.state_dir) / "sessions") if config.state_dir else None
+        )
         self._sessions = SessionTable(
             idle_timeout_s=config.idle_timeout_s,
             max_concurrent=config.max_concurrent_sessions,
             ring_buffer_size=config.ring_buffer_size,
-            event_log_dir=config.event_log_dir,
+            event_log_dir=self._log_dir,
         )
         self._server: asyncio.AbstractServer | None = None
         self._connections: set[Connection] = set()
@@ -1046,7 +1053,7 @@ class Daemon:
             },
             "config": {
                 "ring_buffer_size": self._config.ring_buffer_size,
-                "event_log_enabled": bool(self._config.event_log_dir),
+                "event_log_enabled": bool(self._log_dir),
                 "idle_timeout_s": self._config.idle_timeout_s,
                 "shutdown_grace_s": self._config.shutdown_grace_s,
                 "max_concurrent_sessions": self._config.max_concurrent_sessions,

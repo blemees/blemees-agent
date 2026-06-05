@@ -122,6 +122,54 @@ async def test_registry_survives_restart(state_dir):
                 await c.close()
 
 
+async def test_event_log_replays_across_restart(state_dir):
+    """#22: the per-session event log under <state_dir>/sessions survives a
+    restart, so a reattaching client replays prior turns from disk."""
+    sock1 = short_socket_path("blemeesd-log1")
+    sock2 = short_socket_path("blemeesd-log2")
+    with socket_cleanup(sock1), socket_cleanup(sock2):
+        async with _daemon(state_dir, sock1):
+            c = await _connect(sock1)
+            try:
+                await c.send(
+                    {"type": "session.open", "id": "o", "session_id": "s-log", "options": {}}
+                )
+                await c.wait_for(lambda e: e.get("type") == "session.opened")
+                await c.send(
+                    {"type": "session.prompt", "session_id": "s-log", "prompt": "say pong"}
+                )
+                result = await c.wait_for(lambda e: e.get("type") == "session.result", timeout=30.0)
+                last_seq = result["seq"]
+            finally:
+                await c.close()
+        # The event log was written under the state dir (no explicit event_log_dir).
+        assert (state_dir / "sessions" / "s-log.jsonl").is_file()
+
+        async with _daemon(state_dir, sock2):
+            c = await _connect(sock2)
+            try:
+                await c.send(
+                    {
+                        "type": "session.open",
+                        "id": "o",
+                        "session_id": "s-log",
+                        "resume": True,
+                        "last_seen_seq": 0,
+                        "options": {},
+                    }
+                )
+                opened = await c.wait_for(lambda e: e.get("type") == "session.opened")
+                assert opened["last_seq"] >= last_seq  # seeded from the durable log
+                # The prior run's turn-end result is replayed from disk.
+                replayed = await c.wait_for(
+                    lambda e: e.get("type") == "session.result" and e.get("seq") == last_seq,
+                    timeout=10.0,
+                )
+                assert replayed["stop_reason"] == "end_turn"
+            finally:
+                await c.close()
+
+
 async def test_close_delete_removes_from_registry(state_dir):
     sock = short_socket_path("blemeesd-regdel")
     with socket_cleanup(sock):

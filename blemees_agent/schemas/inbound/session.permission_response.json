@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blemees/schemas/inbound/session.permission_response.json",
+  "title": "session.permission_response",
+  "description": "The owner's decision for a relayed permission request (#20). Answers the session.request_permission carrying the same request_id.",
+  "type": "object",
+  "properties": {
+    "type": { "const": "session.permission_response" },
+    "session_id": { "$ref": "https://blemees/schemas/_common.json#/$defs/SessionId" },
+    "request_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The request_id from the session.request_permission being answered."
+    },
+    "outcome": {
+      "type": "string",
+      "enum": ["selected", "cancelled"],
+      "description": "`selected` chooses an option (option_id required); `cancelled` declines."
+    },
+    "option_id": {
+      "type": "string",
+      "description": "The chosen PermissionOption id. Required when outcome is `selected`."
+    }
+  },
+  "required": ["type", "session_id", "request_id", "outcome"],
+  "additionalProperties": false
+}

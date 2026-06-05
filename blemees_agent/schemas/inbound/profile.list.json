@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blemees/schemas/inbound/profile.list.json",
+  "title": "profile.list",
+  "description": "List profiles and their agents (running state + session counts + source). Replied with `profiles`.",
+  "type": "object",
+  "properties": {
+    "type": { "const": "profile.list" },
+    "id": { "$ref": "https://blemees/schemas/_common.json#/$defs/RequestId" }
+  },
+  "required": ["type"],
+  "additionalProperties": false
+}

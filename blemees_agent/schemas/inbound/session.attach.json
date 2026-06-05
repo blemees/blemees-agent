@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blemees/schemas/inbound/session.attach.json",
+  "title": "session.attach",
+  "description": "Attach to an existing session as its owner (drives turns) or a viewer (read-only). Owner attach takes over from any current owner, who is notified with session.taken (#19).",
+  "type": "object",
+  "properties": {
+    "type": { "const": "session.attach" },
+    "id": { "$ref": "https://blemees/schemas/_common.json#/$defs/RequestId" },
+    "session_id": { "$ref": "https://blemees/schemas/_common.json#/$defs/SessionId" },
+    "as": {
+      "type": "string",
+      "enum": ["owner", "viewer"],
+      "default": "viewer",
+      "description": "Attach role. Defaults to viewer."
+    },
+    "last_seen_seq": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Replay buffered frames with a greater seq before live streaming."
+    }
+  },
+  "required": ["type", "session_id"],
+  "additionalProperties": false
+}

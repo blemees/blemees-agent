@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blemees/schemas/outbound/session.closed.json",
+  "title": "session.closed",
+  "description": "Reply confirming a session.close (the requesting connection's acknowledgement).",
+  "type": "object",
+  "properties": {
+    "type": { "const": "session.closed" },
+    "id": { "$ref": "https://blemees/schemas/_common.json#/$defs/RequestId" },
+    "session_id": { "$ref": "https://blemees/schemas/_common.json#/$defs/SessionId" }
+  },
+  "required": ["type", "session_id"],
+  "additionalProperties": true
+}

@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blemees/schemas/inbound/session.list.json",
+  "title": "session.list",
+  "description": "List known sessions (registry-backed plus live overlay). Replied with `sessions`.",
+  "type": "object",
+  "properties": {
+    "type": { "const": "session.list" },
+    "id": { "$ref": "https://blemees/schemas/_common.json#/$defs/RequestId" },
+    "cwd": {
+      "type": "string",
+      "minLength": 1,
+      "description": "If set, only sessions rooted at this working directory."
+    }
+  },
+  "required": ["type"],
+  "additionalProperties": false
+}

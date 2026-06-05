@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blemees/schemas/outbound/error.json",
+  "title": "error",
+  "description": "Daemon error frame. `code` is machine-readable; `message` is for humans. Carries `id` when it answers a request, `session_id` when session-scoped. Some codes are connection-fatal (spec §9.8).",
+  "type": "object",
+  "properties": {
+    "type": { "const": "error" },
+    "code": { "$ref": "https://blemees/schemas/_common.json#/$defs/ErrorCode" },
+    "message": { "type": "string" },
+    "id": { "$ref": "https://blemees/schemas/_common.json#/$defs/RequestId" },
+    "session_id": { "$ref": "https://blemees/schemas/_common.json#/$defs/SessionId" }
+  },
+  "required": ["type", "code", "message"],
+  "additionalProperties": true
+}

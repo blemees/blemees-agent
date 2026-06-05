@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blemees/schemas/inbound/session.close.json",
+  "title": "session.close",
+  "description": "Close a session. With `delete:true` the daemon also removes its registry record and durable log.",
+  "type": "object",
+  "properties": {
+    "type": { "const": "session.close" },
+    "id": { "$ref": "https://blemees/schemas/_common.json#/$defs/RequestId" },
+    "session_id": { "$ref": "https://blemees/schemas/_common.json#/$defs/SessionId" },
+    "delete": {
+      "type": "boolean",
+      "default": false,
+      "description": "Also delete the persisted session record/log, not just stop the process."
+    }
+  },
+  "required": ["type", "session_id"],
+  "additionalProperties": false
+}

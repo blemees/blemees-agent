@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blemees/schemas/inbound/session.cancel.json",
+  "title": "session.cancel",
+  "description": "Interrupt the in-flight turn on a session. The daemon finalises the turn as cancelled.",
+  "type": "object",
+  "properties": {
+    "type": { "const": "session.cancel" },
+    "session_id": { "$ref": "https://blemees/schemas/_common.json#/$defs/SessionId" }
+  },
+  "required": ["type", "session_id"],
+  "additionalProperties": false
+}

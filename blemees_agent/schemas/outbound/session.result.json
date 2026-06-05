@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blemees/schemas/outbound/session.result.json",
+  "title": "session.result",
+  "description": "Turn-ending frame. `stop_reason` is the ACP stop reason (end_turn, cancelled, …). `usage` is the optional, opportunistic per-turn token usage when the agent reports it.",
+  "type": "object",
+  "properties": {
+    "type": { "const": "session.result" },
+    "session_id": { "$ref": "https://blemees/schemas/_common.json#/$defs/SessionId" },
+    "seq": { "$ref": "https://blemees/schemas/_common.json#/$defs/Seq" },
+    "stop_reason": { "type": "string" },
+    "usage": {
+      "type": "object",
+      "description": "Verbatim ACP usage payload, when reported.",
+      "additionalProperties": true
+    }
+  },
+  "required": ["type", "stop_reason"],
+  "additionalProperties": true
+}

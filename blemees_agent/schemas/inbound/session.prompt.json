@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blemees/schemas/inbound/session.prompt.json",
+  "title": "session.prompt",
+  "description": "Drive a user turn on a session the connection owns. `prompt` is normalised to a {role:user, content} envelope for the agent.",
+  "type": "object",
+  "properties": {
+    "type": { "const": "session.prompt" },
+    "session_id": { "$ref": "https://blemees/schemas/_common.json#/$defs/SessionId" },
+    "prompt": { "$ref": "https://blemees/schemas/_common.json#/$defs/MessageContent" }
+  },
+  "required": ["type", "session_id", "prompt"],
+  "additionalProperties": false
+}

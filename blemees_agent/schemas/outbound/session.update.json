@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blemees/schemas/outbound/session.update.json",
+  "title": "session.update",
+  "description": "A streamed agent update. `update` is the verbatim ACP SessionNotification.update (agent_message_chunk, tool_call, plan, etc.), so its shape is owned by the ACP schema and intentionally not constrained here. The daemon adds `session_id` and a monotonic `seq`.",
+  "type": "object",
+  "properties": {
+    "type": { "const": "session.update" },
+    "session_id": { "$ref": "https://blemees/schemas/_common.json#/$defs/SessionId" },
+    "seq": { "$ref": "https://blemees/schemas/_common.json#/$defs/Seq" },
+    "update": {
+      "type": "object",
+      "description": "Verbatim ACP session/update payload; see the agent-client-protocol schema.",
+      "additionalProperties": true
+    }
+  },
+  "required": ["type", "update"],
+  "additionalProperties": true
+}

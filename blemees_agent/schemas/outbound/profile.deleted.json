@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blemees/schemas/outbound/profile.deleted.json",
+  "title": "profile.deleted",
+  "description": "Reply confirming a profile.delete (#25).",
+  "type": "object",
+  "properties": {
+    "type": { "const": "profile.deleted" },
+    "id": { "$ref": "https://blemees/schemas/_common.json#/$defs/RequestId" },
+    "name": { "$ref": "https://blemees/schemas/_common.json#/$defs/ProfileName" }
+  },
+  "required": ["type", "name"],
+  "additionalProperties": true
+}

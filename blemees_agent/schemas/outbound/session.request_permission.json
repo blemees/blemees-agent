@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blemees/schemas/outbound/session.request_permission.json",
+  "title": "session.request_permission",
+  "description": "A relayed tool-permission request (#20). The owner answers with session.permission_response carrying the same `request_id`. `tool_call` is the ACP ToolCallUpdate (shape owned by ACP).",
+  "type": "object",
+  "properties": {
+    "type": { "const": "session.request_permission" },
+    "session_id": { "$ref": "https://blemees/schemas/_common.json#/$defs/SessionId" },
+    "seq": { "$ref": "https://blemees/schemas/_common.json#/$defs/Seq" },
+    "request_id": { "type": "string", "minLength": 1 },
+    "options": {
+      "type": "array",
+      "items": { "$ref": "https://blemees/schemas/_common.json#/$defs/PermissionOption" }
+    },
+    "tool_call": { "type": "object", "additionalProperties": true }
+  },
+  "required": ["type", "request_id", "options"],
+  "additionalProperties": true
+}

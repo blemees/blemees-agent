@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blemees/schemas/outbound/pong.json",
+  "title": "pong",
+  "description": "Reply to ping, echoing `id` and any `data`.",
+  "type": "object",
+  "properties": {
+    "type": { "const": "pong" },
+    "id": { "$ref": "https://blemees/schemas/_common.json#/$defs/RequestId" },
+    "data": { "description": "Echo of the ping's `data`, if any." }
+  },
+  "required": ["type"],
+  "additionalProperties": true
+}

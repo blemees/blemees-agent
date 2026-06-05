@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blemees/schemas/outbound/sessions.json",
+  "title": "sessions",
+  "description": "Reply to session.list: the union of registry-backed (cold) and live sessions. Each row merges persisted metadata with a live overlay; treat every optional field as advisory.",
+  "type": "object",
+  "properties": {
+    "type": { "const": "sessions" },
+    "id": { "$ref": "https://blemees/schemas/_common.json#/$defs/RequestId" },
+    "sessions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "session_id": { "$ref": "https://blemees/schemas/_common.json#/$defs/SessionId" },
+          "profile": { "type": ["string", "null"] },
+          "agent": { "type": ["string", "null"] },
+          "model": { "type": ["string", "null"] },
+          "cwd": { "type": ["string", "null"] },
+          "turns": { "type": "integer", "minimum": 0 },
+          "started_at_ms": { "type": ["integer", "null"] },
+          "last_active_at_ms": { "type": ["integer", "null"] },
+          "attached": { "type": "boolean" },
+          "running": { "type": "boolean" },
+          "view_only": { "type": "boolean" },
+          "needs_attention": { "type": "boolean" },
+          "attention_reason": {
+            "oneOf": [
+              { "$ref": "https://blemees/schemas/_common.json#/$defs/AttentionReason" },
+              { "type": "null" }
+            ]
+          }
+        },
+        "required": ["session_id"],
+        "additionalProperties": true
+      }
+    }
+  },
+  "required": ["type", "sessions"],
+  "additionalProperties": true
+}

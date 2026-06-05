@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blemees/schemas/outbound/session.stderr.json",
+  "title": "session.stderr",
+  "description": "A line the agent process wrote to stderr, forwarded for diagnostics. Carries `seq` (it flows through the session event stream).",
+  "type": "object",
+  "properties": {
+    "type": { "const": "session.stderr" },
+    "session_id": { "$ref": "https://blemees/schemas/_common.json#/$defs/SessionId" },
+    "seq": { "$ref": "https://blemees/schemas/_common.json#/$defs/Seq" },
+    "line": { "type": "string", "description": "One line of agent stderr." }
+  },
+  "required": ["type", "line"],
+  "additionalProperties": true
+}

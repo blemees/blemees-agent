@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blemees/schemas/outbound/profile.stopped.json",
+  "title": "profile.stopped",
+  "description": "Reply to profile.stop. `agents_stopped` is how many agent processes were closed.",
+  "type": "object",
+  "properties": {
+    "type": { "const": "profile.stopped" },
+    "id": { "$ref": "https://blemees/schemas/_common.json#/$defs/RequestId" },
+    "name": { "$ref": "https://blemees/schemas/_common.json#/$defs/ProfileName" },
+    "agents_stopped": { "type": "integer", "minimum": 0 }
+  },
+  "required": ["type", "name"],
+  "additionalProperties": true
+}

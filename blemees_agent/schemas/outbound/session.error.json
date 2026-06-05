@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blemees/schemas/outbound/session.error.json",
+  "title": "session.error",
+  "description": "A session-stream error delivered through the event stream (carries `seq`), distinct from the connection-level `error` reply. `code` is typically agent_crashed or auth_required (#24).",
+  "type": "object",
+  "properties": {
+    "type": { "const": "session.error" },
+    "session_id": { "$ref": "https://blemees/schemas/_common.json#/$defs/SessionId" },
+    "seq": { "$ref": "https://blemees/schemas/_common.json#/$defs/Seq" },
+    "code": { "$ref": "https://blemees/schemas/_common.json#/$defs/ErrorCode" },
+    "message": { "type": "string" }
+  },
+  "required": ["type", "code", "message"],
+  "additionalProperties": true
+}

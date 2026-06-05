@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blemees/schemas/inbound/profile.create.json",
+  "title": "profile.create",
+  "description": "Create a new over-wire profile, persisted to the registry (#25). The name comes from top-level `name` or `profile.name`. Rejects an existing name (profile_exists) and validates each agent binary is on $PATH (agent_unavailable). Replied with profile.created.",
+  "type": "object",
+  "properties": {
+    "type": { "const": "profile.create" },
+    "id": { "$ref": "https://blemees/schemas/_common.json#/$defs/RequestId" },
+    "name": { "$ref": "https://blemees/schemas/_common.json#/$defs/ProfileName" },
+    "profile": { "$ref": "https://blemees/schemas/_common.json#/$defs/ProfileSpec" }
+  },
+  "required": ["type", "profile"],
+  "additionalProperties": false
+}

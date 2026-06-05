@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blemees/schemas/inbound/ping.json",
+  "title": "ping",
+  "description": "Liveness probe. The daemon replies with pong, echoing `id` and any `data`.",
+  "type": "object",
+  "properties": {
+    "type": { "const": "ping" },
+    "id": { "$ref": "https://blemees/schemas/_common.json#/$defs/RequestId" },
+    "data": { "description": "Opaque value echoed back on pong." }
+  },
+  "required": ["type"],
+  "additionalProperties": false
+}

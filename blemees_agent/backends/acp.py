@@ -1,54 +1,58 @@
-"""ACP client backend (blemees/3, #16).
+"""ACP client backend (blemees/3).
 
 The daemon plays the **client** role of the
-[Agent Client Protocol](https://agentclientprotocol.com): it spawns an
-ACP *agent* subprocess (e.g. ``claude-agent-acp``, ``codex-acp``,
-``gemini --experimental-acp``, ``cursor-agent acp``) over stdio via the
-official ``agent-client-protocol`` SDK and translates the agent's
-streamed ``session/update`` notifications into blemees ``session.*``
-frames.
+[Agent Client Protocol](https://agentclientprotocol.com): it spawns ACP
+*agent* subprocesses over stdio via the official ``agent-client-protocol``
+SDK and translates each agent's streamed ``session/update`` notifications
+into blemees ``session.*`` frames.
 
-This is the tracer-bullet slice (#16): one hard-spawned agent, one ACP
-session per backend instance, the empty-client-capability surface the
-#15 spike validated (no ``fs`` / ``terminal`` — the agent self-serves
-IO). Profiles (#17), multiplexing (#18), owner/viewer (#19) and the real
-permission policy (#20) layer on top of this.
+Two layers (#17 profiles + supervisor):
+
+* :class:`AcpAgentProcess` — one supervised agent subprocess per profile.
+  ACP multiplexes many sessions over one stdio connection (the protocol's
+  native model), so a single process hosts N sessions, demuxed by the
+  agent's ``sessionId``. Owns the subprocess, the ACP connection, the
+  ``initialize`` handshake, and per-session turn state.
+* :class:`AcpSessionHandle` — the per-(daemon-)session view that conforms to
+  :class:`~blemees_agent.backends.AgentBackend`, so the daemon's session /
+  dispatch machinery drives it unchanged. Delegates to its profile's
+  shared :class:`AcpAgentProcess`, scoped to one ACP ``sessionId``.
 
 Frames emitted via ``on_event`` (the backend never assigns ``seq`` — the
-owning :class:`~blemees_agent.session.Session` does):
-
-* ``session.update``  — wraps a verbatim ACP ``SessionNotification.update``.
-* ``session.result``  — turn end, carries ``stop_reason`` and optional ``usage``.
-* ``session.error``   — backend/transport failure mid-turn.
-* ``session.stderr``  — a line from the agent's stderr.
-
-The backend conforms to :class:`~blemees_agent.backends.AgentBackend` so
-the existing session/dispatch machinery drives it unchanged.
+owning :class:`~blemees_agent.session.Session` does): ``session.update``
+(verbatim ACP), ``session.result`` (``stop_reason`` + optional ``usage``),
+``session.error``, ``session.stderr``.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 import acp
 from acp import PROTOCOL_VERSION as ACP_PROTOCOL_VERSION, connect_to_agent, text_block
 from acp.connection import InMemoryMessageQueue
-from acp.schema import AllowedOutcome, ClientCapabilities, RequestPermissionResponse
+from acp.schema import (
+    AllowedOutcome,
+    ClientCapabilities,
+    McpServerStdio,
+    RequestPermissionResponse,
+)
 
 from ..errors import ProtocolError, SessionBusyError, SpawnFailedError
-from . import EventCallback, build_spawn_env
+from . import EventCallback
+
+if TYPE_CHECKING:
+    from ..supervisor import Agent
 
 
 def _to_content_blocks(message: dict[str, Any]) -> list[Any]:
-    """Translate a blemees ``agent.user``-style message into ACP content blocks.
+    """Translate a blemees ``{"role":"user","content":...}`` message into ACP blocks.
 
-    #16 supports text only; image/audio/resource blocks (gated by the
-    agent's ``promptCapabilities``) are a later addition. Non-text blocks
-    raise :class:`ProtocolError` so the daemon can surface
-    ``invalid_message`` rather than silently dropping content.
+    Text only for now; non-text blocks raise :class:`ProtocolError` so the
+    daemon surfaces ``invalid_message`` rather than silently dropping content.
     """
     content = message.get("content")
     if isinstance(content, str):
@@ -65,23 +69,56 @@ def _to_content_blocks(message: dict[str, Any]) -> list[Any]:
     raise ProtocolError("message.content must be a string or array")
 
 
-class _DaemonAcpClient(acp.Client):
-    """The ACP client surface the daemon presents to an agent.
+def _mcp_servers(agent: Agent) -> list[Any]:
+    """Build ACP McpServer entries from a profile's mcp_servers config.
 
-    Advertises **no** filesystem/terminal capabilities (the agent does its
-    own IO — validated by the #15 spike). #16 auto-approves every
-    permission request; the per-profile relay/stall policy is #20.
+    #17 supports stdio servers (`{name, command, args, env}`); HTTP/SSE
+    transports are a later addition.
+    """
+    out: list[Any] = []
+    for spec in agent.mcp_servers:
+        if not isinstance(spec, dict) or "command" not in spec:
+            continue
+        env = spec.get("env") or {}
+        env_entries = [{"name": k, "value": str(v)} for k, v in env.items()]
+        out.append(
+            McpServerStdio(
+                name=spec.get("name", spec["command"]),
+                command=spec["command"],
+                args=list(spec.get("args", [])),
+                env=env_entries,
+            )
+        )
+    return out
+
+
+class _SessionState:
+    """Per-ACP-session bookkeeping inside a shared process."""
+
+    def __init__(self, on_event: EventCallback) -> None:
+        self.on_event = on_event
+        self.turn_active = False
+        self.turn_task: asyncio.Task | None = None
+
+
+class _ProcessClient(acp.Client):
+    """ACP client surface for a shared agent process; routes by sessionId.
+
+    Advertises no fs/terminal capabilities (the agent self-serves IO, per the
+    #15 spike). #17 auto-approves permission requests; the per-profile
+    relay/stall policy is #20.
     """
 
-    def __init__(self, backend: AcpBackend) -> None:
-        self._backend = backend
+    def __init__(self, process: AcpAgentProcess) -> None:
+        self._p = process
 
     async def session_update(self, session_id: str, update: Any, **_kw: Any) -> None:
-        await self._backend._emit(
+        st = self._p.sessions.get(session_id)
+        if st is None:
+            return
+        await st.on_event(
             {
                 "type": "session.update",
-                # by_alias=True keeps the verbatim ACP wire shape (camelCase
-                # discriminators like `sessionUpdate`, `toolCallId`).
                 "update": update.model_dump(mode="json", by_alias=True, exclude_none=True),
             }
         )
@@ -95,51 +132,24 @@ class _DaemonAcpClient(acp.Client):
         )
 
 
-class AcpBackend:
-    """One ACP agent subprocess, driven over stdio via the ACP SDK."""
-
-    backend = "acp"
+class AcpAgentProcess:
+    """One supervised ACP agent subprocess for a profile; multiplexes sessions."""
 
     def __init__(
-        self,
-        *,
-        session_id: str,
-        command: str,
-        args: list[str],
-        cwd: str | None,
-        on_event: EventCallback,
-        logger: Any,
-        env: dict[str, str] | None = None,
-        model: str | None = None,
-        alias: str | None = None,
+        self, agent: Agent, *, key: tuple[str, str], logger: Any, env: dict[str, str]
     ) -> None:
-        self._session_id = session_id
-        self._command = command
-        self._args = list(args)
-        self._cwd = cwd
-        self._on_event = on_event
+        self.agent = agent
+        self.key_tuple = key
+        self._label = f"{key[0]}/{key[1]}"
         self._log = logger
-        self._env = env if env is not None else build_spawn_env(session_id, cwd, alias)
-        self.model = model
-
+        self._env = env
         self._proc: asyncio.subprocess.Process | None = None
-        self._conn: Any = None  # acp.ClientSideConnection once spawned
-        # Our own handle on the SDK's RPC task queue so we can drain pending
-        # session/update notifications before emitting session.result — the
-        # SDK resolves prompt() responses inline but processes notifications
-        # off this queue, so the response can otherwise race ahead of a
-        # turn's final updates.
+        self._conn: Any = None
         self._rpc_queue: Any = None
         self._stderr_task: asyncio.Task | None = None
-        self._turn_task: asyncio.Task | None = None
-
-        # Surfaced to the daemon: the agent's own session id and whether it
-        # supports session/load (drives the durable-resume path, #23).
-        self.native_session_id: str | None = None
+        self._start_lock = asyncio.Lock()
+        self.sessions: dict[str, _SessionState] = {}
         self.load_session: bool = False
-        self.turn_active: bool = False
-
-    # -- AgentBackend protocol -----------------------------------------
 
     @property
     def running(self) -> bool:
@@ -149,119 +159,180 @@ class AcpBackend:
     def pid(self) -> int | None:
         return self._proc.pid if self._proc is not None else None
 
-    async def spawn(self) -> None:
-        try:
-            self._proc = await asyncio.create_subprocess_exec(
-                self._command,
-                *self._args,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=self._cwd or None,
-                env=self._env,
+    def session_count(self) -> int:
+        return len(self.sessions)
+
+    def is_turn_active(self, acp_session_id: str) -> bool:
+        st = self.sessions.get(acp_session_id)
+        return bool(st and st.turn_active)
+
+    async def ensure_started(self) -> None:
+        async with self._start_lock:
+            if self.running:
+                return
+            try:
+                self._proc = await asyncio.create_subprocess_exec(
+                    self.agent.command,
+                    *self.agent.args,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=self.agent.cwd or None,
+                    env=self._env,
+                )
+            except (OSError, ValueError) as exc:
+                raise SpawnFailedError(
+                    f"failed to spawn ACP agent {self.agent.command!r}: {exc}"
+                ) from exc
+
+            assert self._proc.stdin is not None and self._proc.stdout is not None
+            self._rpc_queue = InMemoryMessageQueue()
+            self._conn = connect_to_agent(
+                _ProcessClient(self), self._proc.stdin, self._proc.stdout, queue=self._rpc_queue
             )
-        except (OSError, ValueError) as exc:
-            raise SpawnFailedError(f"failed to spawn ACP agent {self._command!r}: {exc}") from exc
-
-        # ClientSideConnection wants (input_stream=writer→agent stdin,
-        # output_stream=reader←agent stdout). asyncio gives us exactly those.
-        assert self._proc.stdin is not None and self._proc.stdout is not None
-        # input_stream = agent stdin (we write), output_stream = agent stdout (we read).
-        self._rpc_queue = InMemoryMessageQueue()
-        self._conn = connect_to_agent(
-            _DaemonAcpClient(self),
-            self._proc.stdin,
-            self._proc.stdout,
-            queue=self._rpc_queue,
-        )
-        self._stderr_task = asyncio.create_task(
-            self._pump_stderr(), name=f"acp-stderr-{self._session_id}"
-        )
-
-        try:
-            init = await self._conn.initialize(
-                protocol_version=ACP_PROTOCOL_VERSION,
-                client_capabilities=ClientCapabilities(),
+            self._stderr_task = asyncio.create_task(
+                self._pump_stderr(), name=f"acp-stderr-{self._label}"
             )
-            caps = getattr(init, "agent_capabilities", None)
-            self.load_session = bool(getattr(caps, "load_session", False))
-            ns = await self._conn.new_session(cwd=self._cwd or ".", mcp_servers=[])
-            self.native_session_id = ns.session_id
-        except Exception as exc:  # noqa: BLE001 — any init failure is a spawn failure
-            await self.close()
-            raise SpawnFailedError(f"ACP initialize/new_session failed: {exc}") from exc
+            try:
+                init = await self._conn.initialize(
+                    protocol_version=ACP_PROTOCOL_VERSION,
+                    client_capabilities=ClientCapabilities(),
+                )
+                caps = getattr(init, "agent_capabilities", None)
+                self.load_session = bool(getattr(caps, "load_session", False))
+            except Exception as exc:  # noqa: BLE001 — init failure is a spawn failure
+                await self.close()
+                raise SpawnFailedError(f"ACP initialize failed: {exc}") from exc
+            self._log.info(
+                "acp.process_started",
+                agent=self._label,
+                command=self.agent.command,
+                load_session=self.load_session,
+            )
 
-        self._log.info(
-            "acp.spawned",
-            session_id=self._session_id,
-            command=self._command,
-            native_session_id=self.native_session_id,
-            load_session=self.load_session,
+    async def new_session(self, *, cwd: str | None, on_event: EventCallback) -> str:
+        await self.ensure_started()
+        ns = await self._conn.new_session(
+            cwd=cwd or self.agent.cwd or ".",
+            mcp_servers=_mcp_servers(self.agent),
         )
+        sid = ns.session_id
+        self.sessions[sid] = _SessionState(on_event)
+        await self._apply_selection(sid, ns)
+        return sid
 
-    async def send_user_turn(self, message: dict[str, Any]) -> None:
-        if self.turn_active:
-            raise SessionBusyError("a turn is already in flight")
-        if self._conn is None or self.native_session_id is None:
+    async def _apply_selection(self, sid: str, ns: Any) -> None:
+        """Apply the profile's model/mode after session/new (finding B, #15).
+
+        Heterogeneous across agents: model/mode live in SessionModelState /
+        SessionModeState (set_session_model/mode) or config_options
+        (set_config_option). Best-effort — warn, never fail, on a miss.
+        """
+        if self.agent.model:
+            await self._select(sid, ns, want=self.agent.model, category="model")
+        if self.agent.mode:
+            await self._select(sid, ns, want=self.agent.mode, category="mode")
+
+    async def _select(self, sid: str, ns: Any, *, want: str, category: str) -> None:
+        try:
+            if category == "model":
+                models = getattr(ns, "models", None)
+                avail = [m.model_id for m in getattr(models, "available_models", []) or []]
+                if want in avail:
+                    await self._conn.set_session_model(model_id=want, session_id=sid)
+                    return
+            elif category == "mode":
+                modes = getattr(ns, "modes", None)
+                avail = [m.id for m in getattr(modes, "available_modes", []) or []]
+                if want in avail:
+                    await self._conn.set_session_mode(mode_id=want, session_id=sid)
+                    return
+            # Fall back to a config_options select in the right category.
+            for opt in getattr(ns, "config_options", None) or []:
+                if getattr(opt, "category", None) == category:
+                    values = [o.value for o in getattr(opt, "options", []) or []]
+                    if want in values:
+                        await self._conn.set_config_option(
+                            config_id=opt.id, session_id=sid, value=want
+                        )
+                        return
+            self._log.warning(
+                "acp.selection_unavailable",
+                agent=self._label,
+                category=category,
+                requested=want,
+            )
+        except Exception as exc:  # noqa: BLE001 — selection is best-effort
+            self._log.warning(
+                "acp.selection_failed", agent=self._label, category=category, error=str(exc)
+            )
+
+    async def prompt(self, acp_session_id: str, blocks: list[Any]) -> None:
+        st = self.sessions.get(acp_session_id)
+        if st is None:
             raise SpawnFailedError("ACP session not initialised")
-        blocks = _to_content_blocks(message)  # may raise ProtocolError
-        self.turn_active = True
-        self._turn_task = asyncio.create_task(
-            self._run_turn(blocks), name=f"acp-turn-{self._session_id}"
+        if st.turn_active:
+            raise SessionBusyError("a turn is already in flight")
+        st.turn_active = True
+        st.turn_task = asyncio.create_task(
+            self._run_turn(acp_session_id, blocks), name=f"acp-turn-{acp_session_id}"
         )
 
-    async def _run_turn(self, blocks: list[Any]) -> None:
-        assert self._conn is not None and self.native_session_id is not None
+    async def _run_turn(self, acp_session_id: str, blocks: list[Any]) -> None:
+        st = self.sessions.get(acp_session_id)
+        if st is None:
+            return
         try:
             resp = await self._conn.prompt(
-                prompt=blocks,
-                session_id=self.native_session_id,
-                message_id=str(uuid4()),
+                prompt=blocks, session_id=acp_session_id, message_id=str(uuid4())
             )
-            # Ensure every session/update notification for this turn has been
-            # emitted before we close the turn with session.result.
             await self._drain_notifications()
             frame: dict[str, Any] = {"type": "session.result", "stop_reason": resp.stop_reason}
             usage = getattr(resp, "usage", None)
             if usage is not None:
-                # Finding A (#15 spike): ACP carries usage; surface it when present.
                 frame["usage"] = usage.model_dump(mode="json", by_alias=True, exclude_none=True)
-            await self._emit(frame)
+            await st.on_event(frame)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 — surface transport/agent errors as a frame
-            await self._emit(
+            await st.on_event(
                 {"type": "session.error", "code": "agent_crashed", "message": str(exc)}
             )
         finally:
-            self.turn_active = False
+            st.turn_active = False
 
-    async def interrupt(self) -> bool:
-        if not self.turn_active or self._conn is None or self.native_session_id is None:
+    async def cancel(self, acp_session_id: str) -> bool:
+        st = self.sessions.get(acp_session_id)
+        if st is None or not st.turn_active or self._conn is None:
             return False
-        # ACP session/cancel is a notification; the in-flight prompt() returns
-        # with stop_reason "cancelled", which _run_turn turns into session.result.
-        await self._conn.cancel(session_id=self.native_session_id)
+        await self._conn.cancel(session_id=acp_session_id)
         return True
 
-    async def close(self) -> None:
-        if self._turn_task is not None and not self._turn_task.done():
-            self._turn_task.cancel()
+    async def end_session(self, acp_session_id: str) -> None:
+        st = self.sessions.pop(acp_session_id, None)
+        if st is None:
+            return
+        if st.turn_task is not None and not st.turn_task.done():
+            st.turn_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await self._turn_task
+                await st.turn_task
+
+    async def close(self) -> None:
+        for st in list(self.sessions.values()):
+            if st.turn_task is not None and not st.turn_task.done():
+                st.turn_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await st.turn_task
+        self.sessions.clear()
         if self._conn is not None:
-            try:
+            with contextlib.suppress(Exception):
                 await self._conn.close()
-            except Exception:  # noqa: BLE001 — best-effort teardown
-                pass
             self._conn = None
         if self._stderr_task is not None:
             self._stderr_task.cancel()
             self._stderr_task = None
         proc = self._proc
         if proc is not None and proc.returncode is None:
-            # ProcessLookupError: the agent may have exited between the
-            # returncode check and the signal — safe to ignore during teardown.
             with contextlib.suppress(ProcessLookupError):
                 proc.terminate()
             try:
@@ -272,25 +343,7 @@ class AcpBackend:
                 with contextlib.suppress(asyncio.CancelledError):
                     await proc.wait()
 
-    async def wait_for_exit(self, timeout: float) -> bool:
-        if self._proc is None:
-            return True
-        try:
-            await asyncio.wait_for(self._proc.wait(), timeout=timeout)
-            return True
-        except TimeoutError:
-            return False
-
-    # -- internals ------------------------------------------------------
-
-    async def _emit(self, frame: dict[str, Any]) -> None:
-        await self._on_event(frame)
-
     async def _drain_notifications(self) -> None:
-        """Block until queued session/update handlers have run.
-
-        Guarded by a timeout so a stuck worker can never wedge a turn.
-        """
         if self._rpc_queue is None:
             return
         with contextlib.suppress(TimeoutError):
@@ -305,10 +358,84 @@ class AcpBackend:
                 line = await proc.stderr.readline()
                 if not line:
                     return
-                await self._emit(
-                    {"type": "session.stderr", "line": line.decode("utf-8", "replace").rstrip("\n")}
-                )
+                text = line.decode("utf-8", "replace").rstrip("\n")
+                # stderr is process-wide (no sessionId); fan out to all sessions.
+                for st in list(self.sessions.values()):
+                    await st.on_event({"type": "session.stderr", "line": text})
         except asyncio.CancelledError:
             return
-        except Exception:  # noqa: BLE001 — never let stderr pumping crash the backend
+        except Exception:  # noqa: BLE001 — never let stderr pumping crash the process
             return
+
+
+class AcpSessionHandle:
+    """Per-session view onto a profile's shared :class:`AcpAgentProcess`.
+
+    Conforms to :class:`~blemees_agent.backends.AgentBackend` so the daemon's
+    existing session/dispatch code drives it without change.
+    """
+
+    backend = "acp"
+
+    def __init__(
+        self,
+        *,
+        process: AcpAgentProcess,
+        on_event: EventCallback,
+        cwd: str | None,
+        on_close: Any = None,
+    ) -> None:
+        self._process = process
+        self._on_event = on_event
+        self._cwd = cwd
+        self._on_close = on_close  # supervisor callback for idle-reap accounting
+        self.native_session_id: str | None = None
+        self.load_session: bool = False
+        self.model: str | None = process.agent.model
+
+    @property
+    def running(self) -> bool:
+        return self._process.running and self.native_session_id is not None
+
+    @property
+    def pid(self) -> int | None:
+        return self._process.pid
+
+    @property
+    def turn_active(self) -> bool:
+        return bool(self.native_session_id and self._process.is_turn_active(self.native_session_id))
+
+    async def spawn(self) -> None:
+        self.native_session_id = await self._process.new_session(
+            cwd=self._cwd, on_event=self._on_event
+        )
+        self.load_session = self._process.load_session
+
+    async def send_user_turn(self, message: dict[str, Any]) -> None:
+        if self.native_session_id is None:
+            raise SpawnFailedError("ACP session not initialised")
+        blocks = _to_content_blocks(message)  # may raise ProtocolError
+        await self._process.prompt(self.native_session_id, blocks)
+
+    async def interrupt(self) -> bool:
+        if self.native_session_id is None:
+            return False
+        return await self._process.cancel(self.native_session_id)
+
+    async def close(self) -> None:
+        if self.native_session_id is not None:
+            await self._process.end_session(self.native_session_id)
+        if self._on_close is not None:
+            await self._on_close(self._process)
+
+    async def wait_for_exit(self, timeout: float) -> bool:
+        """Wait until this session's in-flight turn finishes (not process exit).
+
+        The agent process is shared and long-lived, so "exit" for a session
+        means its turn completed. Used by the daemon's shutdown grace.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while self.turn_active and loop.time() < deadline:
+            await asyncio.sleep(0.05)
+        return not self.turn_active

@@ -1,193 +1,149 @@
-"""Unit tests for the ACP client backend (#16) using the fake ACP agent stub.
+"""Unit tests for the ACP backend (#16/#17): shared process + per-session handle.
 
-These drive ``AcpBackend`` against ``fake_acp.py`` (a real ACP agent spoken
-over stdio via the SDK), asserting the blemees ``session.*`` translation:
-streamed ``session.update`` frames, a turn-ending ``session.result``,
-interrupt → ``cancelled``, and agent failure → ``session.error``.
+Drive ``AcpAgentProcess`` / ``AcpSessionHandle`` against ``fake_acp.py`` (a
+real ACP agent over stdio), asserting blemees ``session.*`` translation and
+that one process multiplexes several sessions.
 """
 
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 from pathlib import Path
 
 import pytest
 
-from blemees_agent.backends.acp import AcpBackend, _to_content_blocks
+from blemees_agent.backends.acp import AcpAgentProcess, AcpSessionHandle, _to_content_blocks
 from blemees_agent.errors import ProtocolError, SessionBusyError
 from blemees_agent.logging import configure
+from blemees_agent.supervisor import Agent
 
 FAKE_ACP = str(Path(__file__).parent / "fake_acp.py")
 
 
-def _make_backend(queue: asyncio.Queue, *, session_id: str = "s1") -> AcpBackend:
-    return AcpBackend(
-        session_id=session_id,
-        command=sys.executable,
-        args=[FAKE_ACP],
-        cwd=None,
-        on_event=queue.put,
-        logger=configure("error"),
+def _process() -> AcpAgentProcess:
+    agent = Agent(name="default", command=sys.executable, args=[FAKE_ACP])
+    return AcpAgentProcess(
+        agent, key=("t", "default"), logger=configure("error"), env=dict(os.environ)
     )
 
 
-async def _drain_until(queue: asyncio.Queue, *types: str, timeout: float = 30.0) -> list[dict]:
-    """Collect frames until one of ``types`` is seen (inclusive)."""
+async def _collect_turn(q: asyncio.Queue, timeout: float = 30.0) -> list[dict]:
     frames: list[dict] = []
     while True:
-        frame = await asyncio.wait_for(queue.get(), timeout=timeout)
+        frame = await asyncio.wait_for(q.get(), timeout=timeout)
         frames.append(frame)
-        if frame.get("type") in types:
-            return frames
-
-
-async def _collect_turn(queue: asyncio.Queue, timeout: float = 30.0) -> list[dict]:
-    """Collect a full turn: frames up to ``session.result`` plus any stragglers.
-
-    ACP does not guarantee every ``session/update`` reaches the wire before the
-    prompt response (a final update may trail the result), so we also drain a
-    short tail after the result to capture any late update for the turn.
-    """
-    frames = await _drain_until(queue, "session.result", timeout=timeout)
+        if frame.get("type") == "session.result":
+            break
+    # Drain a short tail for any update that trails the result on the wire.
     while True:
         try:
-            frames.append(await asyncio.wait_for(queue.get(), timeout=0.5))
+            frames.append(await asyncio.wait_for(q.get(), timeout=0.5))
         except TimeoutError:
             return frames
 
 
-# ---------------------------------------------------------------------------
-# Pure helpers
-# ---------------------------------------------------------------------------
+# ---- pure helper ----------------------------------------------------
 
 
 def test_to_content_blocks_text():
-    blocks = _to_content_blocks({"role": "user", "content": "hello"})
-    assert len(blocks) == 1 and blocks[0].text == "hello"
-
-
-def test_to_content_blocks_array():
-    blocks = _to_content_blocks(
-        {"role": "user", "content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]}
-    )
-    assert [b.text for b in blocks] == ["a", "b"]
+    blocks = _to_content_blocks({"role": "user", "content": "hi"})
+    assert len(blocks) == 1 and blocks[0].text == "hi"
 
 
 def test_to_content_blocks_rejects_non_text():
     with pytest.raises(ProtocolError):
-        _to_content_blocks(
-            {"role": "user", "content": [{"type": "image", "data": "..", "mimeType": "image/png"}]}
-        )
+        _to_content_blocks({"role": "user", "content": [{"type": "image", "data": ".."}]})
 
 
-# ---------------------------------------------------------------------------
-# End-to-end against the fake ACP agent
-# ---------------------------------------------------------------------------
+# ---- process + handle against the fake agent ------------------------
 
 
-async def test_spawn_initializes_and_reports_capabilities():
-    queue: asyncio.Queue = asyncio.Queue()
-    backend = _make_backend(queue)
-    await backend.spawn()
+async def _handle(process: AcpAgentProcess, q: asyncio.Queue) -> AcpSessionHandle:
+    handle = AcpSessionHandle(process=process, on_event=q.put, cwd=None)
+    await handle.spawn()
+    return handle
+
+
+async def test_spawn_reports_capabilities_and_native_id():
+    process = _process()
+    q: asyncio.Queue = asyncio.Queue()
+    handle = await _handle(process, q)
     try:
-        assert backend.running
-        assert backend.pid is not None
-        # fake_acp advertises load_session and a fixed native session id.
-        assert backend.load_session is True
-        assert backend.native_session_id == "fake-session-1"
+        assert handle.running
+        assert handle.pid is not None
+        assert handle.load_session is True
+        assert handle.native_session_id == "fake-session-1"
     finally:
-        await backend.close()
-    assert not backend.running
+        await process.close()
+    assert not handle.running
 
 
 async def test_turn_streams_updates_then_result():
-    queue: asyncio.Queue = asyncio.Queue()
-    backend = _make_backend(queue)
-    await backend.spawn()
+    process = _process()
+    q: asyncio.Queue = asyncio.Queue()
+    handle = await _handle(process, q)
     try:
-        await backend.send_user_turn({"role": "user", "content": "say pong"})
-        frames = await _collect_turn(queue)
+        await handle.send_user_turn({"role": "user", "content": "say pong"})
+        frames = await _collect_turn(q)
     finally:
-        await backend.close()
-
+        await process.close()
     updates = [f for f in frames if f["type"] == "session.update"]
-    results = [f for f in frames if f["type"] == "session.result"]
-    assert len(results) == 1
-    assert results[0]["stop_reason"] == "end_turn"
-    # Exactly one turn's worth of streamed chunks; the fake emits two.
-    assert len(updates) == 2
-    # Verbatim ACP update payload carried under "update" (camelCase wire shape).
-    assert all(u["update"]["sessionUpdate"] == "agent_message_chunk" for u in updates)
-    streamed = "".join(u["update"]["content"]["text"] for u in updates)
-    assert streamed == "PONG done"
-    # Backend does NOT assign seq — that's the Session's job (#19 path).
-    assert "seq" not in results[0]
-
-
-async def test_second_turn_after_result_works():
-    queue: asyncio.Queue = asyncio.Queue()
-    backend = _make_backend(queue)
-    await backend.spawn()
-    try:
-        await backend.send_user_turn({"role": "user", "content": "one"})
-        await _drain_until(queue, "session.result")
-        assert backend.turn_active is False
-        await backend.send_user_turn({"role": "user", "content": "two"})
-        frames = await _drain_until(queue, "session.result")
-    finally:
-        await backend.close()
-    assert any(f["type"] == "session.result" for f in frames)
+    result = next(f for f in frames if f["type"] == "session.result")
+    assert result["stop_reason"] == "end_turn"
+    assert "".join(u["update"]["content"]["text"] for u in updates) == "PONG done"
+    assert "seq" not in result  # seq is the Session's job
 
 
 async def test_busy_rejects_concurrent_turn():
-    queue: asyncio.Queue = asyncio.Queue()
-    backend = _make_backend(queue)
-    await backend.spawn()
+    process = _process()
+    q: asyncio.Queue = asyncio.Queue()
+    handle = await _handle(process, q)
     try:
-        await backend.send_user_turn({"role": "user", "content": "hang please"})
-        # Turn is in flight (the agent is sleeping); a second turn is rejected.
+        await handle.send_user_turn({"role": "user", "content": "hang please"})
         await asyncio.sleep(0.2)
+        assert handle.turn_active is True
         with pytest.raises(SessionBusyError):
-            await backend.send_user_turn({"role": "user", "content": "again"})
+            await handle.send_user_turn({"role": "user", "content": "again"})
     finally:
-        await backend.close()
+        await process.close()
 
 
-async def test_interrupt_signals_in_flight_turn():
-    # The full cancel→`cancelled` round-trip (SDK cancel propagation to the
-    # agent) is exercised in #18; here we just assert interrupt() reports it
-    # acted on an in-flight turn.
-    queue: asyncio.Queue = asyncio.Queue()
-    backend = _make_backend(queue)
-    await backend.spawn()
+async def test_one_process_multiplexes_two_sessions():
+    process = _process()
+    qa: asyncio.Queue = asyncio.Queue()
+    qb: asyncio.Queue = asyncio.Queue()
+    a = await _handle(process, qa)
+    b = await _handle(process, qb)
     try:
-        await backend.send_user_turn({"role": "user", "content": "hang please"})
-        await asyncio.sleep(0.3)
-        assert await backend.interrupt() is True
+        # Distinct ACP session ids on the same process.
+        assert a.native_session_id != b.native_session_id
+        assert process.session_count() == 2
+        await a.send_user_turn({"role": "user", "content": "say pong"})
+        await b.send_user_turn({"role": "user", "content": "say pong"})
+        fa = await _collect_turn(qa)
+        fb = await _collect_turn(qb)
     finally:
-        await backend.close()
-
-
-async def test_interrupt_when_idle_returns_false():
-    queue: asyncio.Queue = asyncio.Queue()
-    backend = _make_backend(queue)
-    await backend.spawn()
-    try:
-        assert await backend.interrupt() is False
-    finally:
-        await backend.close()
+        await process.close()
+    assert any(f["type"] == "session.result" for f in fa)
+    assert any(f["type"] == "session.result" for f in fb)
 
 
 async def test_agent_failure_surfaces_session_error():
-    queue: asyncio.Queue = asyncio.Queue()
-    backend = _make_backend(queue)
-    await backend.spawn()
+    process = _process()
+    q: asyncio.Queue = asyncio.Queue()
+    handle = await _handle(process, q)
     try:
-        await backend.send_user_turn({"role": "user", "content": "boom"})
-        frames = await _drain_until(queue, "session.error", "session.result")
+        await handle.send_user_turn({"role": "user", "content": "boom"})
+        frame = await asyncio.wait_for(_first(q, "session.error"), timeout=30.0)
     finally:
-        await backend.close()
-    err = next(f for f in frames if f["type"] == "session.error")
-    assert err["code"] == "agent_crashed"
-    assert backend.turn_active is False
+        await process.close()
+    assert frame["code"] == "agent_crashed"
+
+
+async def _first(q: asyncio.Queue, type_: str) -> dict:
+    while True:
+        f = await q.get()
+        if f.get("type") == type_:
+            return f

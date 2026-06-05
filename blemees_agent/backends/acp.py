@@ -37,6 +37,7 @@ from acp.connection import InMemoryMessageQueue
 from acp.schema import (
     AllowedOutcome,
     ClientCapabilities,
+    DeniedOutcome,
     McpServerStdio,
     RequestPermissionResponse,
 )
@@ -95,8 +96,11 @@ def _mcp_servers(agent: Agent) -> list[Any]:
 class _SessionState:
     """Per-ACP-session bookkeeping inside a shared process."""
 
-    def __init__(self, on_event: EventCallback) -> None:
+    def __init__(self, on_event: EventCallback, permission_cb: Any = None) -> None:
         self.on_event = on_event
+        # async (options: list[dict], tool_call: dict) -> decision dict, or None
+        # to auto-allow (the #16/#17 fallback). Supplied by the daemon (#20).
+        self.permission_cb = permission_cb
         self.turn_active = False
         self.turn_task: asyncio.Task | None = None
         self.cancelled = False  # user interrupted this turn → finalize as cancelled
@@ -129,10 +133,25 @@ class _ProcessClient(acp.Client):
     async def request_permission(
         self, options: list[Any], session_id: str, tool_call: Any, **_kw: Any
     ) -> RequestPermissionResponse:
-        chosen = next((o for o in options if o.kind.startswith("allow")), options[0])
-        return RequestPermissionResponse(
-            outcome=AllowedOutcome(option_id=chosen.option_id, outcome="selected")
+        st = self._p.sessions.get(session_id)
+        if st is None or st.permission_cb is None:
+            # Fallback (no policy wired): auto-allow.
+            chosen = next((o for o in options if o.kind.startswith("allow")), options[0])
+            return RequestPermissionResponse(
+                outcome=AllowedOutcome(option_id=chosen.option_id, outcome="selected")
+            )
+        opts = [{"option_id": o.option_id, "name": o.name, "kind": o.kind} for o in options]
+        tc = (
+            tool_call.model_dump(mode="json", by_alias=True, exclude_none=True)
+            if hasattr(tool_call, "model_dump")
+            else tool_call
         )
+        decision = await st.permission_cb(opts, tc)
+        if decision.get("outcome") == "selected" and decision.get("option_id"):
+            return RequestPermissionResponse(
+                outcome=AllowedOutcome(option_id=decision["option_id"], outcome="selected")
+            )
+        return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
 
 
 class AcpAgentProcess:
@@ -250,14 +269,16 @@ class AcpAgentProcess:
                         }
                     )
 
-    async def new_session(self, *, cwd: str | None, on_event: EventCallback) -> str:
+    async def new_session(
+        self, *, cwd: str | None, on_event: EventCallback, permission_cb: Any = None
+    ) -> str:
         await self.ensure_started()
         ns = await self._conn.new_session(
             cwd=cwd or self.agent.cwd or ".",
             mcp_servers=_mcp_servers(self.agent),
         )
         sid = ns.session_id
-        self.sessions[sid] = _SessionState(on_event)
+        self.sessions[sid] = _SessionState(on_event, permission_cb)
         await self._apply_selection(sid, ns)
         return sid
 
@@ -445,11 +466,13 @@ class AcpSessionHandle:
         on_event: EventCallback,
         cwd: str | None,
         on_close: Any = None,
+        permission_cb: Any = None,
     ) -> None:
         self._process = process
         self._on_event = on_event
         self._cwd = cwd
         self._on_close = on_close  # supervisor callback for idle-reap accounting
+        self._permission_cb = permission_cb
         self.native_session_id: str | None = None
         self.load_session: bool = False
         self.model: str | None = process.agent.model
@@ -468,7 +491,7 @@ class AcpSessionHandle:
 
     async def spawn(self) -> None:
         self.native_session_id = await self._process.new_session(
-            cwd=self._cwd, on_event=self._on_event
+            cwd=self._cwd, on_event=self._on_event, permission_cb=self._permission_cb
         )
         self.load_session = self._process.load_session
 

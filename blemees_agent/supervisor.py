@@ -51,10 +51,15 @@ class Agent:
 
 @dataclasses.dataclass(slots=True)
 class Profile:
-    """A named container of agents."""
+    """A named container of agents (plus cross-agent policy)."""
 
     name: str
     agents: dict[str, Agent] = dataclasses.field(default_factory=dict)
+    # Permission policy applied to this profile's sessions (#20):
+    # {"mode": relay|allow|deny, "detached": stall|allow|deny}.
+    permission_policy: dict[str, Any] = dataclasses.field(
+        default_factory=lambda: {"mode": "relay", "detached": "stall"}
+    )
 
     @property
     def default_agent(self) -> Agent:
@@ -106,7 +111,16 @@ def _profiles_from_config(config: Config) -> dict[str, Profile]:
             # Flat sugar: the profile body defines a single "default" agent.
             agents = {DEFAULT_AGENT: _agent_from_spec(DEFAULT_AGENT, pspec, config.agent_command)}
         if agents:
-            profiles[pname] = Profile(name=pname, agents=agents)
+            policy = pspec.get("permission_policy")
+            profiles[pname] = Profile(
+                name=pname,
+                agents=agents,
+                permission_policy=(
+                    dict(policy)
+                    if isinstance(policy, dict)
+                    else {"mode": "relay", "detached": "stall"}
+                ),
+            )
     return profiles
 
 
@@ -154,7 +168,13 @@ class Supervisor:
         return proc
 
     def make_handle(
-        self, profile_name: str | None, agent_name: str | None, *, on_event: Any, cwd: str | None
+        self,
+        profile_name: str | None,
+        agent_name: str | None,
+        *,
+        on_event: Any,
+        cwd: str | None,
+        permission_cb: Any = None,
     ) -> AcpSessionHandle:
         """Return a per-session handle bound to the (profile, agent)'s lazy process."""
         profile, agent = self.resolve(profile_name, agent_name)
@@ -165,6 +185,7 @@ class Supervisor:
             on_event=on_event,
             cwd=cwd or agent.cwd,
             on_close=self._on_session_close,
+            permission_cb=permission_cb,
         )
 
     async def _on_session_close(self, proc: AcpAgentProcess) -> None:

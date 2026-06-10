@@ -318,9 +318,13 @@ def test_parse_profile_mutate_rejects_invalid_agent_names():
         )
 
 
-def test_parse_profile_action_allows_legacy_names():
-    # delete must keep working for registry entries that predate validation (#54)
-    msg = parse_profile_action({"type": "profile.delete", "name": "my.profile"})
+@pytest.mark.parametrize("verb", ["profile.start", "profile.stop", "profile.delete"])
+def test_parse_profile_action_allows_legacy_names(verb):
+    # All action verbs target *existing* registry entries, which may predate
+    # name validation (#54) — a legacy-named profile must stay stoppable and
+    # deletable. Unknown names fail with profile_unknown at the registry
+    # lookup, so permissive parsing is safe.
+    msg = parse_profile_action({"type": verb, "name": "my.profile"})
     assert msg.name == "my.profile"
 
 

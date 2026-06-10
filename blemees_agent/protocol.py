@@ -315,8 +315,12 @@ def parse_profile_action(obj: dict[str, Any]) -> ProfileActionMessage:
     name = obj.get("name")
     if not isinstance(name, str) or not name:
         raise ProtocolError("profile action requires non-empty 'name'")
-    # Deliberately no charset validation here: profile.delete must keep working
-    # against a registry entry created before name validation existed (#54).
+    # Deliberately no charset validation here. This parser serves
+    # profile.start / profile.stop / profile.delete, all of which target an
+    # *existing* registry entry — which may legally predate name validation
+    # (#54). A legacy-named profile must stay stoppable and deletable, and an
+    # unknown name already fails cleanly with profile_unknown at the registry
+    # lookup. Validation gates creation (parse_profile_mutate), not use.
     return ProfileActionMessage(id=_opt_str_id(obj), name=name)
 
 

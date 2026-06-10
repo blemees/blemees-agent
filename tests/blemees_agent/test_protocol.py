@@ -21,6 +21,8 @@ from blemees_agent.protocol import (
     parse_list,
     parse_open,
     parse_ping,
+    parse_profile_action,
+    parse_profile_mutate,
     parse_prompt,
     parse_session_info,
     parse_status,
@@ -282,3 +284,65 @@ def test_parse_detach_rejects_extra_keys():
 def test_parse_session_info_rejects_extra_keys():
     with pytest.raises(ProtocolError, match="unexpected field"):
         parse_session_info({"type": "session.info", "session_id": "s1", "extra": 1})
+
+
+# ---------------------------------------------------------------------------
+# Profile / agent name validation (#54)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("name", ["ok", "claude-sonnet", "A_1", "a" * 64])
+def test_parse_profile_mutate_accepts_valid_names(name):
+    msg = parse_profile_mutate(
+        {"type": "profile.create", "name": name, "profile": {"agent": {"agent_command": "x"}}}
+    )
+    assert msg.name == name
+
+
+@pytest.mark.parametrize("name", ["my.profile", "a b", "naïve", "a/b", "a" * 65])
+def test_parse_profile_mutate_rejects_invalid_names(name):
+    with pytest.raises(ProtocolError, match="invalid profile name"):
+        parse_profile_mutate(
+            {"type": "profile.create", "name": name, "profile": {"agent": {"agent_command": "x"}}}
+        )
+
+
+def test_parse_profile_mutate_rejects_invalid_agent_names():
+    with pytest.raises(ProtocolError, match="invalid agent name"):
+        parse_profile_mutate(
+            {
+                "type": "profile.create",
+                "name": "ok",
+                "profile": {"agents": {"bad.agent": {"agent_command": "x"}}},
+            }
+        )
+
+
+@pytest.mark.parametrize("verb", ["profile.start", "profile.stop", "profile.delete"])
+def test_parse_profile_action_allows_legacy_names(verb):
+    # All action verbs target *existing* registry entries, which may predate
+    # name validation (#54) — a legacy-named profile must stay stoppable and
+    # deletable. Unknown names fail with profile_unknown at the registry
+    # lookup, so permissive parsing is safe.
+    msg = parse_profile_action({"type": verb, "name": "my.profile"})
+    assert msg.name == "my.profile"
+
+
+def test_parse_profile_mutate_rejects_explicit_empty_top_level_name():
+    # An explicit empty "name" is a client bug — no silent fallback to
+    # profile.name (#55 review).
+    with pytest.raises(ProtocolError, match="non-empty 'name'"):
+        parse_profile_mutate(
+            {
+                "type": "profile.create",
+                "name": "",
+                "profile": {"name": "ok", "agent": {"agent_command": "x"}},
+            }
+        )
+
+
+def test_parse_profile_mutate_absent_name_falls_back_to_profile_name():
+    msg = parse_profile_mutate(
+        {"type": "profile.create", "profile": {"name": "ok", "agent": {"agent_command": "x"}}}
+    )
+    assert msg.name == "ok"

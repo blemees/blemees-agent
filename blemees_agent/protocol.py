@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import re
 from typing import Any
 
 from . import PROTOCOL_VERSION
@@ -109,6 +110,23 @@ def _require_session_id(obj: dict[str, Any], verb: str) -> str:
     if not isinstance(session_id, str) or not session_id:
         raise ProtocolError(f"{verb} requires non-empty 'session_id'")
     return session_id
+
+
+# Profile and agent names become registry keys, config table names, and
+# client-side identifiers (e.g. Textual widget ids in blemees-tui), so they are
+# restricted to a conservative identifier charset (#54).
+_NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
+def is_valid_name(name: str) -> bool:
+    """True if ``name`` is a legal profile/agent name."""
+    return bool(_NAME_RE.fullmatch(name))
+
+
+def _require_valid_name(name: str, what: str) -> str:
+    if not is_valid_name(name):
+        raise ProtocolError(f"invalid {what} {name!r}: use 1-64 characters from [A-Za-z0-9_-]")
+    return name
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +315,12 @@ def parse_profile_action(obj: dict[str, Any]) -> ProfileActionMessage:
     name = obj.get("name")
     if not isinstance(name, str) or not name:
         raise ProtocolError("profile action requires non-empty 'name'")
+    # Deliberately no charset validation here. This parser serves
+    # profile.start / profile.stop / profile.delete, all of which target an
+    # *existing* registry entry — which may legally predate name validation
+    # (#54). A legacy-named profile must stay stoppable and deletable, and an
+    # unknown name already fails cleanly with profile_unknown at the registry
+    # lookup. Validation gates creation (parse_profile_mutate), not use.
     return ProfileActionMessage(id=_opt_str_id(obj), name=name)
 
 
@@ -306,9 +330,21 @@ def parse_profile_mutate(obj: dict[str, Any]) -> ProfileMutateMessage:
     if not isinstance(profile, dict):
         raise ProtocolError("profile create/update requires a 'profile' object")
     # The name may be carried at the top level or inside the profile object.
-    name = obj.get("name") or profile.get("name")
+    # Only an absent (or null) top-level name falls back to profile.name — an
+    # explicit empty string is a client bug and is rejected, not ignored.
+    name = obj.get("name")
+    if name is None:
+        name = profile.get("name")
     if not isinstance(name, str) or not name:
         raise ProtocolError("profile create/update requires a non-empty 'name'")
+    _require_valid_name(name, "profile name")
+    agents_spec = profile.get("agents")
+    if isinstance(agents_spec, dict):
+        for aname in agents_spec:
+            if not isinstance(aname, str) or not is_valid_name(aname):
+                raise ProtocolError(
+                    f"invalid agent name {aname!r}: use 1-64 characters from [A-Za-z0-9_-]"
+                )
     return ProfileMutateMessage(id=_opt_str_id(obj), name=name, profile=profile)
 
 

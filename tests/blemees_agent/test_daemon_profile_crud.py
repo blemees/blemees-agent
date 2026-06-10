@@ -268,3 +268,77 @@ async def test_create_duplicate_yields_profile_exists(state_dir):
                 assert err["code"] == "profile_protected"  # default is config-managed
             finally:
                 await c.close()
+
+
+# ---- name validation (#54) -----------------------------------------
+
+
+async def test_create_with_invalid_name_rejected(state_dir):
+    sock = short_socket_path("blemeesd-pn1")
+    with socket_cleanup(sock):
+        async with _daemon(state_dir, sock):
+            c = await _connect(sock)
+            try:
+                await c.send(
+                    {
+                        "type": "profile.create",
+                        "id": "c1",
+                        "name": "my.profile",
+                        "profile": {"agent": {"agent_command": GOOD}},
+                    }
+                )
+                err = await c.wait_for(lambda e: e.get("type") == "error")
+                assert err["code"] == "invalid_message"
+                assert "invalid profile name" in err["message"]
+                assert "my.profile" not in await _profile_names(c)
+            finally:
+                await c.close()
+
+
+async def test_config_profile_with_invalid_name_skipped(state_dir):
+    sock = short_socket_path("blemeesd-pn2")
+    with socket_cleanup(sock):
+        async with _daemon(
+            state_dir,
+            sock,
+            profiles={
+                "bad.name": {"agent": {"agent_command": GOOD}},
+                "good-name": {"agent": {"agent_command": GOOD}},
+            },
+        ):
+            c = await _connect(sock)
+            try:
+                names = await _profile_names(c)
+                assert "good-name" in names
+                assert "bad.name" not in names
+            finally:
+                await c.close()
+
+
+async def test_config_agents_with_invalid_keys_filtered_not_silently_dropped(state_dir):
+    sock = short_socket_path("blemeesd-pn3")
+    with socket_cleanup(sock):
+        async with _daemon(
+            state_dir,
+            sock,
+            profiles={
+                # one valid + one invalid agent key: profile loads, bad key skipped
+                "mixed": {
+                    "agents": {
+                        "good": {"agent_command": GOOD},
+                        "bad.key": {"agent_command": GOOD},
+                    }
+                },
+                # only invalid agent keys: the whole profile is dropped (warned)
+                "all-bad": {"agents": {"bad.key": {"agent_command": GOOD}}},
+            },
+        ):
+            c = await _connect(sock)
+            try:
+                names = await _profile_names(c)
+                assert "mixed" in names
+                agent_names = [a["name"] for a in names["mixed"]["agents"]]
+                assert agent_names == ["good"]
+                assert "all-bad" not in names
+            finally:
+                await c.close()

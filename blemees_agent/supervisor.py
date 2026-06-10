@@ -36,6 +36,7 @@ from .errors import (
     ProfileProtectedError,
     ProfileUnknownError,
 )
+from .protocol import is_valid_name
 
 if TYPE_CHECKING:
     from .registry import Registry
@@ -95,7 +96,9 @@ def _agent_from_spec(name: str, spec: dict[str, Any], fallback_command: str) -> 
     )
 
 
-def _profile_from_spec(name: str, pspec: dict[str, Any], fallback_command: str) -> Profile | None:
+def _profile_from_spec(
+    name: str, pspec: dict[str, Any], fallback_command: str, log: Any | None = None
+) -> Profile | None:
     """Build one :class:`Profile` from a raw spec dict (config table or the
     over-wire ``profile`` object, #25).
 
@@ -105,11 +108,20 @@ def _profile_from_spec(name: str, pspec: dict[str, Any], fallback_command: str) 
     """
     agents_spec = pspec.get("agents")
     if isinstance(agents_spec, dict) and agents_spec:
-        agents = {
-            aname: _agent_from_spec(aname, aspec, fallback_command)
-            for aname, aspec in agents_spec.items()
-            if isinstance(aspec, dict)
-        }
+        # Agent names share the profile-name charset (#54); the wire path is
+        # rejected at parse time, so this filter only bites config tables —
+        # warn per skipped key so typos are diagnosable.
+        agents = {}
+        for aname, aspec in agents_spec.items():
+            if not isinstance(aspec, dict):
+                continue
+            if not is_valid_name(str(aname)):
+                if log is not None:
+                    log.warning(
+                        "profile.invalid_agent_name_skipped", profile=name, agent=str(aname)
+                    )
+                continue
+            agents[aname] = _agent_from_spec(aname, aspec, fallback_command)
     elif isinstance(pspec.get("agent"), dict):
         agents = {DEFAULT_AGENT: _agent_from_spec(DEFAULT_AGENT, pspec["agent"], fallback_command)}
     else:
@@ -128,7 +140,7 @@ def _profile_from_spec(name: str, pspec: dict[str, Any], fallback_command: str) 
     )
 
 
-def _profiles_from_config(config: Config) -> dict[str, Profile]:
+def _profiles_from_config(config: Config, log: Any | None = None) -> dict[str, Profile]:
     """Build the profile registry: a synthesised ``default`` + config-file ones."""
     profiles: dict[str, Profile] = {
         DEFAULT_PROFILE: Profile(
@@ -145,9 +157,18 @@ def _profiles_from_config(config: Config) -> dict[str, Profile]:
     for pname, pspec in (config.profiles or {}).items():
         if not isinstance(pspec, dict):
             continue
-        profile = _profile_from_spec(pname, pspec, config.agent_command)
+        if not is_valid_name(str(pname)):
+            # Warn-and-skip so one bad table name can't keep the daemon down (#54).
+            if log is not None:
+                log.warning("profile.invalid_name_skipped", profile=str(pname))
+            continue
+        profile = _profile_from_spec(pname, pspec, config.agent_command, log)
         if profile is not None:
             profiles[pname] = profile
+        elif log is not None:
+            # All of the table's agents were invalid/skipped — say so rather
+            # than letting the profile vanish silently.
+            log.warning("profile.no_valid_agents_skipped", profile=str(pname))
     return profiles
 
 
@@ -158,7 +179,7 @@ class Supervisor:
         self._config = config
         self._log = logger
         self._registry = registry
-        self._profiles: dict[str, Profile] = _profiles_from_config(config)
+        self._profiles: dict[str, Profile] = _profiles_from_config(config, logger)
         # Names that come from config (synthesised default + [profiles.*]); these
         # are config-managed and can't be mutated/deleted over the wire (#25).
         self._static_names: set[str] = set(self._profiles)
@@ -179,7 +200,7 @@ class Supervisor:
                 if name in self._static_names:
                     self._log.warning("profile.persisted_shadowed_by_config", profile=name)
                 continue
-            profile = _profile_from_spec(name, spec, self._config.agent_command)
+            profile = _profile_from_spec(name, spec, self._config.agent_command, self._log)
             if profile is not None:
                 self._profiles[name] = profile
 
@@ -296,7 +317,7 @@ class Supervisor:
     def create_profile(self, name: str, spec: dict[str, Any]) -> Profile:
         if name in self._profiles:
             raise ProfileExistsError(name)
-        profile = _profile_from_spec(name, spec, self._config.agent_command)
+        profile = _profile_from_spec(name, spec, self._config.agent_command, self._log)
         if profile is None:
             raise ProfileUnknownError(name)  # malformed spec → no agents
         self._validate_agents_available(profile)
@@ -308,7 +329,7 @@ class Supervisor:
         if name not in self._profiles:
             raise ProfileUnknownError(name)
         self._ensure_mutable(name)
-        profile = _profile_from_spec(name, spec, self._config.agent_command)
+        profile = _profile_from_spec(name, spec, self._config.agent_command, self._log)
         if profile is None:
             raise ProfileUnknownError(name)
         self._validate_agents_available(profile)

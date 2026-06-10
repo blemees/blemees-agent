@@ -326,7 +326,11 @@ def parse_profile_mutate(obj: dict[str, Any]) -> ProfileMutateMessage:
     if not isinstance(profile, dict):
         raise ProtocolError("profile create/update requires a 'profile' object")
     # The name may be carried at the top level or inside the profile object.
-    name = obj.get("name") or profile.get("name")
+    # Only an absent (or null) top-level name falls back to profile.name — an
+    # explicit empty string is a client bug and is rejected, not ignored.
+    name = obj.get("name")
+    if name is None:
+        name = profile.get("name")
     if not isinstance(name, str) or not name:
         raise ProtocolError("profile create/update requires a non-empty 'name'")
     _require_valid_name(name, "profile name")

@@ -313,3 +313,32 @@ async def test_config_profile_with_invalid_name_skipped(state_dir):
                 assert "bad.name" not in names
             finally:
                 await c.close()
+
+
+async def test_config_agents_with_invalid_keys_filtered_not_silently_dropped(state_dir):
+    sock = short_socket_path("blemeesd-pn3")
+    with socket_cleanup(sock):
+        async with _daemon(
+            state_dir,
+            sock,
+            profiles={
+                # one valid + one invalid agent key: profile loads, bad key skipped
+                "mixed": {
+                    "agents": {
+                        "good": {"agent_command": GOOD},
+                        "bad.key": {"agent_command": GOOD},
+                    }
+                },
+                # only invalid agent keys: the whole profile is dropped (warned)
+                "all-bad": {"agents": {"bad.key": {"agent_command": GOOD}}},
+            },
+        ):
+            c = await _connect(sock)
+            try:
+                names = await _profile_names(c)
+                assert "mixed" in names
+                agent_names = [a["name"] for a in names["mixed"]["agents"]]
+                assert agent_names == ["good"]
+                assert "all-bad" not in names
+            finally:
+                await c.close()

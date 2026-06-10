@@ -322,3 +322,23 @@ def test_parse_profile_action_allows_legacy_names():
     # delete must keep working for registry entries that predate validation (#54)
     msg = parse_profile_action({"type": "profile.delete", "name": "my.profile"})
     assert msg.name == "my.profile"
+
+
+def test_parse_profile_mutate_rejects_explicit_empty_top_level_name():
+    # An explicit empty "name" is a client bug — no silent fallback to
+    # profile.name (#55 review).
+    with pytest.raises(ProtocolError, match="non-empty 'name'"):
+        parse_profile_mutate(
+            {
+                "type": "profile.create",
+                "name": "",
+                "profile": {"name": "ok", "agent": {"agent_command": "x"}},
+            }
+        )
+
+
+def test_parse_profile_mutate_absent_name_falls_back_to_profile_name():
+    msg = parse_profile_mutate(
+        {"type": "profile.create", "profile": {"name": "ok", "agent": {"agent_command": "x"}}}
+    )
+    assert msg.name == "ok"

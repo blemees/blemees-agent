@@ -21,6 +21,8 @@ from blemees_agent.protocol import (
     parse_list,
     parse_open,
     parse_ping,
+    parse_profile_action,
+    parse_profile_mutate,
     parse_prompt,
     parse_session_info,
     parse_status,
@@ -282,3 +284,41 @@ def test_parse_detach_rejects_extra_keys():
 def test_parse_session_info_rejects_extra_keys():
     with pytest.raises(ProtocolError, match="unexpected field"):
         parse_session_info({"type": "session.info", "session_id": "s1", "extra": 1})
+
+
+# ---------------------------------------------------------------------------
+# Profile / agent name validation (#54)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("name", ["ok", "claude-sonnet", "A_1", "a" * 64])
+def test_parse_profile_mutate_accepts_valid_names(name):
+    msg = parse_profile_mutate(
+        {"type": "profile.create", "name": name, "profile": {"agent": {"agent_command": "x"}}}
+    )
+    assert msg.name == name
+
+
+@pytest.mark.parametrize("name", ["my.profile", "a b", "naïve", "a/b", "a" * 65])
+def test_parse_profile_mutate_rejects_invalid_names(name):
+    with pytest.raises(ProtocolError, match="invalid profile name"):
+        parse_profile_mutate(
+            {"type": "profile.create", "name": name, "profile": {"agent": {"agent_command": "x"}}}
+        )
+
+
+def test_parse_profile_mutate_rejects_invalid_agent_names():
+    with pytest.raises(ProtocolError, match="invalid agent name"):
+        parse_profile_mutate(
+            {
+                "type": "profile.create",
+                "name": "ok",
+                "profile": {"agents": {"bad.agent": {"agent_command": "x"}}},
+            }
+        )
+
+
+def test_parse_profile_action_allows_legacy_names():
+    # delete must keep working for registry entries that predate validation (#54)
+    msg = parse_profile_action({"type": "profile.delete", "name": "my.profile"})
+    assert msg.name == "my.profile"

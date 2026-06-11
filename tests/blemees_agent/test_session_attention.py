@@ -141,3 +141,43 @@ async def test_attach_clears_attention():
     assert sess.needs_attention is False
     assert notify.cleared == ["s1"]
     assert "session.attention_cleared" in [f["type"] for f in captured]
+
+
+# ---- per-session attention policy (#51) ------------------------------
+
+
+async def test_turn_complete_detached_is_silent_by_default():
+    sess, notify, frames = _session(connection_id=None)
+    await sess.on_event({"type": "session.result", "stop_reason": "end_turn"})
+    assert sess.needs_attention is False
+    assert notify.fired == []
+    assert "session.needs_attention" not in _types(frames)
+
+
+async def test_turn_complete_fires_when_armed_and_detached():
+    sess, notify, frames = _session(connection_id=None)
+    sess.attention_triggers = {"turn_complete"}
+    await sess.on_event({"type": "session.result", "stop_reason": "end_turn"})
+    assert sess.needs_attention is True
+    assert sess.attention_reason == "turn_complete"
+    assert "session.needs_attention" in _types(frames)
+    assert notify.fired and notify.fired[0]["reason"] == "turn_complete"
+    assert "end_turn" in notify.fired[0]["detail"]
+
+
+async def test_turn_complete_armed_but_attached_is_noop():
+    sess, notify, frames = _session(connection_id=7)
+    sess.attention_triggers = {"turn_complete"}
+    await sess.on_event({"type": "session.result", "stop_reason": "end_turn"})
+    assert sess.needs_attention is False
+    assert notify.fired == []
+
+
+async def test_disarmed_blocked_trigger_is_silent():
+    # The policy can also disarm a default trigger — an empty set means
+    # nothing pushes for this session (#51).
+    sess, notify, frames = _session(connection_id=None)
+    sess.attention_triggers = set()
+    await sess.enter_attention("agent_crashed", "boom")
+    assert sess.needs_attention is False
+    assert notify.fired == []

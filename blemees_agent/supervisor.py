@@ -36,6 +36,7 @@ from .errors import (
     ProfileProtectedError,
     ProfileUnknownError,
 )
+from .notify import BLOCKED_TRIGGERS, KNOWN_TRIGGERS
 from .protocol import is_valid_name
 
 if TYPE_CHECKING:
@@ -73,6 +74,10 @@ class Profile:
     # Notify config for this profile's sessions (#24, §6). Currently
     # ``{"webhook_url": str}``; absent falls back to the daemon-global URL.
     notify: dict[str, Any] = dataclasses.field(default_factory=dict)
+    # Attention policy (#51): which triggers arm needs_attention + webhook
+    # for this profile's sessions. Default = the blocked set; turn_complete
+    # is opt-in (``[profiles.<p>.attention] triggers = [...]``).
+    attention_triggers: set[str] = dataclasses.field(default_factory=lambda: set(BLOCKED_TRIGGERS))
 
     @property
     def default_agent(self) -> Agent:
@@ -137,7 +142,27 @@ def _profile_from_spec(
             dict(policy) if isinstance(policy, dict) else {"mode": "relay", "detached": "stall"}
         ),
         notify=dict(notify) if isinstance(notify, dict) else {},
+        attention_triggers=_attention_triggers_from_spec(name, pspec, log),
     )
+
+
+def _attention_triggers_from_spec(
+    name: str, pspec: dict[str, Any], log: Any | None = None
+) -> set[str]:
+    """Resolve the profile's attention policy (#51). Absent → blocked set;
+    a configured ``attention.triggers`` list replaces it, with unknown
+    trigger names warn-skipped so a typo can't silently disarm the rest."""
+    attention = pspec.get("attention")
+    triggers = attention.get("triggers") if isinstance(attention, dict) else None
+    if not isinstance(triggers, list):
+        return set(BLOCKED_TRIGGERS)
+    armed: set[str] = set()
+    for t in triggers:
+        if isinstance(t, str) and t in KNOWN_TRIGGERS:
+            armed.add(t)
+        elif log is not None:
+            log.warning("profile.unknown_attention_trigger", profile=name, trigger=str(t))
+    return armed
 
 
 def _profiles_from_config(config: Config, log: Any | None = None) -> dict[str, Profile]:

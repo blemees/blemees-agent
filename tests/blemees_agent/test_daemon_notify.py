@@ -31,7 +31,7 @@ def webhook_posts(monkeypatch):
     at construction)."""
     posts: list[tuple[str, dict]] = []
 
-    def fake_post(self, url, body):
+    def fake_post(self, url, body, headers):
         posts.append((url, json.loads(body)))
 
     monkeypatch.setattr(WebhookSink, "_http_post", fake_post)

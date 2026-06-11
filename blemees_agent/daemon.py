@@ -1120,7 +1120,13 @@ class Daemon:
         # Notify service (#24, §6): one webhook sink resolving the per-profile
         # URL (global fallback). The sink no-ops for profiles with no URL.
         self._notify = NotifyService(
-            sinks=[WebhookSink(self._supervisor.webhook_url_for, logger)],
+            sinks=[
+                WebhookSink(
+                    self._supervisor.webhook_url_for,
+                    logger,
+                    resolve_format=self._supervisor.webhook_format_for,
+                )
+            ],
             logger=logger,
         )
         self._start_time: float = time.monotonic()

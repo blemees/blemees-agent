@@ -134,7 +134,7 @@ async def test_webhook_skips_when_no_url():
 
 
 async def test_webhook_post_failure_is_swallowed():
-    def boom(url, body):
+    def boom(url, body, headers):
         raise OSError("connection refused")
 
     sink = WebhookSink(resolve_url=lambda p: "https://hook", logger=LOG, post=boom)

@@ -31,12 +31,21 @@ from typing import Any, Protocol
 PERMISSION_PENDING = "permission_pending"
 AUTH_REQUIRED = "auth_required"
 AGENT_CRASHED = "agent_crashed"
+TURN_COMPLETE = "turn_complete"
 TEST = "test"
+
+# The per-profile attention policy (#51). "Blocked" triggers — the session
+# cannot make progress without its owner — are the default; turn_complete
+# (a turn finished while detached) is opt-in per profile so push stays
+# scarce unless a profile asks for it (2026-06-10 roadmap decision).
+BLOCKED_TRIGGERS = frozenset({PERMISSION_PENDING, AUTH_REQUIRED, AGENT_CRASHED})
+KNOWN_TRIGGERS = BLOCKED_TRIGGERS | {TURN_COMPLETE}
 
 _TITLES = {
     PERMISSION_PENDING: "blemees: permission needed",
     AUTH_REQUIRED: "blemees: authentication required",
     AGENT_CRASHED: "blemees: agent crashed",
+    TURN_COMPLETE: "blemees: turn complete",
     TEST: "blemees: test notification",
 }
 
@@ -143,6 +152,11 @@ class NotifyService:
     logger: Any = None
     now_ms: Callable[[], int] = _default_now_ms
     _outstanding: dict[str, Notification] = field(default_factory=dict, init=False)
+    # Dispatch tasks are service-owned: a trigger may fire from a task that
+    # is about to be cancelled (e.g. the backend pump during a post-turn
+    # soft-kill), and an inline await would die with it — silently eating
+    # the webhook (#51). Refs held per the asyncio GC rules.
+    _tasks: set = field(default_factory=set, init=False)
 
     async def fire(
         self, *, reason: str, profile: str, session_id: str, detail: str
@@ -156,8 +170,24 @@ class NotifyService:
             ts_ms=self.now_ms(),
         )
         self._outstanding[session_id] = notification
-        await self._dispatch(notification)
+        if not self.sinks:
+            return notification
+        # Fire-and-forget on a service-owned task — sinks are best-effort and
+        # must never block or die with the trigger that fired them.
+        task = asyncio.create_task(self._dispatch(notification))
+        self._tasks.add(task)
+        task.add_done_callback(self._reap)
         return notification
+
+    def _reap(self, task: asyncio.Task) -> None:
+        """Drop a finished dispatch task and surface unexpected crashes
+        instead of relying on the never-retrieved warning."""
+        self._tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None and self.logger is not None:
+            self.logger.warning("notify.dispatch_crashed", error=repr(exc))
 
     async def test(
         self, *, profile: str, session_id: str = "notify-test", detail: str = "test event"

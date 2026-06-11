@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from blemees_agent.logging import configure
@@ -55,6 +57,9 @@ async def test_fire_records_outstanding_and_dispatches():
     n = await svc.fire(reason=AGENT_CRASHED, profile="claude", session_id="s1", detail="boom")
     assert n.reason == "agent_crashed"
     assert [p["session_id"] for p in svc.outstanding()] == ["s1"]
+    # Dispatch rides a service-owned task (decoupled from the caller, #51) —
+    # drain it before observing sink emissions.
+    await asyncio.gather(*svc._tasks)
     assert sink.seen[0].session_id == "s1"
 
 
@@ -88,6 +93,7 @@ async def test_sink_failure_is_swallowed():
     svc = _svc(_BoomSink(), good)
     # A failing sink must not prevent other sinks or break fire().
     await svc.fire(reason=AGENT_CRASHED, profile="p", session_id="s1", detail="d")
+    await asyncio.gather(*svc._tasks)
     assert good.seen[0].session_id == "s1"
     assert svc.outstanding()  # still recorded
 
@@ -136,3 +142,24 @@ async def test_webhook_post_failure_is_swallowed():
     await sink.emit(
         Notification(reason=AGENT_CRASHED, profile="p", session_id="s", detail="d", ts_ms=1)
     )
+
+
+async def test_fire_survives_caller_cancellation():
+    # The trigger may fire from a task that is cancelled immediately after
+    # (the backend pump during a post-turn soft-kill, #51) — the dispatch
+    # must complete anyway.
+    sink = _RecordingSink()
+    svc = _svc(sink)
+
+    async def doomed():
+        await svc.fire(reason=AGENT_CRASHED, profile="p", session_id="s1", detail="d")
+        await asyncio.sleep(60)  # keep the caller alive so the cancel bites
+
+    task = asyncio.create_task(doomed())
+    await asyncio.sleep(0)  # let fire() schedule the dispatch task
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert task.cancelled()
+    await asyncio.gather(*svc._tasks)
+    assert sink.seen and sink.seen[0].session_id == "s1"

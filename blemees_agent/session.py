@@ -32,7 +32,15 @@ from typing import Any
 from .backends import AgentBackend
 from .errors import SessionExistsError, SessionUnknownError
 from .event_log import DurableEventLog, RingBuffer, event_log_path
-from .notify import AGENT_CRASHED, AUTH_REQUIRED, PERMISSION_PENDING, NotifyService
+from .notify import (
+    AGENT_CRASHED,
+    AUTH_REQUIRED,
+    BLOCKED_TRIGGERS,
+    KNOWN_TRIGGERS,
+    PERMISSION_PENDING,
+    TURN_COMPLETE,
+    NotifyService,
+)
 from .protocol import OpenMessage
 
 WriterFn = Callable[[dict], Awaitable[None]]
@@ -136,6 +144,10 @@ class Session:
     # open so the attention state machine can fire the per-profile webhook (#24).
     notify: NotifyService | None = None
     profile_name: str | None = None
+    # Which attention triggers are armed for this session (#51): inherited
+    # from the profile at open (default = the blocked set), overridable per
+    # session via session.open options.attention_triggers.
+    attention_triggers: set[str] = field(default_factory=lambda: set(BLOCKED_TRIGGERS))
 
     # ------------------------------------------------------------------
     # Event dispatch
@@ -181,6 +193,14 @@ class Session:
                     dead.append(conn_id)
             for conn_id in dead:
                 self._watchers.pop(conn_id, None)
+        # A turn that finishes while no owner is attached is an opt-in
+        # attention trigger (#51); enter_attention gates on both the armed
+        # trigger set and "owner present", so this is a no-op by default and
+        # always a no-op while attached. Runs BEFORE the soft-kill below so
+        # the notify edge isn't racing the backend-pump cancellation.
+        if frame.get("type") == "session.result":
+            stop = frame.get("stop_reason") or "end_turn"
+            await self.enter_attention(TURN_COMPLETE, f"turn finished ({stop}) while detached")
         # Soft-kill after a completed turn when the client has left.
         # Backends emit `agent.result` as the turn-ending frame.
         if self._finishing and frame.get("type") == "session.result":
@@ -350,6 +370,8 @@ class Session:
         """
         if self.connection_id is not None:
             return  # owner is present; they see it live, no push needed
+        if reason in KNOWN_TRIGGERS and reason not in self.attention_triggers:
+            return  # trigger not armed by this session's attention policy (#51)
         if self.needs_attention and self.attention_reason == reason:
             return
         self.needs_attention = True

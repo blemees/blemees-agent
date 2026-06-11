@@ -48,7 +48,7 @@ from .errors import (
     UnsafeFlagError,
 )
 from .logging import StructuredLogger
-from .notify import NotifyService, WebhookSink
+from .notify import KNOWN_TRIGGERS, NotifyService, WebhookSink
 from .protocol import (
     _MISSING,
     OpenMessage,
@@ -397,6 +397,23 @@ class Connection:
         sess.permission_policy = dict(profile.permission_policy)
         sess.notify = self._notify
         sess.profile_name = profile.name
+        # Attention policy (#51): profile default, overridable per session.
+        sess.attention_triggers = set(profile.attention_triggers)
+        override = (msg.options or {}).get("attention_triggers")
+        if isinstance(override, list):
+            armed: set[str] = set()
+            for t in override:
+                if isinstance(t, str) and t in KNOWN_TRIGGERS:
+                    armed.add(t)
+                else:
+                    # Same warn-skip safety as profile config — a typo must
+                    # not silently disarm the rest (review feedback on #57).
+                    self._log.warning(
+                        "session.unknown_attention_trigger",
+                        session_id=msg.session_id,
+                        trigger=str(t),
+                    )
+            sess.attention_triggers = armed
 
         # On resume, rehydrate the agent's prior session via session/load (#23).
         # The prior agent session id comes from the live session or, across a

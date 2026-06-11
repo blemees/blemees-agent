@@ -553,19 +553,39 @@ async def _oneshot_connect(
         reader, writer = await asyncio.open_unix_connection(path)
     except OSError as exc:
         raise _OneShotError(EXIT_UNREACHABLE, f"daemon unreachable at {path}: {exc}") from exc
-    writer.write(
-        (
-            json.dumps(
-                {"type": "hello", "client": f"agentctl/{__version__}", "protocol": PROTOCOL_VERSION}
-            )
-            + "\n"
-        ).encode()
-    )
-    await writer.drain()
-    ack = json.loads(await reader.readline())
-    if ack.get("type") != "hello_ack":
-        raise _OneShotError(EXIT_UNREACHABLE, f"unexpected hello reply: {ack}")
+    try:
+        writer.write(
+            (
+                json.dumps(
+                    {
+                        "type": "hello",
+                        "client": f"blemees-agentctl/{__version__}",
+                        "protocol": PROTOCOL_VERSION,
+                    }
+                )
+                + "\n"
+            ).encode()
+        )
+        await writer.drain()
+        line = await reader.readline()
+        if not line:
+            raise _OneShotError(EXIT_UNREACHABLE, "daemon closed the connection during hello")
+        try:
+            ack = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise _OneShotError(EXIT_UNREACHABLE, f"non-JSON hello reply: {exc}") from exc
+        if ack.get("type") != "hello_ack":
+            raise _OneShotError(EXIT_UNREACHABLE, f"unexpected hello reply: {ack}")
+    except _OneShotError:
+        await _oneshot_close(writer)
+        raise
     return reader, writer
+
+
+async def _oneshot_close(writer: asyncio.StreamWriter) -> None:
+    writer.close()
+    with contextlib.suppress(OSError, ConnectionError):
+        await writer.wait_closed()
 
 
 async def _oneshot_send(writer: asyncio.StreamWriter, frame: dict[str, Any]) -> None:
@@ -586,7 +606,10 @@ async def _oneshot_wait(
         line = await asyncio.wait_for(reader.readline(), timeout=remaining)
         if not line:
             raise _OneShotError(EXIT_UNREACHABLE, "daemon closed the connection")
-        frame = json.loads(line)
+        try:
+            frame = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise _OneShotError(EXIT_UNREACHABLE, f"non-JSON frame from daemon: {exc}") from exc
         if frame.get("type") in types or frame.get("type") == "error":
             return frame
 
@@ -638,7 +661,7 @@ async def cmd_open(args: argparse.Namespace) -> int:
             print(f"error: {reply.get('code')}: {reply.get('message')}", file=sys.stderr)
             return EXIT_OPEN_FAILED
     finally:
-        writer.close()
+        await _oneshot_close(writer)
     print(sid)
     return EXIT_OK
 
@@ -657,7 +680,7 @@ async def cmd_list(args: argparse.Namespace) -> int:
             return EXIT_OPEN_FAILED
         print(json.dumps(reply.get("sessions", []), indent=None))
     finally:
-        writer.close()
+        await _oneshot_close(writer)
     return EXIT_OK
 
 

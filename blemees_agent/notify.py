@@ -102,10 +102,12 @@ class WebhookSink:
         resolve_url: Callable[[str], str | None],
         logger: Any,
         *,
+        resolve_format: Callable[[str], str] | None = None,
         timeout_s: float = 5.0,
-        post: Callable[[str, bytes], None] | None = None,
+        post: Callable[[str, bytes, dict[str, str]], None] | None = None,
     ) -> None:
         self._resolve_url = resolve_url
+        self._resolve_format = resolve_format or (lambda _profile: "json")
         self._log = logger
         self._timeout_s = timeout_s
         self._post = post or self._http_post
@@ -114,10 +116,10 @@ class WebhookSink:
         url = self._resolve_url(notification.profile)
         if not url:
             return
-        body = json.dumps(notification.to_payload()).encode("utf-8")
+        body, headers = self._render(notification)
         try:
             await asyncio.wait_for(
-                asyncio.to_thread(self._post, url, body), timeout=self._timeout_s
+                asyncio.to_thread(self._post, url, body, headers), timeout=self._timeout_s
             )
         except Exception as exc:  # best-effort: log and move on
             self._log.warning(
@@ -127,12 +129,32 @@ class WebhookSink:
                 error=str(exc),
             )
 
-    def _http_post(self, url: str, body: bytes) -> None:
+    def _render(self, n: Notification) -> tuple[bytes, dict[str, str]]:
+        """Render the POST for the profile's format (#52).
+
+        "json" (default) is the documented ``blemees.notify`` payload.
+        "ntfy" is a plain-text body plus the Title/Priority/Tags headers a
+        stock ntfy server renders as a readable phone notification — point
+        ``webhook_url`` at ``https://ntfy.sh/<topic>`` and you're done.
+        """
+        if self._resolve_format(n.profile) == "ntfy":
+            body = f"{n.detail}\n\nprofile: {n.profile} · session: {n.session_id[:12]}".encode()
+            headers = {
+                "Content-Type": "text/plain; charset=utf-8",
+                "Title": n.title,
+                # Blocked reasons need the owner; completions are informational.
+                "Priority": "high" if n.reason in BLOCKED_TRIGGERS else "default",
+                "Tags": "robot",
+            }
+            return body, headers
+        return json.dumps(n.to_payload()).encode("utf-8"), {"Content-Type": "application/json"}
+
+    def _http_post(self, url: str, body: bytes, headers: dict[str, str]) -> None:
         req = urllib.request.Request(
             url,
             data=body,
             method="POST",
-            headers={"Content-Type": "application/json", "User-Agent": "blemees-agentd"},
+            headers={**headers, "User-Agent": "blemees-agentd"},
         )
         with urllib.request.urlopen(req, timeout=self._timeout_s) as resp:  # noqa: S310 (operator-configured URL)
             resp.read()

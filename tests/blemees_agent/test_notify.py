@@ -107,7 +107,7 @@ async def test_webhook_posts_to_resolved_url():
     sink = WebhookSink(
         resolve_url=lambda profile: {"claude": "https://hook/claude"}.get(profile),
         logger=LOG,
-        post=lambda url, body: posted.append((url, body)),
+        post=lambda url, body, headers: posted.append((url, body)),
     )
     await sink.emit(
         Notification(
@@ -125,7 +125,7 @@ async def test_webhook_posts_to_resolved_url():
 async def test_webhook_skips_when_no_url():
     posted: list[tuple[str, bytes]] = []
     sink = WebhookSink(
-        resolve_url=lambda profile: None, logger=LOG, post=lambda u, b: posted.append((u, b))
+        resolve_url=lambda profile: None, logger=LOG, post=lambda u, b, h: posted.append((u, b))
     )
     await sink.emit(
         Notification(reason=PERMISSION_PENDING, profile="x", session_id="s", detail="d", ts_ms=1)
@@ -163,3 +163,65 @@ async def test_fire_survives_caller_cancellation():
     assert task.cancelled()
     await asyncio.gather(*svc._tasks)
     assert sink.seen and sink.seen[0].session_id == "s1"
+
+
+# ---- ntfy format (#52) -----------------------------------------------
+
+
+async def test_ntfy_format_renders_plaintext_with_headers():
+    posted: list[tuple[str, bytes, dict]] = []
+    sink = WebhookSink(
+        resolve_url=lambda p: "https://ntfy.sh/my-topic",
+        resolve_format=lambda p: "ntfy",
+        logger=LOG,
+        post=lambda u, b, h: posted.append((u, b, h)),
+    )
+    await sink.emit(
+        Notification(
+            reason=PERMISSION_PENDING,
+            profile="dev",
+            session_id="s-12345678",
+            detail="Run a command",
+            ts_ms=1,
+        )
+    )
+    url, body, headers = posted[0]
+    text = body.decode()
+    assert "Run a command" in text
+    assert "dev" in text and "s-12345678" in text
+    assert headers["Title"] == "blemees: permission needed"
+    assert headers["Priority"] == "high"  # blocked reason needs the owner
+    assert headers["Content-Type"].startswith("text/plain")
+
+
+async def test_ntfy_format_turn_complete_is_default_priority():
+    posted: list[tuple[str, bytes, dict]] = []
+    sink = WebhookSink(
+        resolve_url=lambda p: "https://ntfy.sh/t",
+        resolve_format=lambda p: "ntfy",
+        logger=LOG,
+        post=lambda u, b, h: posted.append((u, b, h)),
+    )
+    from blemees_agent.notify import TURN_COMPLETE
+
+    await sink.emit(
+        Notification(reason=TURN_COMPLETE, profile="batch", session_id="s", detail="d", ts_ms=1)
+    )
+    assert posted[0][2]["Priority"] == "default"
+
+
+async def test_json_format_is_unchanged_default():
+    posted: list[tuple[str, bytes, dict]] = []
+    sink = WebhookSink(
+        resolve_url=lambda p: "https://hook/x",
+        logger=LOG,
+        post=lambda u, b, h: posted.append((u, b, h)),
+    )
+    await sink.emit(
+        Notification(reason=PERMISSION_PENDING, profile="p", session_id="s", detail="d", ts_ms=1)
+    )
+    url, body, headers = posted[0]
+    import json
+
+    assert json.loads(body)["type"] == "blemees.notify"
+    assert headers["Content-Type"] == "application/json"

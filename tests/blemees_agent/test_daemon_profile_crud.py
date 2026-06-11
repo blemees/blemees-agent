@@ -342,3 +342,26 @@ async def test_config_agents_with_invalid_keys_filtered_not_silently_dropped(sta
                 assert "all-bad" not in names
             finally:
                 await c.close()
+
+
+# ---- notify format resolution (#52) ----------------------------------
+
+
+async def test_webhook_format_resolution(state_dir):
+    from blemees_agent.config import Config as _Cfg
+    from blemees_agent.logging import configure as _configure
+    from blemees_agent.supervisor import Supervisor
+
+    cfg = _Cfg(
+        socket_path="/tmp/unused.sock",
+        agent_command=GOOD,
+        notify_webhook_format="ntfy",
+        profiles={
+            "jsonish": {"agent_command": GOOD, "notify": {"format": "json"}},
+            "typo": {"agent_command": GOOD, "notify": {"format": "ntfyy"}},
+        },
+    )
+    sup = Supervisor(cfg, _configure("error"))
+    assert sup.webhook_format_for("default") == "ntfy"  # global default applies
+    assert sup.webhook_format_for("jsonish") == "json"  # per-profile override
+    assert sup.webhook_format_for("typo") == "json"  # unknown value degrades

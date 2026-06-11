@@ -69,6 +69,12 @@ class Config:
     # the notification payload to when a session enters ``needs_attention``
     # and its profile defines no webhook of its own. ``None`` = no fallback.
     notify_webhook_url: str | None = None
+    # Webhook payload format (#52): "json" (default — the documented
+    # blemees.notify JSON payload) or "ntfy" (plain-text body + Title/
+    # Priority/Tags headers so a bare ntfy topic renders a readable phone
+    # notification with zero middleware). Per-profile
+    # ``[profiles.<p>.notify] format`` overrides.
+    notify_webhook_format: str = "json"
 
 
 def default_socket_path() -> str:
@@ -109,6 +115,7 @@ def _env_overrides() -> dict[str, Any]:
         "BLEMEES_AGENTD_STATE_DIR": "state_dir",
         "BLEMEES_AGENTD_SHUTDOWN_GRACE": "shutdown_grace_s",
         "BLEMEES_AGENTD_NOTIFY_WEBHOOK_URL": "notify_webhook_url",
+        "BLEMEES_AGENTD_NOTIFY_FORMAT": "notify_webhook_format",
     }
     out: dict[str, Any] = {}
     for env_name, field in mapping.items():

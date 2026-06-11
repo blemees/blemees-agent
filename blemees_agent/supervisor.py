@@ -259,6 +259,20 @@ class Supervisor:
                 return url
         return self._config.notify_webhook_url
 
+    def webhook_format_for(self, profile_name: str | None) -> str:
+        """The webhook payload format for a profile (#52): its own
+        ``notify.format``, else the global default. Unknown values fall back
+        to "json" with a warning so a typo degrades gracefully."""
+        fmt = None
+        profile = self._profiles.get(profile_name or DEFAULT_PROFILE)
+        if profile is not None:
+            fmt = profile.notify.get("format")
+        fmt = fmt or self._config.notify_webhook_format or "json"
+        if fmt not in ("json", "ntfy"):
+            self._log.warning("notify.unknown_format", profile=profile_name, format=str(fmt))
+            return "json"
+        return fmt
+
     # -- processes ------------------------------------------------------
 
     def _process_for(self, profile: Profile, agent: Agent) -> AcpAgentProcess:

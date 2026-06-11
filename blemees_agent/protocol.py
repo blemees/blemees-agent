@@ -117,8 +117,11 @@ def _require_session_id(obj: dict[str, Any], verb: str) -> str:
     if not isinstance(session_id, str) or not session_id:
         raise ProtocolError(f"{verb} requires non-empty 'session_id'")
     if not _SESSION_ID_RE.fullmatch(session_id):
+        # Truncate the echoed id — don't reflect arbitrarily large
+        # attacker-supplied strings back into error frames and logs.
+        shown = session_id if len(session_id) <= 32 else session_id[:32] + "…"
         raise ProtocolError(
-            f"invalid session_id {session_id!r}: use 1-128 characters from [A-Za-z0-9_-]"
+            f"invalid session_id {shown!r}: use 1-128 characters from [A-Za-z0-9_-]"
         )
     return session_id
 

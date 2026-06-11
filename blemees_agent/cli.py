@@ -613,7 +613,12 @@ async def _oneshot_wait(
         remaining = deadline - loop.time()
         if remaining <= 0:
             raise _OneShotError(EXIT_OPEN_FAILED, f"timed out waiting for {types}")
-        line = await asyncio.wait_for(reader.readline(), timeout=remaining)
+        try:
+            line = await asyncio.wait_for(reader.readline(), timeout=remaining)
+        except TimeoutError as exc:
+            raise _OneShotError(EXIT_OPEN_FAILED, f"timed out waiting for {types}") from exc
+        except OSError as exc:
+            raise _OneShotError(EXIT_UNREACHABLE, f"connection lost: {exc}") from exc
         if not line:
             raise _OneShotError(EXIT_UNREACHABLE, "daemon closed the connection")
         try:

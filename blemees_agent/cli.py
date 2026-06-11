@@ -554,20 +554,27 @@ async def _oneshot_connect(
     except OSError as exc:
         raise _OneShotError(EXIT_UNREACHABLE, f"daemon unreachable at {path}: {exc}") from exc
     try:
-        writer.write(
-            (
-                json.dumps(
-                    {
-                        "type": "hello",
-                        "client": f"blemees-agentctl/{__version__}",
-                        "protocol": PROTOCOL_VERSION,
-                    }
-                )
-                + "\n"
-            ).encode()
-        )
-        await writer.drain()
-        line = await reader.readline()
+        try:
+            writer.write(
+                (
+                    json.dumps(
+                        {
+                            "type": "hello",
+                            "client": f"blemees-agentctl/{__version__}",
+                            "protocol": PROTOCOL_VERSION,
+                        }
+                    )
+                    + "\n"
+                ).encode()
+            )
+            await writer.drain()
+            # Bounded: a socket that accepts but never replies must exit 2,
+            # not hang (review feedback on #60).
+            line = await asyncio.wait_for(reader.readline(), timeout=10.0)
+        except TimeoutError as exc:
+            raise _OneShotError(EXIT_UNREACHABLE, "daemon did not answer hello") from exc
+        except OSError as exc:
+            raise _OneShotError(EXIT_UNREACHABLE, f"hello failed: {exc}") from exc
         if not line:
             raise _OneShotError(EXIT_UNREACHABLE, "daemon closed the connection during hello")
         try:
@@ -589,8 +596,11 @@ async def _oneshot_close(writer: asyncio.StreamWriter) -> None:
 
 
 async def _oneshot_send(writer: asyncio.StreamWriter, frame: dict[str, Any]) -> None:
-    writer.write((json.dumps(frame) + "\n").encode())
-    await writer.drain()
+    try:
+        writer.write((json.dumps(frame) + "\n").encode())
+        await writer.drain()
+    except OSError as exc:
+        raise _OneShotError(EXIT_UNREACHABLE, f"send failed: {exc}") from exc
 
 
 async def _oneshot_wait(
@@ -618,7 +628,10 @@ def _read_prompt(args: argparse.Namespace) -> str:
     if args.prompt is not None:
         return args.prompt
     if args.prompt_file is not None:
-        return Path(args.prompt_file).read_text(encoding="utf-8")
+        try:
+            return Path(args.prompt_file).read_text(encoding="utf-8")
+        except OSError as exc:
+            raise _OneShotError(EXIT_OPEN_FAILED, f"cannot read --prompt-file: {exc}") from exc
     if sys.stdin.isatty():
         raise _OneShotError(
             EXIT_OPEN_FAILED, "no prompt: pass --prompt/--prompt-file or pipe stdin"

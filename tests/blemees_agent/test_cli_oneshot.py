@@ -83,9 +83,8 @@ async def test_open_under_unknown_profile_exits_3(capsys):
 
 
 async def test_daemon_unreachable_exits_2(capsys):
-    rc = await _main_in_thread(
-        ["--socket", "/tmp/definitely-not-a-daemon.sock", "open", "--prompt", "hi"]
-    )
+    sock = short_socket_path("ctl-none")  # guaranteed absent, no daemon started
+    rc = await _main_in_thread(["--socket", str(sock), "open", "--prompt", "hi"])
     assert rc == EXIT_UNREACHABLE
     assert "unreachable" in capsys.readouterr().err
 
@@ -104,3 +103,11 @@ async def test_prompt_from_stdin(monkeypatch, capsys):
             monkeypatch.setattr(sys, "stdin", io.StringIO("finish\n"))
             rc = await _main_in_thread(["--socket", str(sock), "open"])
             assert rc == EXIT_OK
+
+
+async def test_unreadable_prompt_file_exits_3(capsys):
+    rc = await _main_in_thread(
+        ["--socket", "/tmp/irrelevant.sock", "open", "--prompt-file", "/nonexistent/prompt.txt"]
+    )
+    assert rc == EXIT_OPEN_FAILED
+    assert "prompt-file" in capsys.readouterr().err

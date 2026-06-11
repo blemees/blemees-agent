@@ -1290,6 +1290,25 @@ vars override. Env prefix: `BLEMEES_AGENTD_`.
 | `stderr_rate_window_s` | — | — | `10` |
 | `notify_webhook_url` | — | `BLEMEES_AGENTD_NOTIFY_WEBHOOK_URL` | none (global fallback for the notify webhook; per-profile `[profiles.<p>.notify] webhook_url` overrides) |
 
+#### Attention policy (per profile)
+
+Which events flip a detached session to `needs_attention` and fire the
+notify webhook is a per-profile choice (#51):
+
+```toml
+[profiles.batch.attention]
+triggers = ["permission_pending", "auth_required", "agent_crashed", "turn_complete"]
+```
+
+Unconfigured profiles use the default **blocked-only** set —
+`permission_pending`, `auth_required`, `agent_crashed` — i.e. the session
+cannot make progress without you. `turn_complete` (a turn finished while no
+owner was attached) is **opt-in** so push stays scarce; arm it for batch
+profiles whose runs you want to be paged about. Unknown trigger names are
+warn-skipped at load. A `session.open` may override the set for one session
+via `options.attention_triggers` (same names). Reattaching always clears
+`needs_attention`.
+
 A backend whose binary cannot be located at startup is simply omitted
 from the `agent.hello_ack.backends` map; the daemon serves whichever
 backends *are* available. Sessions for a missing backend fail with

@@ -20,6 +20,7 @@ from blemees_agent.protocol import (
     parse_line,
     parse_list,
     parse_open,
+    parse_permission_response,
     parse_ping,
     parse_profile_action,
     parse_profile_mutate,
@@ -346,3 +347,56 @@ def test_parse_profile_mutate_absent_name_falls_back_to_profile_name():
         {"type": "profile.create", "profile": {"name": "ok", "agent": {"agent_command": "x"}}}
     )
     assert msg.name == "ok"
+
+
+# ---------------------------------------------------------------------------
+# Session-id validation (#46)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "sid", ["7cc76e92-d44c-4623-b36e-ce7f6cb05749", "Sess_1-x", "a", "a" * 128]
+)
+def test_parse_open_accepts_valid_session_ids(sid):
+    msg = parse_open({"type": "session.open", "session_id": sid})
+    assert msg.session_id == sid
+
+
+@pytest.mark.parametrize("sid", ["../escape", "a/b", "/abs/path", "a b", "a.b", "naïve", "a" * 129])
+def test_parse_open_rejects_path_shaped_session_ids(sid):
+    # Session ids become state-dir path components (event log, usage
+    # sidecar) — "../"-shaped ids escaped the state dir for arbitrary file
+    # create/append/delete (#46).
+    with pytest.raises(ProtocolError, match="invalid session_id"):
+        parse_open({"type": "session.open", "session_id": sid})
+
+
+def test_all_session_verbs_share_the_validation():
+    # Every session_id-bearing verb (all go through _require_session_id).
+    for parse, frame in (
+        (parse_open, {"type": "session.open", "session_id": "../x"}),
+        (parse_prompt, {"type": "session.prompt", "session_id": "../x", "prompt": "hi"}),
+        (parse_cancel, {"type": "session.cancel", "session_id": "../x"}),
+        (parse_close, {"type": "session.close", "session_id": "../x"}),
+        (parse_attach, {"type": "session.attach", "session_id": "../x"}),
+        (parse_detach, {"type": "session.detach", "session_id": "../x"}),
+        (parse_session_info, {"type": "session.info", "session_id": "../x"}),
+        (
+            parse_permission_response,
+            {
+                "type": "session.permission_response",
+                "session_id": "../x",
+                "request_id": "r1",
+                "outcome": "cancelled",
+            },
+        ),
+    ):
+        with pytest.raises(ProtocolError, match="invalid session_id"):
+            parse(frame)
+
+
+def test_invalid_session_id_error_truncates_the_echoed_value():
+    with pytest.raises(ProtocolError) as ei:
+        parse_open({"type": "session.open", "session_id": "../" + "A" * 500})
+    assert len(str(ei.value)) < 200
+    assert "…" in str(ei.value)

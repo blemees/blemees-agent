@@ -105,10 +105,24 @@ def _opt_str_id(obj: dict[str, Any]) -> str | None:
     return req_id
 
 
+# Session ids become filesystem path components (durable event log, usage
+# sidecar — mkdir/append/unlink on close{delete}), so the charset is
+# conservative (#46). Client-generated UUIDs fit comfortably; 128 leaves
+# room for prefixed schemes.
+_SESSION_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,128}")
+
+
 def _require_session_id(obj: dict[str, Any], verb: str) -> str:
     session_id = obj.get("session_id")
     if not isinstance(session_id, str) or not session_id:
         raise ProtocolError(f"{verb} requires non-empty 'session_id'")
+    if not _SESSION_ID_RE.fullmatch(session_id):
+        # Truncate the echoed id — don't reflect arbitrarily large
+        # attacker-supplied strings back into error frames and logs.
+        shown = session_id if len(session_id) <= 32 else session_id[:32] + "…"
+        raise ProtocolError(
+            f"invalid session_id {shown!r}: use 1-128 characters from [A-Za-z0-9_-]"
+        )
     return session_id
 
 

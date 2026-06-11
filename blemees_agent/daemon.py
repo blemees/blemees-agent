@@ -401,9 +401,19 @@ class Connection:
         sess.attention_triggers = set(profile.attention_triggers)
         override = (msg.options or {}).get("attention_triggers")
         if isinstance(override, list):
-            sess.attention_triggers = {
-                t for t in override if isinstance(t, str) and t in KNOWN_TRIGGERS
-            }
+            armed: set[str] = set()
+            for t in override:
+                if isinstance(t, str) and t in KNOWN_TRIGGERS:
+                    armed.add(t)
+                else:
+                    # Same warn-skip safety as profile config — a typo must
+                    # not silently disarm the rest (review feedback on #57).
+                    self._log.warning(
+                        "session.unknown_attention_trigger",
+                        session_id=msg.session_id,
+                        trigger=str(t),
+                    )
+            sess.attention_triggers = armed
 
         # On resume, rehydrate the agent's prior session via session/load (#23).
         # The prior agent session id comes from the live session or, across a

@@ -153,9 +153,13 @@ async def test_fire_survives_caller_cancellation():
 
     async def doomed():
         await svc.fire(reason=AGENT_CRASHED, profile="p", session_id="s1", detail="d")
+        await asyncio.sleep(60)  # keep the caller alive so the cancel bites
 
     task = asyncio.create_task(doomed())
-    await task  # fire() returns without awaiting the sinks
+    await asyncio.sleep(0)  # let fire() schedule the dispatch task
     task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert task.cancelled()
     await asyncio.gather(*svc._tasks)
     assert sink.seen and sink.seen[0].session_id == "s1"

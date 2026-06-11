@@ -170,12 +170,24 @@ class NotifyService:
             ts_ms=self.now_ms(),
         )
         self._outstanding[session_id] = notification
+        if not self.sinks:
+            return notification
         # Fire-and-forget on a service-owned task — sinks are best-effort and
         # must never block or die with the trigger that fired them.
         task = asyncio.create_task(self._dispatch(notification))
         self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        task.add_done_callback(self._reap)
         return notification
+
+    def _reap(self, task: asyncio.Task) -> None:
+        """Drop a finished dispatch task and surface unexpected crashes
+        instead of relying on the never-retrieved warning."""
+        self._tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None and self.logger is not None:
+            self.logger.warning("notify.dispatch_crashed", error=repr(exc))
 
     async def test(
         self, *, profile: str, session_id: str = "notify-test", detail: str = "test event"

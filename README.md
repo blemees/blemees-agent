@@ -1307,7 +1307,7 @@ The webhook can render a readable phone notification on a stock
 [ntfy](https://ntfy.sh) topic with zero middleware (#52):
 
 ```toml
-notify_webhook_url = "https://ntfy.sh/my-blemees-alerts"   # pick a private topic name
+notify_webhook_url = "https://ntfy.sh/my-blemees-alerts"   # hard-to-guess topic: ntfy.sh topics are public to anyone who knows the name (self-host or use access tokens for confidentiality)
 notify_webhook_format = "ntfy"   # env: BLEMEES_AGENTD_NOTIFY_FORMAT; per profile: [profiles.<p>.notify] format = "ntfy"
 ```
 

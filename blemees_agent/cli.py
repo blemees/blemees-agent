@@ -528,6 +528,147 @@ async def repl(initial_connect: bool, socket_path: str | None) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# One-shot (non-interactive) mode (#53) — the dispatch tracer's foundation.
+# The northbound envelope stays a private, version-locked contract; agentctl
+# is in-repo, so scripting rides here rather than a public API.
+# ---------------------------------------------------------------------------
+
+EXIT_OK = 0
+EXIT_UNREACHABLE = 2  # daemon socket absent / hello failed
+EXIT_OPEN_FAILED = 3  # daemon reachable but session.open / prompt was refused
+
+
+class _OneShotError(RuntimeError):
+    def __init__(self, exit_code: int, message: str) -> None:
+        super().__init__(message)
+        self.exit_code = exit_code
+
+
+async def _oneshot_connect(
+    socket_path: str | None,
+) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    path = socket_path or default_socket_path()
+    try:
+        reader, writer = await asyncio.open_unix_connection(path)
+    except OSError as exc:
+        raise _OneShotError(EXIT_UNREACHABLE, f"daemon unreachable at {path}: {exc}") from exc
+    writer.write(
+        (
+            json.dumps(
+                {"type": "hello", "client": f"agentctl/{__version__}", "protocol": PROTOCOL_VERSION}
+            )
+            + "\n"
+        ).encode()
+    )
+    await writer.drain()
+    ack = json.loads(await reader.readline())
+    if ack.get("type") != "hello_ack":
+        raise _OneShotError(EXIT_UNREACHABLE, f"unexpected hello reply: {ack}")
+    return reader, writer
+
+
+async def _oneshot_send(writer: asyncio.StreamWriter, frame: dict[str, Any]) -> None:
+    writer.write((json.dumps(frame) + "\n").encode())
+    await writer.drain()
+
+
+async def _oneshot_wait(
+    reader: asyncio.StreamReader, types: tuple[str, ...], *, timeout: float = 60.0
+) -> dict[str, Any]:
+    """Read frames until one of ``types`` or an ``error`` arrives."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise _OneShotError(EXIT_OPEN_FAILED, f"timed out waiting for {types}")
+        line = await asyncio.wait_for(reader.readline(), timeout=remaining)
+        if not line:
+            raise _OneShotError(EXIT_UNREACHABLE, "daemon closed the connection")
+        frame = json.loads(line)
+        if frame.get("type") in types or frame.get("type") == "error":
+            return frame
+
+
+def _read_prompt(args: argparse.Namespace) -> str:
+    if args.prompt is not None:
+        return args.prompt
+    if args.prompt_file is not None:
+        return Path(args.prompt_file).read_text(encoding="utf-8")
+    if sys.stdin.isatty():
+        raise _OneShotError(
+            EXIT_OPEN_FAILED, "no prompt: pass --prompt/--prompt-file or pipe stdin"
+        )
+    return sys.stdin.read()
+
+
+async def cmd_open(args: argparse.Namespace) -> int:
+    """Open a session, submit the prompt, detach, print the session id."""
+    prompt = _read_prompt(args)
+    if not prompt.strip():
+        print("error: empty prompt", file=sys.stderr)
+        return EXIT_OPEN_FAILED
+    sid = str(uuid.uuid4())
+    reader, writer = await _oneshot_connect(args.socket)
+    try:
+        open_frame: dict[str, Any] = {
+            "type": "session.open",
+            "id": "o1",
+            "session_id": sid,
+            "options": {"cwd": args.cwd} if args.cwd else {},
+        }
+        if args.profile:
+            open_frame["profile"] = args.profile
+        if args.agent:
+            open_frame["agent"] = args.agent
+        if args.title:
+            open_frame["alias"] = args.title
+        await _oneshot_send(writer, open_frame)
+        reply = await _oneshot_wait(reader, ("session.opened",))
+        if reply.get("type") == "error":
+            print(f"error: {reply.get('code')}: {reply.get('message')}", file=sys.stderr)
+            return EXIT_OPEN_FAILED
+        await _oneshot_send(writer, {"type": "session.prompt", "session_id": sid, "prompt": prompt})
+        # Explicit detach (rather than a bare disconnect) so the daemon logs a
+        # deliberate hand-off; the turn keeps running detached.
+        await _oneshot_send(writer, {"type": "session.detach", "id": "d1", "session_id": sid})
+        reply = await _oneshot_wait(reader, ("session.detached",), timeout=10.0)
+        if reply.get("type") == "error":
+            print(f"error: {reply.get('code')}: {reply.get('message')}", file=sys.stderr)
+            return EXIT_OPEN_FAILED
+    finally:
+        writer.close()
+    print(sid)
+    return EXIT_OK
+
+
+async def cmd_list(args: argparse.Namespace) -> int:
+    """Print the daemon's sessions as JSON (registry-backed, all profiles)."""
+    reader, writer = await _oneshot_connect(args.socket)
+    try:
+        frame: dict[str, Any] = {"type": "session.list", "id": "l1"}
+        if args.cwd:
+            frame["cwd"] = args.cwd
+        await _oneshot_send(writer, frame)
+        reply = await _oneshot_wait(reader, ("sessions",), timeout=10.0)
+        if reply.get("type") == "error":
+            print(f"error: {reply.get('code')}: {reply.get('message')}", file=sys.stderr)
+            return EXIT_OPEN_FAILED
+        print(json.dumps(reply.get("sessions", []), indent=None))
+    finally:
+        writer.close()
+    return EXIT_OK
+
+
+def _run_oneshot(coro: Any) -> int:
+    try:
+        return asyncio.run(coro)
+    except _OneShotError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return exc.exit_code
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="blemees-agentctl",
@@ -540,11 +681,31 @@ def main(argv: list[str] | None = None) -> int:
         help="Start the REPL without auto-connecting",
     )
     parser.add_argument("--version", action="store_true")
+    sub = parser.add_subparsers(dest="cmd")
+    p_open = sub.add_parser(
+        "open", help="one-shot: open a session, submit a prompt, detach, print the id (#53)"
+    )
+    p_open.add_argument("--profile", help="profile to open under (default: daemon default)")
+    p_open.add_argument("--agent", help="agent within the profile (default: profile default)")
+    p_open.add_argument("--cwd", help="session working directory")
+    p_open.add_argument("--title", help="session alias shown in clients")
+    p_open.add_argument("--prompt", "-p", help="prompt text")
+    p_open.add_argument("--prompt-file", help="read the prompt from a file (stdin if neither)")
+    p_list = sub.add_parser("list", help="one-shot: print sessions as JSON")
+    p_list.add_argument("--cwd", help="filter to one working directory")
+    p_list.add_argument(
+        "--json", action="store_true", help="machine output (the default; flag kept for clarity)"
+    )
     args = parser.parse_args(argv)
 
     if args.version:
         print(f"blemees-agentctl {__version__}")
         return 0
+
+    if args.cmd == "open":
+        return _run_oneshot(cmd_open(args))
+    if args.cmd == "list":
+        return _run_oneshot(cmd_list(args))
 
     try:
         return asyncio.run(repl(not args.no_connect, args.socket))

@@ -188,7 +188,8 @@ async def test_ntfy_format_renders_plaintext_with_headers():
     url, body, headers = posted[0]
     text = body.decode()
     assert "Run a command" in text
-    assert "dev" in text and "s-12345678" in text
+    assert "dev" in text and "s-12345678" in text  # full session id
+    assert "reason: permission_pending" in text
     assert headers["Title"] == "blemees: permission needed"
     assert headers["Priority"] == "high"  # blocked reason needs the owner
     assert headers["Content-Type"].startswith("text/plain")

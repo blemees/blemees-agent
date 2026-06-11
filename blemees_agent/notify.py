@@ -138,7 +138,9 @@ class WebhookSink:
         ``webhook_url`` at ``https://ntfy.sh/<topic>`` and you're done.
         """
         if self._resolve_format(n.profile) == "ntfy":
-            body = f"{n.detail}\n\nprofile: {n.profile} · session: {n.session_id[:12]}".encode()
+            body = (
+                f"{n.detail}\n\nreason: {n.reason}\nprofile: {n.profile}\nsession: {n.session_id}"
+            ).encode()
             headers = {
                 "Content-Type": "text/plain; charset=utf-8",
                 "Title": n.title,

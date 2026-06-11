@@ -1308,7 +1308,7 @@ The webhook can render a readable phone notification on a stock
 
 ```toml
 notify_webhook_url = "https://ntfy.sh/my-blemees-alerts"   # pick a private topic name
-notify_webhook_format = "ntfy"                              # or per profile: [profiles.<p>.notify] format = "ntfy"
+notify_webhook_format = "ntfy"   # env: BLEMEES_AGENTD_NOTIFY_FORMAT; per profile: [profiles.<p>.notify] format = "ntfy"
 ```
 
 1. Subscribe to the topic in the ntfy app (or `ntfy subscribe my-blemees-alerts`).
@@ -1317,12 +1317,15 @@ notify_webhook_format = "ntfy"                              # or per profile: [p
    ```bash
    python3 - <<'PY'
    import json, socket
-   s = socket.socket(socket.AF_UNIX); s.connect("/tmp/blemees-agentd-$(id -u).sock".replace("$(id -u)", str(__import__("os").getuid())))
+   from blemees_agent.config import default_socket_path  # resolves the platform default
+   s = socket.socket(socket.AF_UNIX); s.connect(default_socket_path())
    for f in ({"type": "hello", "client": "t", "protocol": "blemees/3"}, {"type": "notify.test", "id": "t1"}):
        s.sendall((json.dumps(f) + "\n").encode())
    print(s.recv(65536).decode())
    PY
    ```
+
+   (If the daemon runs on a custom `--socket`, connect to that path instead.)
 
 3. Your phone shows "blemees: test notification". Real triggers follow the
    profile's attention policy above: blocked reasons arrive as

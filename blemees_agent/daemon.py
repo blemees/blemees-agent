@@ -454,7 +454,7 @@ class Connection:
             profile=profile.name,
             agent=agent.name,
             native_session_id=sess.native_session_id,
-            cwd=msg.options.get("cwd") or agent.cwd,
+            cwd=msg.options.get("cwd") or agent.agent_home,
             model=agent.model,
             view_only=bool(sess.extra.get("view_only", False)),
         )

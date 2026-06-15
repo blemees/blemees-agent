@@ -223,7 +223,7 @@ class AcpAgentProcess:
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
-                    cwd=self.agent.cwd or None,
+                    cwd=self.agent.agent_home or None,
                     env=self._env,
                 )
             except (OSError, ValueError) as exc:
@@ -297,7 +297,7 @@ class AcpAgentProcess:
         await self.ensure_started()
         try:
             ns = await self._conn.new_session(
-                cwd=cwd or self.agent.cwd or ".",
+                cwd=cwd or self.agent.agent_home or ".",
                 mcp_servers=_mcp_servers(self.agent),
             )
         except acp.RequestError as exc:
@@ -328,7 +328,7 @@ class AcpAgentProcess:
         self.sessions[native_session_id] = st
         try:
             await self._conn.load_session(
-                cwd=cwd or self.agent.cwd or ".",
+                cwd=cwd or self.agent.agent_home or ".",
                 session_id=native_session_id,
                 mcp_servers=_mcp_servers(self.agent),
             )

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from blemees_agent.logging import configure
@@ -55,6 +57,9 @@ async def test_fire_records_outstanding_and_dispatches():
     n = await svc.fire(reason=AGENT_CRASHED, profile="claude", session_id="s1", detail="boom")
     assert n.reason == "agent_crashed"
     assert [p["session_id"] for p in svc.outstanding()] == ["s1"]
+    # Dispatch rides a service-owned task (decoupled from the caller, #51) —
+    # drain it before observing sink emissions.
+    await asyncio.gather(*svc._tasks)
     assert sink.seen[0].session_id == "s1"
 
 
@@ -88,6 +93,7 @@ async def test_sink_failure_is_swallowed():
     svc = _svc(_BoomSink(), good)
     # A failing sink must not prevent other sinks or break fire().
     await svc.fire(reason=AGENT_CRASHED, profile="p", session_id="s1", detail="d")
+    await asyncio.gather(*svc._tasks)
     assert good.seen[0].session_id == "s1"
     assert svc.outstanding()  # still recorded
 
@@ -101,7 +107,7 @@ async def test_webhook_posts_to_resolved_url():
     sink = WebhookSink(
         resolve_url=lambda profile: {"claude": "https://hook/claude"}.get(profile),
         logger=LOG,
-        post=lambda url, body: posted.append((url, body)),
+        post=lambda url, body, headers: posted.append((url, body)),
     )
     await sink.emit(
         Notification(
@@ -119,7 +125,7 @@ async def test_webhook_posts_to_resolved_url():
 async def test_webhook_skips_when_no_url():
     posted: list[tuple[str, bytes]] = []
     sink = WebhookSink(
-        resolve_url=lambda profile: None, logger=LOG, post=lambda u, b: posted.append((u, b))
+        resolve_url=lambda profile: None, logger=LOG, post=lambda u, b, h: posted.append((u, b))
     )
     await sink.emit(
         Notification(reason=PERMISSION_PENDING, profile="x", session_id="s", detail="d", ts_ms=1)
@@ -128,7 +134,7 @@ async def test_webhook_skips_when_no_url():
 
 
 async def test_webhook_post_failure_is_swallowed():
-    def boom(url, body):
+    def boom(url, body, headers):
         raise OSError("connection refused")
 
     sink = WebhookSink(resolve_url=lambda p: "https://hook", logger=LOG, post=boom)
@@ -136,3 +142,87 @@ async def test_webhook_post_failure_is_swallowed():
     await sink.emit(
         Notification(reason=AGENT_CRASHED, profile="p", session_id="s", detail="d", ts_ms=1)
     )
+
+
+async def test_fire_survives_caller_cancellation():
+    # The trigger may fire from a task that is cancelled immediately after
+    # (the backend pump during a post-turn soft-kill, #51) — the dispatch
+    # must complete anyway.
+    sink = _RecordingSink()
+    svc = _svc(sink)
+
+    async def doomed():
+        await svc.fire(reason=AGENT_CRASHED, profile="p", session_id="s1", detail="d")
+        await asyncio.sleep(60)  # keep the caller alive so the cancel bites
+
+    task = asyncio.create_task(doomed())
+    await asyncio.sleep(0)  # let fire() schedule the dispatch task
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert task.cancelled()
+    await asyncio.gather(*svc._tasks)
+    assert sink.seen and sink.seen[0].session_id == "s1"
+
+
+# ---- ntfy format (#52) -----------------------------------------------
+
+
+async def test_ntfy_format_renders_plaintext_with_headers():
+    posted: list[tuple[str, bytes, dict]] = []
+    sink = WebhookSink(
+        resolve_url=lambda p: "https://ntfy.sh/my-topic",
+        resolve_format=lambda p: "ntfy",
+        logger=LOG,
+        post=lambda u, b, h: posted.append((u, b, h)),
+    )
+    await sink.emit(
+        Notification(
+            reason=PERMISSION_PENDING,
+            profile="dev",
+            session_id="s-12345678",
+            detail="Run a command",
+            ts_ms=1,
+        )
+    )
+    url, body, headers = posted[0]
+    text = body.decode()
+    assert "Run a command" in text
+    assert "dev" in text and "s-12345678" in text  # full session id
+    assert "reason: permission_pending" in text
+    assert headers["Title"] == "blemees: permission needed"
+    assert headers["Priority"] == "high"  # blocked reason needs the owner
+    assert headers["Content-Type"].startswith("text/plain")
+
+
+async def test_ntfy_format_turn_complete_is_default_priority():
+    posted: list[tuple[str, bytes, dict]] = []
+    sink = WebhookSink(
+        resolve_url=lambda p: "https://ntfy.sh/t",
+        resolve_format=lambda p: "ntfy",
+        logger=LOG,
+        post=lambda u, b, h: posted.append((u, b, h)),
+    )
+    from blemees_agent.notify import TURN_COMPLETE
+
+    await sink.emit(
+        Notification(reason=TURN_COMPLETE, profile="batch", session_id="s", detail="d", ts_ms=1)
+    )
+    assert posted[0][2]["Priority"] == "default"
+
+
+async def test_json_format_is_unchanged_default():
+    posted: list[tuple[str, bytes, dict]] = []
+    sink = WebhookSink(
+        resolve_url=lambda p: "https://hook/x",
+        logger=LOG,
+        post=lambda u, b, h: posted.append((u, b, h)),
+    )
+    await sink.emit(
+        Notification(reason=PERMISSION_PENDING, profile="p", session_id="s", detail="d", ts_ms=1)
+    )
+    url, body, headers = posted[0]
+    import json
+
+    assert json.loads(body)["type"] == "blemees.notify"
+    assert headers["Content-Type"] == "application/json"

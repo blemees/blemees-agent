@@ -31,7 +31,7 @@ def webhook_posts(monkeypatch):
     at construction)."""
     posts: list[tuple[str, dict]] = []
 
-    def fake_post(self, url, body):
+    def fake_post(self, url, body, headers):
         posts.append((url, json.loads(body)))
 
     monkeypatch.setattr(WebhookSink, "_http_post", fake_post)
@@ -209,3 +209,68 @@ async def test_webhook_url_resolution_prefers_profile_then_global():
     assert sup.webhook_url_for("withhook") == "https://profile"  # profile wins
     assert sup.webhook_url_for("nohook") == "https://global"  # falls back to global
     assert sup.webhook_url_for("unknown") == "https://global"  # unknown → global
+
+
+# ---- per-profile attention policy (#51) ------------------------------
+
+
+async def test_turn_complete_fires_for_opted_in_profile(webhook_posts):
+    sock = short_socket_path("blemeesd-notify5")
+    profiles = {
+        "watch": {
+            "agent_command": sys.executable,
+            "agent_args": [FAKE_ACP],
+            "attention": {"triggers": ["turn_complete"]},
+        }
+    }
+    with socket_cleanup(sock):
+        async with _daemon(sock, profiles=profiles):
+            c1 = await _connect(sock)
+            await c1.send(
+                {"type": "session.open", "id": "o", "session_id": "s-watch", "profile": "watch"}
+            )
+            await c1.wait_for(lambda e: e.get("type") == "session.opened")
+            # "finish" streams a chunk then completes ~0.5s later — drop the
+            # owner mid-turn so the result lands while detached.
+            await c1.send({"type": "session.prompt", "session_id": "s-watch", "prompt": "finish"})
+            await c1.wait_for(lambda e: e.get("type") == "session.update", timeout=10.0)
+            await c1.close()
+
+            c2 = await _connect(sock)
+            try:
+                reply = await _poll_status(c2, lambda r: r.get("attention"))
+                assert reply["attention"][0]["reason"] == "turn_complete"
+                assert reply["attention"][0]["session_id"] == "s-watch"
+            finally:
+                await c2.close()
+    assert webhook_posts, "expected a webhook POST for the opted-in profile"
+    assert webhook_posts[0][1]["reason"] == "turn_complete"
+
+
+async def test_turn_complete_override_via_open_options(webhook_posts):
+    # The default profile is blocked-only, but session.open can arm
+    # turn_complete for just this session (#51).
+    sock = short_socket_path("blemeesd-notify6")
+    with socket_cleanup(sock):
+        async with _daemon(sock):
+            c1 = await _connect(sock)
+            await c1.send(
+                {
+                    "type": "session.open",
+                    "id": "o",
+                    "session_id": "s-once",
+                    "options": {"attention_triggers": ["turn_complete", "permission_pending"]},
+                }
+            )
+            await c1.wait_for(lambda e: e.get("type") == "session.opened")
+            await c1.send({"type": "session.prompt", "session_id": "s-once", "prompt": "finish"})
+            await c1.wait_for(lambda e: e.get("type") == "session.update", timeout=10.0)
+            await c1.close()
+
+            c2 = await _connect(sock)
+            try:
+                reply = await _poll_status(c2, lambda r: r.get("attention"))
+                assert reply["attention"][0]["reason"] == "turn_complete"
+            finally:
+                await c2.close()
+    assert webhook_posts and webhook_posts[0][1]["reason"] == "turn_complete"

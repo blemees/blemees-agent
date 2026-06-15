@@ -1290,6 +1290,59 @@ vars override. Env prefix: `BLEMEES_AGENTD_`.
 | `stderr_rate_window_s` | — | — | `10` |
 | `notify_webhook_url` | — | `BLEMEES_AGENTD_NOTIFY_WEBHOOK_URL` | none (global fallback for the notify webhook; per-profile `[profiles.<p>.notify] webhook_url` overrides) |
 
+#### Attention policy (per profile)
+
+Which events flip a detached session to `needs_attention` and fire the
+notify webhook is a per-profile choice (#51):
+
+```toml
+[profiles.batch.attention]
+triggers = ["permission_pending", "auth_required", "agent_crashed", "turn_complete"]
+```
+
+Unconfigured profiles use the default **blocked-only** set —
+`permission_pending`, `auth_required`, `agent_crashed` — i.e. the session
+cannot make progress without you. `turn_complete` (a turn finished while no
+owner was attached) is **opt-in** so push stays scarce; arm it for batch
+profiles whose runs you want to be paged about. Unknown trigger names are
+warn-skipped at load. A `session.open` may override the set for one session
+via `options.attention_triggers` (same names). Reattaching always clears
+`needs_attention`.
+
+#### Phone notifications via ntfy (end to end)
+
+The webhook can render a readable phone notification on a stock
+[ntfy](https://ntfy.sh) topic with zero middleware (#52):
+
+```toml
+notify_webhook_url = "https://ntfy.sh/my-blemees-alerts"   # hard-to-guess topic: ntfy.sh topics are public to anyone who knows the name (self-host or use access tokens for confidentiality)
+notify_webhook_format = "ntfy"   # env: BLEMEES_AGENTD_NOTIFY_FORMAT; per profile: [profiles.<p>.notify] format = "ntfy"
+```
+
+1. Subscribe to the topic in the ntfy app (or `ntfy subscribe my-blemees-alerts`).
+2. Restart the daemon and fire a test notification over the wire:
+
+   ```bash
+   python3 - <<'PY'
+   import json, socket
+   from blemees_agent.config import default_socket_path  # resolves the platform default
+   s = socket.socket(socket.AF_UNIX); s.connect(default_socket_path())
+   for f in ({"type": "hello", "client": "t", "protocol": "blemees/3"}, {"type": "notify.test", "id": "t1"}):
+       s.sendall((json.dumps(f) + "\n").encode())
+   print(s.recv(65536).decode())
+   PY
+   ```
+
+   (If the daemon runs on a custom `--socket`, connect to that path instead.)
+
+3. Your phone shows "blemees: test notification". Real triggers follow the
+   profile's attention policy above: blocked reasons arrive as
+   high-priority, `turn_complete` as default-priority.
+
+The default `format = "json"` keeps the documented `blemees.notify` JSON
+payload for Slack/Discord/custom receivers.
+
+
 A backend whose binary cannot be located at startup is simply omitted
 from the `agent.hello_ack.backends` map; the daemon serves whichever
 backends *are* available. Sessions for a missing backend fail with

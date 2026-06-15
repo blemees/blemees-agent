@@ -36,7 +36,7 @@ class Config:
     agent_command: str = "claude-agent-acp"
     agent_args: list[str] = dataclasses.field(default_factory=list)
     # Named profiles from the config file's [profiles.<name>] tables (#17).
-    # Each value is a raw dict (agent_command/agent_args/model/mode/cwd/
+    # Each value is a raw dict (agent_command/agent_args/model/mode/agent_home/
     # mcp_servers/env); the Supervisor builds Profile objects from these
     # plus a synthesised "default" profile from agent_command/agent_args.
     profiles: dict[str, Any] = dataclasses.field(default_factory=dict)

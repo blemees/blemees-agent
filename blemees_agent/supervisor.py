@@ -5,7 +5,7 @@ The model is **Profile → Agent → Session**:
 * A **Profile** is a named container of one or more **Agents** (plus, later,
   profile-level permission policy / notify config — #20 / #24).
 * An **Agent** is an independently-configured ACP agent (its own binary, CLI
-  args, model/mode, cwd, MCP servers, env). Two agents in a profile may even
+  args, model/mode, agent_home, MCP servers, env). Two agents in a profile may even
   be the same vendor with different configs. Each agent is the unit of
   process supervision: the daemon runs at most one
   :class:`~blemees_agent.backends.acp.AcpAgentProcess` per agent, lazily
@@ -53,7 +53,11 @@ class Agent:
     args: list[str] = dataclasses.field(default_factory=list)
     model: str | None = None
     mode: str | None = None
-    cwd: str | None = None
+    # The agent process's home directory — where the ACP subprocess is
+    # spawned. Distinct from a session's ``cwd`` (the per-session working
+    # directory, supplied on ``session.open``): one agent_home can serve
+    # sessions in many different cwds.
+    agent_home: str | None = None
     mcp_servers: list[dict[str, Any]] = dataclasses.field(default_factory=list)
     env: dict[str, str] = dataclasses.field(default_factory=dict)
 
@@ -89,7 +93,7 @@ def _agent_from_spec(name: str, spec: dict[str, Any], fallback_command: str) -> 
         args=list(spec.get("agent_args") or spec.get("args") or []),
         model=spec.get("model"),
         mode=spec.get("mode"),
-        cwd=spec.get("cwd"),
+        agent_home=spec.get("agent_home"),
         mcp_servers=list(spec.get("mcp_servers") or []),
         env=dict(spec.get("env") or {}),
     )
@@ -241,7 +245,7 @@ class Supervisor:
         return AcpSessionHandle(
             process=proc,
             on_event=on_event,
-            cwd=cwd or agent.cwd,
+            cwd=cwd,
             on_close=self._on_session_close,
             permission_cb=permission_cb,
             resume_native_id=resume_native_id,

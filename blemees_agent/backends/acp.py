@@ -52,6 +52,13 @@ if TYPE_CHECKING:
 # (``acp.RequestError.auth_required``); see #24.
 _ACP_AUTH_REQUIRED_CODE = -32000
 
+# StreamReader buffer for the agent's stdout. ACP frames are newline-delimited
+# JSON, and a single frame (a big tool result, file read, diff, or base64
+# image) routinely exceeds asyncio's 64 KiB default — which makes
+# ``readline()`` raise ``LimitOverrunError`` and kills the receive loop,
+# surfacing as a spurious ``agent_crashed``. 16 MiB gives ample headroom.
+_STDIO_BUFFER_LIMIT = 16 * 1024 * 1024
+
 
 def _translate_request_error(exc: Exception) -> Exception:
     """Map an ACP auth rejection to :class:`AuthRequiredError`, else passthrough.
@@ -225,6 +232,7 @@ class AcpAgentProcess:
                     stderr=asyncio.subprocess.PIPE,
                     cwd=self.agent.agent_home or None,
                     env=self._env,
+                    limit=_STDIO_BUFFER_LIMIT,
                 )
             except (OSError, ValueError) as exc:
                 raise SpawnFailedError(

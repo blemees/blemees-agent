@@ -233,6 +233,67 @@ async def test_delete_profile_with_live_session_rejected(state_dir):
                 await c.close()
 
 
+async def test_update_profile_with_live_session_rejected(state_dir):
+    # #47: update must not stop a profile's agent out from under a live session
+    # (which would cancel in-flight turns with no terminal frame). Mirror the
+    # delete guard — refuse with profile_in_use until the session is closed.
+    sock = short_socket_path("blemeesd-pc5b")
+    with socket_cleanup(sock):
+        async with _daemon(state_dir, sock):
+            c = await _connect(sock)
+            try:
+                await c.send(
+                    {
+                        "type": "profile.create",
+                        "id": "c",
+                        "profile": {
+                            "name": "mine",
+                            "agent": {"agent_command": GOOD, "args": [FAKE_ACP]},
+                        },
+                    }
+                )
+                await c.wait_for(lambda e: e.get("type") == "profile.created")
+                await c.send(
+                    {
+                        "type": "session.open",
+                        "id": "o",
+                        "session_id": "s1",
+                        "profile": "mine",
+                        "options": {},
+                    }
+                )
+                await c.wait_for(lambda e: e.get("type") == "session.opened")
+
+                await c.send(
+                    {
+                        "type": "profile.update",
+                        "id": "u",
+                        "name": "mine",
+                        "profile": {"agent": {"agent_command": GOOD}, "model": "opus"},
+                    }
+                )
+                err = await c.wait_for(lambda e: e.get("type") == "error")
+                assert err["code"] == "profile_in_use"
+                assert err["id"] == "u"
+
+                # After closing the session, update succeeds.
+                await c.send(
+                    {"type": "session.close", "id": "x", "session_id": "s1", "delete": True}
+                )
+                await c.wait_for(lambda e: e.get("type") == "session.closed")
+                await c.send(
+                    {
+                        "type": "profile.update",
+                        "id": "u2",
+                        "name": "mine",
+                        "profile": {"agent": {"agent_command": GOOD}, "model": "opus"},
+                    }
+                )
+                await c.wait_for(lambda e: e.get("type") == "profile.updated")
+            finally:
+                await c.close()
+
+
 # ---- agent_unavailable ----------------------------------------------
 
 

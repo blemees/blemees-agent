@@ -25,7 +25,7 @@ classifiers = [
 # NOTE (blemees/3 ACP migration, #15 spike): the daemon is no longer
 # stdlib-only. It acts as an ACP client via the official Python SDK.
 dependencies = [
-    "agent-client-protocol>=0.10",
+    "agent-client-protocol>=0.10,<0.12",
 ]
 
 [project.scripts]
@@ -41,7 +41,7 @@ dev = [
     "pytest>=7",
     "pytest-asyncio>=0.23",
     "jsonschema>=4.20",
-    "ruff>=0.6",
+    "ruff==0.17.1",
 ]
 
 [tool.setuptools.packages.find]

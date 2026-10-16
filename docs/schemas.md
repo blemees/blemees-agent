@@ -19,9 +19,9 @@ installed clients validate frames without copying JSON anywhere:
 ```python
 from blemees_agent.schemas import load, iter_schemas, files
 
-opened = load("outbound/session.opened.json")   # parsed dict
-all_frames = list(iter_schemas())                # every shipped schema
-root = files()                                   # importlib.resources Traversable
+opened = load("outbound/session.opened.json")  # parsed dict
+all_frames = list(iter_schemas())  # every shipped schema
+root = files()  # importlib.resources Traversable
 ```
 
 ## Layout
@@ -61,6 +61,7 @@ store = {s["$id"]: s for s in iter_schemas()}
 registry = Registry().with_resources(
     [(uri, Resource.from_contents(schema)) for uri, schema in store.items()]
 )
+
 
 def validate(frame_type: str, frame: dict, direction: str = "inbound") -> None:
     url = f"https://blemees/schemas/{direction}/{frame_type}.json"

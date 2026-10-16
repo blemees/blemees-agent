@@ -21,9 +21,9 @@ jobs:
         with:
           python-version: "3.12"
       - name: ruff check
-        run: uvx --from "ruff>=0.6" ruff check .
+        run: uvx --from "ruff==0.17.1" ruff check .
       - name: ruff format --check
-        run: uvx --from "ruff>=0.6" ruff format --check .
+        run: uvx --from "ruff==0.17.1" ruff format --check .
 
   test:
     name: Test — py ${{ matrix.python }} on ${{ matrix.os }}

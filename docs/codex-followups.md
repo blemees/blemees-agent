@@ -182,9 +182,10 @@ def _rollout_cwd(sc: dict) -> str | None:
             return os.path.realpath(v).rstrip("/")
     return None
 
+
 def _cwd_matches(rollout_cwd: str | None, requested: str) -> bool:
     if rollout_cwd is None:
-        return True   # don't hide rollouts with unknown cwd
+        return True  # don't hide rollouts with unknown cwd
     return rollout_cwd == os.path.realpath(requested).rstrip("/")
 ```
 

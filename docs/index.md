@@ -36,6 +36,7 @@ Drive it with the reference client:
 import asyncio, uuid
 from blemees.client import BlemeesClient
 
+
 async def main():
     async with await BlemeesClient.connect() as c:
         async with c.open_session(
@@ -48,6 +49,7 @@ async def main():
             async for evt in sess.events():
                 if evt.get("type") == "claude.result":
                     break
+
 
 asyncio.run(main())
 ```

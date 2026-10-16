@@ -921,14 +921,31 @@ class Connection:
         self._supervisor.create_profile(msg.name, msg.profile)
         await self._emit_frame({"type": "profile.created", "id": msg.id, "name": msg.name})
 
+    def _live_sessions_for_profile(self, name: str) -> list:
+        """Sessions (attached or detached) still bound to a profile."""
+        return [s for s in self._sessions._sessions.values() if s.profile_name == name]
+
     async def _handle_profile_update(self, msg) -> None:
+        # Refuse to update a profile that still has live sessions (#47): the
+        # update path stops the profile's agent processes to respawn with the
+        # new config, which would cancel in-flight turns with no terminal frame
+        # and orphan detached sessions. Mirror the profile.delete guard — the
+        # client must close them first.
+        live = self._live_sessions_for_profile(msg.name)
+        if live:
+            await self._emit_error(
+                PROFILE_IN_USE,
+                f"profile {msg.name!r} has {len(live)} live session(s); close them first",
+                id=msg.id,
+            )
+            return
         await self._supervisor.update_profile(msg.name, msg.profile)
         await self._emit_frame({"type": "profile.updated", "id": msg.id, "name": msg.name})
 
     async def _handle_profile_delete(self, msg) -> None:
         # Refuse to delete a profile that still has live sessions (attached or
         # detached) — they'd be orphaned. The client must close them first (#25).
-        live = [s for s in self._sessions._sessions.values() if s.profile_name == msg.name]
+        live = self._live_sessions_for_profile(msg.name)
         if live:
             await self._emit_error(
                 PROFILE_IN_USE,

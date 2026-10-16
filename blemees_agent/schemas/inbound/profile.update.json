@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://blemees/schemas/inbound/profile.update.json",
   "title": "profile.update",
-  "description": "Replace a dynamic profile's definition, persisted to the registry (#25). Config-managed profiles are rejected (profile_protected); a missing binary is agent_unavailable. Replied with profile.updated.",
+  "description": "Replace a dynamic profile's definition, persisted to the registry (#25). Config-managed profiles are rejected (profile_protected); a profile with live sessions is rejected (profile_in_use); a missing binary is agent_unavailable. Replied with profile.updated.",
   "type": "object",
   "properties": {
     "type": { "const": "profile.update" },

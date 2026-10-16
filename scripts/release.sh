@@ -7,13 +7,13 @@
 #   scripts/release.sh major         # 0.5.0 -> 1.0.0
 #   scripts/release.sh 0.6.2         # explicit version
 #
-# Pre-flight: working tree clean, on main, in sync with origin/main, the
-# target tag does not exist locally or on origin. You'll be prompted to
-# confirm before anything is committed or pushed.
+# Pre-flight: `uv` on PATH, working tree clean, on main, in sync with
+# origin/main, the target tag does not exist locally or on origin. You'll
+# be prompted to confirm before anything is committed or pushed.
 #
 # After the push, .github/workflows/release.yml runs build → publish-pypi
 # → gh-release; bump-tap.yml then updates blemees/homebrew-tap. Watch
-# with `gh run watch` or open https://github.com/blemees/blemees-daemon/actions.
+# with `gh run watch` or open https://github.com/blemees/blemees-agent/actions.
 
 set -euo pipefail
 
@@ -77,6 +77,12 @@ PY
 esac
 
 # ---- pre-flight checks --------------------------------------------------
+
+# The bump step re-locks so the committed uv.lock records the new version.
+if ! command -v uv >/dev/null 2>&1; then
+    echo "uv not found on PATH — needed to refresh uv.lock" >&2
+    exit 1
+fi
 
 if ! git diff --quiet || ! git diff --cached --quiet; then
     echo "working tree is dirty — commit or stash first" >&2
@@ -143,7 +149,9 @@ if n != 1:
 path.write_text(text)
 PY
 
-git add pyproject.toml
+uv lock
+
+git add pyproject.toml uv.lock
 git commit -m "release: v$next"
 git tag -a "v$next" -m "Release v$next"
 git push origin main "v$next"
@@ -151,7 +159,7 @@ git push origin main "v$next"
 cat <<EOF
 
 ✓ pushed v$next.
-  Workflow:  gh run watch    (or https://github.com/blemees/blemees-daemon/actions)
-  Release:   https://github.com/blemees/blemees-daemon/releases/tag/v$next
-  PyPI:      https://pypi.org/project/blemees/$next/
+  Workflow:  gh run watch    (or https://github.com/blemees/blemees-agent/actions)
+  Release:   https://github.com/blemees/blemees-agent/releases/tag/v$next
+  PyPI:      https://pypi.org/project/blemees-agent/$next/
 EOF

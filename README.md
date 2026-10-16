@@ -26,40 +26,45 @@
 
 ## 0. Install
 
-Python 3.11+. No runtime dependencies outside the standard library.
-At least one of the supported agent backends must be on `$PATH`:
+Python 3.11+. One runtime dependency (`agent-client-protocol`); the rest
+is the standard library. At least one **ACP agent** must be on `$PATH`:
 
-* **Claude Code** — `claude` binary (override with `--claude` / `BLEMEES_AGENTD_CLAUDE`).
-* **Codex** — `codex` binary, version 0.125+ for `codex mcp-server` (override with `--codex` / `BLEMEES_AGENTD_CODEX`).
+| Agent | Command | Args (ACP mode) |
+|---|---|---|
+| Claude Code | `claude-agent-acp` | — |
+| Codex | `codex-acp` | `acp` |
+| Gemini CLI | `gemini` | `--experimental-acp` |
+| Cursor | `cursor-agent` | `acp` |
 
-The daemon picks the backend per session, on `agent.open`. A daemon
-without `claude` on `$PATH` can still serve `backend:"codex"` sessions
-and vice versa; the missing binary surfaces as a `spawn_failed` only
-when a session that needs it is opened.
+With no config the daemon serves a built-in `default` profile that spawns
+`claude-agent-acp` (override with `--agent` / `BLEMEES_AGENTD_AGENT`).
+Other agents are set up as **profiles** in the config file (§8); a session
+picks its profile on `session.open`. A missing binary surfaces as
+`spawn_failed` only when a session that needs it is opened.
 
 PyPI is the canonical source — every channel below pulls the same wheel
-from there.
+from there. The distribution name is **`blemees-agent`**.
 
 ```bash
 # pip (any environment):
-pip install blemees
+pip install blemees-agent
 
 # uv (isolated CLI tool, fast):
-uv tool install blemees
+uv tool install blemees-agent
 
 # pipx (isolated CLI tool, classic):
-pipx install blemees
+pipx install blemees-agent
 
 # Homebrew (macOS / Linux):
 brew tap blemees/tap
-brew install blemees
+brew install blemees-agent
 ```
 
 From source for development:
 
 ```bash
-git clone https://github.com/blemees/blemees-daemon
-cd blemees-daemon
+git clone https://github.com/blemees/blemees-agent
+cd blemees-agent
 uv pip install -e ".[dev]"      # or: pip install -e ".[dev]"
 ```
 
@@ -72,7 +77,7 @@ blemees-agentd --log-level debug
 ```
 
 Socket permissions are `0600`. Anyone who can `connect()` the socket has
-full access to your Claude subscription, so guard it like an SSH agent.
+full access to your agent accounts, so guard it like an SSH agent.
 
 ### systemd (Linux user unit)
 
@@ -94,7 +99,7 @@ launchctl load ~/Library/LaunchAgents/com.blemees.blemees-agentd.plist
 ### `brew services` (after `brew install`)
 
 ```bash
-brew services start blemees
+brew services start blemees-agent
 ```
 
 The Homebrew formula ships a service stanza so the daemon runs at login
@@ -117,23 +122,27 @@ frames.
 ```
 $ blemees-agentctl
 · connected: /tmp/blemees-agentd-501.sock
-→ {"type":"agent.hello","client":"blemees-agentctl/0.9.0","protocol":"blemees/2"}
-← agent.hello_ack  {"daemon":"blemees-agentd/0.9.0","backends":{"claude":"2.1.118","codex":"0.125.0"},…}
+→ {"type":"hello","client":"blemees-agentctl/0.11.0","protocol":"blemees/3"}
+← hello_ack  {"type":"hello_ack","daemon":"blemees-agentd/0.11.0","protocol":"blemees/3","pid":4242,"agents":{"claude-agent-acp":"available"},"profiles":["default"]}
 blemees-agentctl> status
-← agent.status_reply  {"uptime_s":12.4,"connections":1,…}
-blemees-agentctl> open new backend=claude options.model=sonnet options.permission_mode=bypassPermissions
-· session_id: 5a01f0d8-…
-← agent.opened  …
+← status_reply  {"type":"status_reply","uptime_s":12.4,"connections":1,…}
+blemees-agentctl> open new cwd=/tmp
+→ {"type":"session.open","id":"req_…","session_id":"5a01f0d8-…","options":{"cwd":"/tmp"}}
+← session.opened  {"type":"session.opened","session_id":"5a01f0d8-…","profile":"default","agent":"default",…}
 blemees-agentctl> send 5a01f0d8-… what is 2+2?
-← agent.delta {"backend":"claude","kind":"text","text":"4"}
-← agent.result {"backend":"claude","subtype":"success","duration_ms":…}
+← session.update seq=1  {"type":"session.update","session_id":"5a01f0d8-…","seq":1,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"4"}}}
+← session.result seq=2  {"type":"session.result","session_id":"5a01f0d8-…","seq":2,"stop_reason":"end_turn",…}
 blemees-agentctl> close 5a01f0d8-…
 ```
 
+(Timestamps and most `→` echoes trimmed. `open new profile=<p> agent=<a>`
+picks a non-default profile / agent; other `k=v` pairs become `options.*`.)
+
 `help` at the prompt lists every verb. Highlights: `open` / `resume` /
-`close` / `interrupt` / `send` / `send-json` / `watch` / `unwatch` /
+`close` / `interrupt` / `send` / `send-json` / `attach` / `detach` /
 `status` / `session-info` / `sessions [cwd]` / `ping`. `raw {…}`
-sends an arbitrary JSON frame for protocol experiments.
+sends an arbitrary JSON frame for protocol experiments. For scripts,
+`blemees-agentctl open …` / `list` run one-shot without the REPL.
 
 ---
 
@@ -245,34 +254,38 @@ event type without branching by backend.
 ## 4. File Layout
 
 ```
-blemees/
+blemees_agent/
   __init__.py
-  __main__.py            # python -m blemees → daemon entry point
-  daemon.py              # UnixServer + connection dispatcher
-  protocol.py            # wire protocol codec, message dataclasses
-  session.py             # SessionTable
+  __main__.py            # python -m blemees_agent → daemon entry point
+  daemon.py              # Unix server + per-connection dispatcher
+  protocol.py            # wire protocol codec, frame builders
+  session.py             # SessionTable + Session (ring buffer, attention state)
+  supervisor.py          # Profile → Agent registry; one ACP process per agent (#17)
+  registry.py            # persistent session + over-wire profile store (#21, #25)
+  event_log.py           # durable per-session `.jsonl` event log (#22)
+  notify.py              # needs_attention webhook sink (#24, #52)
   backends/
-    __init__.py          # AgentBackend Protocol
-    claude.py            # ClaudeBackend (spawn `claude -p`, translate stream-json → agent.*)
-    codex.py             # CodexBackend  (spawn `codex mcp-server`, translate JSON-RPC → agent.*)
-    translate_claude.py  # CC native event → agent.* frames
-    translate_codex.py   # Codex `msg.*` → agent.* frames
+    __init__.py
+    acp.py               # AcpAgentProcess: spawn + drive an ACP agent over stdio
   config.py              # config loading (file + env + CLI)
-  errors.py              # typed exceptions
+  errors.py              # typed exceptions, wire error codes
   logging.py             # structured logging helpers
-  client.py              # reference Python client (~200 lines, stdlib only)
-tests/blemees/
+  client.py              # reference Python client (stdlib only)
+  cli.py                 # `blemees-agentctl` wire tester (REPL + one-shot)
+  bench.py               # latency bench
+  schemas/               # JSON Schemas for every frame (inbound/, outbound/)
+tests/blemees_agent/
+  fake_acp.py                # scriptable mock ACP agent (no real binary needed)
   test_protocol.py
   test_session.py
-  test_translate_claude.py
-  test_translate_codex.py
-  test_daemon_mock.py        # mock `claude` and mock `codex mcp-server` stubs
-  test_daemon_e2e_claude.py  # requires real `claude`, gated by `requires_claude`
-  test_daemon_e2e_codex.py   # requires real `codex`,  gated by `requires_codex`
+  test_backend_acp.py
+  test_daemon_*.py           # daemon over a real socket, driven by fake_acp
+  test_daemon_e2e_acp.py     # real ACP agents, gated by `requires_*_acp` markers
 ```
 
-Package is self-contained (no external imports outside stdlib). A console
-script `blemees-agentd` in `pyproject.toml` maps to `python -m blemees`.
+The only runtime import outside the stdlib is `agent-client-protocol`.
+Console scripts in `pyproject.toml`: `blemees-agentd` (the daemon, same as
+`python -m blemees_agent`) and `blemees-agentctl` (the wire tester).
 
 ---
 
@@ -1269,18 +1282,48 @@ vars override. Env prefix: `BLEMEES_AGENTD_`.
 | Key | CLI flag | Env var | Default |
 |---|---|---|---|
 | `socket_path` | `--socket` | `BLEMEES_AGENTD_SOCKET` | `$XDG_RUNTIME_DIR/blemees/agentd.sock` |
-| `claude_bin` | `--claude` | `BLEMEES_AGENTD_CLAUDE` | `claude` on PATH |
-| `codex_bin` | `--codex` | `BLEMEES_AGENTD_CODEX` | `codex` on PATH |
+| `agent_command` | `--agent` | `BLEMEES_AGENTD_AGENT` | `claude-agent-acp` (the built-in `default` profile's agent) |
+| `agent_args` | — | — | `[]` |
+| `profiles` | — | — | none (`[profiles.<p>]` tables, see below) |
+| `state_dir` | `--state-dir` | `BLEMEES_AGENTD_STATE_DIR` | `$XDG_STATE_HOME/blemees/agentd` (session registry + event logs) |
+| `event_log_dir` | — | `BLEMEES_AGENTD_EVENT_LOG_DIR` | `<state_dir>/sessions` |
 | `log_level` | `--log-level` | `BLEMEES_AGENTD_LOG_LEVEL` | `info` |
 | `log_file` | `--log-file` | `BLEMEES_AGENTD_LOG_FILE` | stderr |
 | `max_line_bytes` | — | `BLEMEES_AGENTD_MAX_LINE` | `16777216` |
 | `idle_timeout_s` | — | `BLEMEES_AGENTD_IDLE_TIMEOUT` | `900` |
-| `session_retention_days` | — | — | `7` (0 disables) |
-| `max_sessions_per_connection` | — | — | `32` |
 | `max_concurrent_sessions` | — | — | `64` |
-| `stderr_rate_lines` | — | — | `50` |
-| `stderr_rate_window_s` | — | — | `10` |
+| `ring_buffer_size` | — | `BLEMEES_AGENTD_RING_BUFFER_SIZE` | `1024` |
+| `shutdown_grace_s` | — | `BLEMEES_AGENTD_SHUTDOWN_GRACE` | `30` (0 = hard-kill on shutdown) |
 | `notify_webhook_url` | — | `BLEMEES_AGENTD_NOTIFY_WEBHOOK_URL` | none (global fallback for the notify webhook; per-profile `[profiles.<p>.notify] webhook_url` overrides) |
+| `notify_webhook_format` | — | `BLEMEES_AGENTD_NOTIFY_FORMAT` | `json` (`ntfy` for plain-text phone push, see below) |
+
+The pre-0.11 keys `claude_bin` / `codex_bin` (and their `--claude` /
+`--codex` flags), `session_retention_days`, `max_sessions_per_connection`
+and `stderr_rate_lines` / `stderr_rate_window_s` are still accepted but
+ignored.
+
+#### Profiles
+
+A profile names one or more ACP agents (binary, args, model, mode, env,
+MCP servers); `session.open {profile, agent}` picks one. Full shape:
+[`docs/acp-migration-spec.md`](docs/acp-migration-spec.md) §2.
+
+```toml
+# Flat: one agent, named "default".
+[profiles.solo]
+agent_command = "claude-agent-acp"
+model = "sonnet"
+
+# Several agents in one profile.
+[profiles.work.agents.claude]
+agent_command = "claude-agent-acp"
+[profiles.work.agents.codex]
+agent_command = "codex-acp"
+agent_args = ["acp"]
+```
+
+Profiles can also be created over the wire (`profile.create`, persisted
+under `state_dir`).
 
 #### Attention policy (per profile)
 
@@ -1335,14 +1378,13 @@ The default `format = "json"` keeps the documented `blemees.notify` JSON
 payload for Slack/Discord/custom receivers.
 
 
-A backend whose binary cannot be located at startup is simply omitted
-from the `agent.hello_ack.backends` map; the daemon serves whichever
-backends *are* available. Sessions for a missing backend fail with
+`hello_ack.agents` reports whether the default `agent_command` resolves
+on `$PATH`. A session whose agent binary is missing fails with
 `spawn_failed` at open time.
 
 CLI:
 ```
-blemees-agentd [--socket PATH] [--claude PATH] [--codex PATH]
+blemees-agentd [--socket PATH] [--agent PATH] [--state-dir DIR]
         [--log-level LEVEL] [--log-file PATH]
         [--config FILE] [--version]
 ```

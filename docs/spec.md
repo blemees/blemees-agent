@@ -1703,6 +1703,7 @@ block.
 import asyncio, uuid
 from blemees.client import BlemeesClient
 
+
 async def stream_one_turn(backend: str, options: dict, prompt: str) -> None:
     async with BlemeesClient.connect() as c:
         async with c.open_session(
@@ -1720,6 +1721,7 @@ async def stream_one_turn(backend: str, options: dict, prompt: str) -> None:
                     break
                 elif t == "agent.error":
                     raise RuntimeError(event["message"])
+
 
 async def main():
     await stream_one_turn(
@@ -1743,6 +1745,7 @@ async def main():
         },
         "What is 2+2?",
     )
+
 
 asyncio.run(main())
 ```

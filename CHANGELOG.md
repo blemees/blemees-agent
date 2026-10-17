@@ -66,3 +66,9 @@ no `blemees/2` compatibility shims.
   `inputTokens + cachedReadTokens + cachedWriteTokens` (snake_case keys for
   older sidecars). `cumulative_usage` no longer starts with snake_case zero
   keys; it holds only the keys the agent reports. (#66)
+- A turn's `session.update` (e.g. a late `agent_message_chunk` or
+  `usage_update`) could arrive after its `session.result`, so a client could
+  open a phantom new turn. The ACP SDK hands each notification to its own
+  task, and the old queue drain did not wait for those tasks. The daemon now
+  counts each session's in-flight `session/update` handlers and emits
+  `session.result` only when they are done (5 s cap, then a warning). (#68)

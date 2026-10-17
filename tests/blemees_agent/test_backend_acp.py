@@ -96,6 +96,35 @@ async def test_turn_streams_updates_then_result():
     assert "seq" not in result  # seq is the Session's job
 
 
+async def test_result_waits_for_in_flight_updates():
+    """``session.result`` must not overtake the turn's own ``session.update``
+    frames (#68). A slow ``on_event`` keeps each update handler in flight when
+    ``prompt()`` returns; the result must still come last."""
+    process = _process()
+    order: list[str] = []
+    result_seen = asyncio.Event()
+
+    async def on_event(frame: dict) -> None:
+        if frame["type"] == "session.update":
+            await asyncio.sleep(0.05)
+            order.append(frame["update"]["sessionUpdate"])
+        else:
+            order.append(frame["type"])
+            if frame["type"] == "session.result":
+                result_seen.set()
+
+    handle = AcpSessionHandle(process=process, on_event=on_event, cwd=None)
+    await handle.spawn()
+    try:
+        await handle.send_user_turn({"role": "user", "content": "usage"})
+        await asyncio.wait_for(result_seen.wait(), timeout=10.0)
+        await asyncio.sleep(0.3)  # let any straggling update land
+    finally:
+        await process.close()
+    assert order[-1] == "session.result", order
+    assert sorted(order[:-1]) == ["agent_message_chunk", "usage_update"], order
+
+
 async def test_busy_rejects_concurrent_turn():
     process = _process()
     q: asyncio.Queue = asyncio.Queue()

@@ -54,3 +54,9 @@ no `blemees/2` compatibility shims.
 ### Removed
 - The `blemees/2` `agent.*` event vocabulary and the
   `translate_claude.py` / `translate_codex.py` translators.
+
+### Fixed
+- `session.info_reply.context_tokens` was always 0: it read snake_case usage
+  keys, but the last turn's usage is verbatim ACP camelCase. It now sums
+  `inputTokens + cachedReadTokens + cachedWriteTokens`, with the old
+  snake_case keys as a fallback for older usage sidecars. (#66)

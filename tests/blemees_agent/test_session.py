@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from blemees_agent.errors import SessionExistsError, SessionUnknownError
@@ -105,3 +107,48 @@ async def test_remove_is_idempotent():
     await table.remove("s1")
     await table.remove("s1")  # should not raise
     assert table.try_get("s1") is None
+
+
+def test_context_tokens_from_acp_camelcase_usage():
+    # Under blemees/3, session.result.usage is ACP usage dumped by_alias
+    # (camelCase). context_tokens must sum the last turn's input side (#66).
+    sess = Session(session_id="s1", open_msg=_open_msg(), cwd=None)
+    usage = {
+        "inputTokens": 3824,
+        "outputTokens": 5,
+        "cachedReadTokens": 14000,
+        "cachedWriteTokens": 20022,
+        "totalTokens": 37851,
+    }
+    sess._update_usage_from_frame({"type": "session.result", "usage": usage})
+    snap = sess.usage_snapshot(attached=True, subprocess_running=True)
+    assert snap["context_tokens"] == 3824 + 14000 + 20022
+    # last_turn_usage stays verbatim ACP camelCase.
+    assert snap["last_turn_usage"] == usage
+
+
+def test_context_tokens_snake_case_sidecar_fallback(tmp_path):
+    # Usage sidecars written before #66 may hold snake_case keys.
+    (tmp_path / "s1.usage.json").write_text(
+        json.dumps(
+            {
+                "session_id": "s1",
+                "turns": 2,
+                "last_turn_usage": {
+                    "input_tokens": 500,
+                    "output_tokens": 200,
+                    "cache_read_input_tokens": 14000,
+                    "cache_creation_input_tokens": 7,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    sess = Session(session_id="s1", open_msg=_open_msg(), cwd=None)
+    sess.enable_durable_log(tmp_path)
+    try:
+        snap = sess.usage_snapshot(attached=False, subprocess_running=False)
+    finally:
+        sess.log.close()
+    assert snap["turns"] == 2
+    assert snap["context_tokens"] == 500 + 14000 + 7

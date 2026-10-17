@@ -614,10 +614,17 @@ class Session:
 
     def usage_snapshot(self, *, attached: bool, subprocess_running: bool) -> dict:
         """Build the payload for a ``agent.session_info_reply`` frame."""
+        usage = self.last_turn_usage
+
+        def _tokens(acp_key: str, legacy_key: str) -> int:
+            # ACP usage is stored camelCase (by_alias dump); snake_case is a
+            # fallback for usage sidecars written before #66.
+            return int(usage.get(acp_key, usage.get(legacy_key, 0)) or 0)
+
         last_inputs = (
-            int(self.last_turn_usage.get("input_tokens", 0) or 0)
-            + int(self.last_turn_usage.get("cache_read_input_tokens", 0) or 0)
-            + int(self.last_turn_usage.get("cache_creation_input_tokens", 0) or 0)
+            _tokens("inputTokens", "input_tokens")
+            + _tokens("cachedReadTokens", "cache_read_input_tokens")
+            + _tokens("cachedWriteTokens", "cache_creation_input_tokens")
         )
         return {
             "session_id": self.session_id,

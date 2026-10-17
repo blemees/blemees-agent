@@ -40,6 +40,7 @@ from acp.schema import (
     DeniedOutcome,
     McpServerStdio,
     RequestPermissionResponse,
+    SessionNotification,
 )
 from acp.task import RpcTask, RpcTaskKind
 
@@ -155,7 +156,9 @@ class _UpdateTrackingQueue(InMemoryMessageQueue):
     at once, so ``queue.join()`` can return before our handler has run. The
     receive loop publishes messages in stdout order, before it resolves a
     later prompt response, so counting here covers every update the agent
-    wrote before it answered ``session/prompt``.
+    wrote before it answered ``session/prompt``. Params are validated the way
+    the SDK router does (``SessionNotification``); an update it would reject
+    never reaches our handler, so it must not be counted.
     """
 
     def __init__(self, process: AcpAgentProcess) -> None:
@@ -166,9 +169,11 @@ class _UpdateTrackingQueue(InMemoryMessageQueue):
         st = None
         msg = task.message
         if task.kind is RpcTaskKind.NOTIFICATION and msg.get("method") == "session/update":
-            params = msg.get("params")
-            sid = params.get("sessionId") if isinstance(params, dict) else None
-            if isinstance(sid, str):
+            try:
+                sid = SessionNotification.model_validate(msg.get("params")).session_id
+            except ValueError:  # pydantic.ValidationError: the router drops it
+                sid = None
+            if sid is not None:
                 st = self._p.sessions.get(sid)
         if st is not None:
             st.update_published()

@@ -13,8 +13,15 @@ import sys
 from pathlib import Path
 
 import pytest
+from acp.task import RpcTask, RpcTaskKind
 
-from blemees_agent.backends.acp import AcpAgentProcess, AcpSessionHandle, _to_content_blocks
+from blemees_agent.backends.acp import (
+    AcpAgentProcess,
+    AcpSessionHandle,
+    _SessionState,
+    _to_content_blocks,
+    _UpdateTrackingQueue,
+)
 from blemees_agent.errors import AuthRequiredError, ProtocolError, SessionBusyError
 from blemees_agent.logging import configure
 from blemees_agent.supervisor import Agent
@@ -123,6 +130,28 @@ async def test_result_waits_for_in_flight_updates():
         await process.close()
     assert order[-1] == "session.result", order
     assert sorted(order[:-1]) == ["agent_message_chunk", "usage_update"], order
+
+
+async def test_invalid_update_is_not_counted():
+    """An update the SDK router rejects never reaches ``session_update``, so
+    counting it would hold the turn's ``session.result`` for the full wait
+    cap (#68)."""
+    process = _process()
+    st = _SessionState(on_event=asyncio.Queue().put)
+    process.sessions["s1"] = st
+    queue = _UpdateTrackingQueue(process)
+
+    def note(update: object) -> RpcTask:
+        return RpcTask(
+            RpcTaskKind.NOTIFICATION,
+            {"method": "session/update", "params": {"sessionId": "s1", "update": update}},
+        )
+
+    await queue.publish(note({"sessionUpdate": "no_such_update"}))
+    assert st.updates_in_flight == 0
+    assert st.updates_idle.is_set()
+    await queue.publish(note({"sessionUpdate": "usage_update", "used": 1, "size": 2}))
+    assert st.updates_in_flight == 1
 
 
 async def test_busy_rejects_concurrent_turn():

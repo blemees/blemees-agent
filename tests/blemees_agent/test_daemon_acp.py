@@ -95,16 +95,22 @@ async def test_session_info_context_from_usage_update(acp_daemon):
         frames = await client.wait_for(
             lambda e: e.get("type") == "session.result", collect=True, timeout=30.0
         )
+
+        def is_usage_update(f):
+            return f.get("type") == "session.update" and (
+                f["update"].get("sessionUpdate") == "usage_update"
+            )
+
+        # ACP notifications are not ordered against the prompt response, so
+        # the usage_update may land just after session.result.
+        if not any(is_usage_update(f) for f in frames):
+            frames += await client.wait_for(is_usage_update, collect=True)
         await client.send({"type": "session.info", "id": "i", "session_id": SID})
         info = await client.wait_for(lambda e: e.get("type") == "session.info_reply")
     finally:
         await client.close()
 
-    usage_updates = [
-        f["update"]
-        for f in frames
-        if f.get("type") == "session.update" and f["update"].get("sessionUpdate") == "usage_update"
-    ]
+    usage_updates = [f["update"] for f in frames if is_usage_update(f)]
     assert usage_updates == [{"sessionUpdate": "usage_update", "used": 50_000, "size": 200_000}]
     assert info["context_tokens"] == 50_000
     assert info["context_window"] == 200_000

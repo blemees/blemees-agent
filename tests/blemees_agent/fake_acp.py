@@ -12,6 +12,9 @@ is driven by the prompt text so a single stub covers several scenarios:
                      shutdown: turn completes within the grace window).
 * contains "boom"  → raise, so the turn surfaces as an agent error.
 * contains "die"   → hard-exit the process mid-turn (crash/recovery tests).
+* contains "usage" → emit a ``usage_update`` (used=50k, size=200k), then end
+                     with a ``PromptResponse.usage`` that sums many calls
+                     (inputTokens=400k), like claude-agent-acp does (#66).
 
 Run as: ``python fake_acp.py`` (stdio).
 """
@@ -30,6 +33,8 @@ from acp.schema import (
     PermissionOption,
     PromptResponse,
     ToolCallUpdate,
+    Usage,
+    UsageUpdate,
 )
 
 
@@ -141,6 +146,22 @@ class FakeAgent(acp.Agent):
             await asyncio.sleep(0.5)
             await self._conn.session_update(session_id, update_agent_message_text(" done"))
             return PromptResponse(stop_reason="end_turn")
+
+        if "usage" in text:
+            await self._conn.session_update(session_id, update_agent_message_text("working"))
+            await self._conn.session_update(
+                session_id,
+                UsageUpdate(session_update="usage_update", used=50_000, size=200_000),
+            )
+            return PromptResponse(
+                stop_reason="end_turn",
+                usage=Usage(
+                    input_tokens=400_000,
+                    output_tokens=2_000,
+                    cached_read_tokens=300_000,
+                    total_tokens=702_000,
+                ),
+            )
 
         await self._conn.session_update(session_id, update_agent_message_text("PONG"))
         await self._conn.session_update(session_id, update_agent_message_text(" done"))

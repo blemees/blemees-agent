@@ -422,12 +422,16 @@ that still has live sessions are refused (`profile_in_use`) — close them first
 ← {"type":"sessions","id":"sl","sessions":[ {"session_id":"…","profile":"…","attached":true,"owner_pid":123,"model":"…","title":"…","cwd":"…","mode":"…","needs_attention":false,"view_only":false,"last_seq":47,"turn_active":false,"started_at_ms":…,"last_active_at_ms":…} ]}
 
 → {"type":"session.info","id":"si","session_id":"…"}
-← {"type":"session.info_reply","id":"si","session_id":"…","profile":"…","model":"…","cwd":"…","mode":"…","turns":5,"attached":true,"running":true,"view_only":false,"needs_attention":false,"last_turn_at_ms":…,"last_seq":42,"usage":{"input_tokens":3824,"output_tokens":5,"cached_write_tokens":20022,"total_tokens":23851}}
+← {"type":"session.info_reply","id":"si","session_id":"…","backend":"acp","native_session_id":"…","profile":"…","agent":"…","model":"…","cwd":"…","turns":5,"attached":true,"subprocess_running":true,"view_only":false,"needs_attention":false,"attention_reason":null,"last_turn_at_ms":…,"last_seq":42,"last_turn_usage":{"inputTokens":3824,"outputTokens":5,"cachedReadTokens":14000,"cachedWriteTokens":20022,"totalTokens":37851},"cumulative_usage":{"inputTokens":9100,"outputTokens":40,"cachedReadTokens":52000,"cachedWriteTokens":20022,"totalTokens":81162},"context_tokens":37826,"context_window":200000}
 ```
-> `session.info.usage` is **optional** — present only when the agent reports
-> usage (accumulated from ACP `UsageUpdate` / `PromptResponse.usage`; see
-> §3.1), omitted otherwise. This reverses the earlier "drop usage" plan
-> after the #15 spike found usage is in-protocol at `protocol_version 1`
+> Usage is **advisory**. `last_turn_usage` / `cumulative_usage` are the ACP
+> `PromptResponse.usage` (camelCase, verbatim / summed per key) and stay `{}`
+> when the agent reports none. `context_tokens` / `context_window` come from
+> the agent's latest ACP `usage_update` (`used` / `size`); when the agent
+> never sent one, `context_tokens` falls back to an approximate sum of the
+> last turn's input side and `context_window` is `null` (#66). This reverses
+> the earlier "drop usage" plan after the #15 spike found usage is
+> in-protocol at `protocol_version 1`
 > (claude-agent-acp and codex-acp report it; gemini/cursor don't). The daemon
 > never scrapes agent logs for it.
 

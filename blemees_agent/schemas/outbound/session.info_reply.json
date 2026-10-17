@@ -13,6 +13,24 @@
     "model": { "type": ["string", "null"] },
     "cwd": { "type": ["string", "null"] },
     "turns": { "type": "integer", "minimum": 0 },
+    "context_tokens": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Tokens in context: the agent's latest ACP usage_update.used; else an approximate sum of the last turn's input-side usage."
+    },
+    "context_window": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "Context window size from the agent's latest ACP usage_update.size; null when the agent never sent one."
+    },
+    "last_turn_usage": {
+      "type": "object",
+      "description": "The last turn's ACP PromptResponse.usage, verbatim (camelCase)."
+    },
+    "cumulative_usage": {
+      "type": "object",
+      "description": "Per-key sum of every turn's ACP PromptResponse.usage (camelCase)."
+    },
     "attached": { "type": "boolean" },
     "subprocess_running": { "type": "boolean" },
     "needs_attention": { "type": "boolean" },

@@ -83,6 +83,35 @@ async def test_open_and_drive_acp_turn(acp_daemon):
     assert result["seq"] > updates[0]["seq"]
 
 
+async def test_session_info_context_from_usage_update(acp_daemon):
+    # The fake agent sends usage_update{used=50k,size=200k} and then a
+    # PromptResponse.usage of 400k input tokens summed over the turn's calls.
+    # session.info must report the usage_update occupancy, not the sum (#66).
+    client = await _connect(acp_daemon)
+    try:
+        await client.send({"type": "session.open", "id": "o", "session_id": SID, "options": {}})
+        await client.wait_for(lambda e: e.get("type") == "session.opened")
+        await client.send({"type": "session.prompt", "session_id": SID, "prompt": "usage"})
+        frames = await client.wait_for(
+            lambda e: e.get("type") == "session.result", collect=True, timeout=30.0
+        )
+        await client.send({"type": "session.info", "id": "i", "session_id": SID})
+        info = await client.wait_for(lambda e: e.get("type") == "session.info_reply")
+    finally:
+        await client.close()
+
+    usage_updates = [
+        f["update"]
+        for f in frames
+        if f.get("type") == "session.update" and f["update"].get("sessionUpdate") == "usage_update"
+    ]
+    assert usage_updates == [{"sessionUpdate": "usage_update", "used": 50_000, "size": 200_000}]
+    assert info["context_tokens"] == 50_000
+    assert info["context_window"] == 200_000
+    assert info["last_turn_usage"]["inputTokens"] == 400_000
+    assert info["turns"] == 1
+
+
 async def test_prompt_without_open_is_unknown_session(acp_daemon):
     client = await _connect(acp_daemon)
     try:

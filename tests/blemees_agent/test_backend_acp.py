@@ -13,8 +13,15 @@ import sys
 from pathlib import Path
 
 import pytest
+from acp.task import RpcTask, RpcTaskKind
 
-from blemees_agent.backends.acp import AcpAgentProcess, AcpSessionHandle, _to_content_blocks
+from blemees_agent.backends.acp import (
+    AcpAgentProcess,
+    AcpSessionHandle,
+    _SessionState,
+    _to_content_blocks,
+    _UpdateTrackingQueue,
+)
 from blemees_agent.errors import AuthRequiredError, ProtocolError, SessionBusyError
 from blemees_agent.logging import configure
 from blemees_agent.supervisor import Agent
@@ -94,6 +101,57 @@ async def test_turn_streams_updates_then_result():
     assert result["stop_reason"] == "end_turn"
     assert "".join(u["update"]["content"]["text"] for u in updates) == "PONG done"
     assert "seq" not in result  # seq is the Session's job
+
+
+async def test_result_waits_for_in_flight_updates():
+    """``session.result`` must not overtake the turn's own ``session.update``
+    frames (#68). A slow ``on_event`` keeps each update handler in flight when
+    ``prompt()`` returns; the result must still come last."""
+    process = _process()
+    order: list[str] = []
+    result_seen = asyncio.Event()
+
+    async def on_event(frame: dict) -> None:
+        if frame["type"] == "session.update":
+            await asyncio.sleep(0.05)
+            order.append(frame["update"]["sessionUpdate"])
+        else:
+            order.append(frame["type"])
+            if frame["type"] == "session.result":
+                result_seen.set()
+
+    handle = AcpSessionHandle(process=process, on_event=on_event, cwd=None)
+    await handle.spawn()
+    try:
+        await handle.send_user_turn({"role": "user", "content": "usage"})
+        await asyncio.wait_for(result_seen.wait(), timeout=10.0)
+        await asyncio.sleep(0.3)  # let any straggling update land
+    finally:
+        await process.close()
+    assert order[-1] == "session.result", order
+    assert sorted(order[:-1]) == ["agent_message_chunk", "usage_update"], order
+
+
+async def test_invalid_update_is_not_counted():
+    """An update the SDK router rejects never reaches ``session_update``, so
+    counting it would hold the turn's ``session.result`` for the full wait
+    cap (#68)."""
+    process = _process()
+    st = _SessionState(on_event=asyncio.Queue().put)
+    process.sessions["s1"] = st
+    queue = _UpdateTrackingQueue(process)
+
+    def note(update: object) -> RpcTask:
+        return RpcTask(
+            RpcTaskKind.NOTIFICATION,
+            {"method": "session/update", "params": {"sessionId": "s1", "update": update}},
+        )
+
+    await queue.publish(note({"sessionUpdate": "no_such_update"}))
+    assert st.updates_in_flight == 0
+    assert st.updates_idle.is_set()
+    await queue.publish(note({"sessionUpdate": "usage_update", "used": 1, "size": 2}))
+    assert st.updates_in_flight == 1
 
 
 async def test_busy_rejects_concurrent_turn():

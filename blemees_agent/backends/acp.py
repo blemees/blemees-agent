@@ -40,7 +40,9 @@ from acp.schema import (
     DeniedOutcome,
     McpServerStdio,
     RequestPermissionResponse,
+    SessionNotification,
 )
+from acp.task import RpcTask, RpcTaskKind
 
 from ..errors import AuthRequiredError, ProtocolError, SessionBusyError, SpawnFailedError
 from . import EventCallback
@@ -129,6 +131,58 @@ class _SessionState:
         self.cancelled = False  # user interrupted this turn → finalize as cancelled
         self.notified_crash = False  # agent_crashed already emitted for this turn
         self.loading = False  # session/load is replaying history → drop those updates
+        # session/update notifications published but not yet handled; the
+        # turn waits for zero before it emits session.result (#68).
+        self.updates_in_flight = 0
+        self.updates_idle = asyncio.Event()
+        self.updates_idle.set()
+
+    def update_published(self) -> None:
+        self.updates_in_flight += 1
+        self.updates_idle.clear()
+
+    def update_handled(self) -> None:
+        # Clamp at 0: an update published before this state was registered
+        # (e.g. around session/new) was never counted.
+        self.updates_in_flight = max(0, self.updates_in_flight - 1)
+        if self.updates_in_flight == 0:
+            self.updates_idle.set()
+
+
+class _UpdateTrackingQueue(InMemoryMessageQueue):
+    """RPC queue that counts in-flight ``session/update`` notifications (#68).
+
+    The SDK dispatcher only spawns a task per notification and marks it done
+    at once, so ``queue.join()`` can return before our handler has run. The
+    receive loop publishes messages in stdout order, before it resolves a
+    later prompt response, so counting here covers every update the agent
+    wrote before it answered ``session/prompt``. Params are validated the way
+    the SDK router does (``SessionNotification``); an update it would reject
+    never reaches our handler, so it must not be counted.
+    """
+
+    def __init__(self, process: AcpAgentProcess) -> None:
+        super().__init__()
+        self._p = process
+
+    async def publish(self, task: RpcTask) -> None:
+        st = None
+        msg = task.message
+        if task.kind is RpcTaskKind.NOTIFICATION and msg.get("method") == "session/update":
+            try:
+                sid = SessionNotification.model_validate(msg.get("params")).session_id
+            except ValueError:  # pydantic.ValidationError: the router drops it
+                sid = None
+            if sid is not None:
+                st = self._p.sessions.get(sid)
+        if st is not None:
+            st.update_published()
+        try:
+            await super().publish(task)
+        except BaseException:
+            if st is not None:
+                st.update_handled()
+            raise
 
 
 class _ProcessClient(acp.Client):
@@ -144,17 +198,22 @@ class _ProcessClient(acp.Client):
 
     async def session_update(self, session_id: str, update: Any, **_kw: Any) -> None:
         st = self._p.sessions.get(session_id)
-        if st is None or st.cancelled or st.notified_crash or st.loading:
-            # Drop updates for a cancelled/crashed turn, or the history the
-            # agent replays during session/load (the client already has it
-            # from the durable event log, #22).
+        if st is None:
             return
-        await st.on_event(
-            {
-                "type": "session.update",
-                "update": update.model_dump(mode="json", by_alias=True, exclude_none=True),
-            }
-        )
+        try:
+            if st.cancelled or st.notified_crash or st.loading:
+                # Drop updates for a cancelled/crashed turn, or the history the
+                # agent replays during session/load (the client already has it
+                # from the durable event log, #22).
+                return
+            await st.on_event(
+                {
+                    "type": "session.update",
+                    "update": update.model_dump(mode="json", by_alias=True, exclude_none=True),
+                }
+            )
+        finally:
+            st.update_handled()
 
     async def request_permission(
         self, options: list[Any], session_id: str, tool_call: Any, **_kw: Any
@@ -240,7 +299,7 @@ class AcpAgentProcess:
                 ) from exc
 
             assert self._proc.stdin is not None and self._proc.stdout is not None
-            self._rpc_queue = InMemoryMessageQueue()
+            self._rpc_queue = _UpdateTrackingQueue(self)
             self._conn = connect_to_agent(
                 _ProcessClient(self), self._proc.stdin, self._proc.stdout, queue=self._rpc_queue
             )
@@ -414,7 +473,7 @@ class AcpAgentProcess:
             resp = await self._conn.prompt(
                 prompt=blocks, session_id=acp_session_id, message_id=str(uuid4())
             )
-            await self._drain_notifications()
+            await self._drain_updates(acp_session_id, st)
             frame: dict[str, Any] = {"type": "session.result", "stop_reason": resp.stop_reason}
             usage = getattr(resp, "usage", None)
             if usage is not None:
@@ -495,11 +554,24 @@ class AcpAgentProcess:
                 with contextlib.suppress(asyncio.CancelledError):
                     await proc.wait()
 
-    async def _drain_notifications(self) -> None:
-        if self._rpc_queue is None:
-            return
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(self._rpc_queue.join(), timeout=5.0)
+    async def _drain_updates(self, acp_session_id: str, st: _SessionState) -> None:
+        """Wait until the turn's published ``session/update`` handlers finish.
+
+        Keeps a late update from trailing ``session.result`` (#68). On
+        timeout, reset the count so a lost handler (e.g. a notification the
+        SDK router rejected) cannot delay every later turn.
+        """
+        try:
+            await asyncio.wait_for(st.updates_idle.wait(), timeout=5.0)
+        except TimeoutError:
+            self._log.warning(
+                "acp.updates_drain_timeout",
+                agent=self._label,
+                session_id=acp_session_id,
+                in_flight=st.updates_in_flight,
+            )
+            st.updates_in_flight = 0
+            st.updates_idle.set()
 
     async def _pump_stderr(self) -> None:
         proc = self._proc

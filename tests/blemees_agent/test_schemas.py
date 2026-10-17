@@ -286,6 +286,10 @@ EXAMPLES: dict[str, dict] = {
         "needs_attention": False,
         "attention_reason": None,
         "view_only": False,
+        "context_tokens": 50000,
+        "context_window": 200000,
+        "last_turn_usage": {"inputTokens": 400000, "outputTokens": 5},
+        "cumulative_usage": {"inputTokens": 800000, "outputTokens": 9},
     },
     _sid("outbound", "session.needs_attention"): {
         "type": "session.needs_attention",
@@ -325,6 +329,11 @@ NEGATIVE: list[tuple[str, dict]] = [
             "request_id": "r",
             "outcome": "maybe",
         },
+    ),
+    # context_window must be an integer or null
+    (
+        _sid("outbound", "session.info_reply"),
+        {"type": "session.info_reply", "context_window": "200k"},
     ),
     # bad attach role
     (

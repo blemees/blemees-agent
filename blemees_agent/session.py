@@ -97,21 +97,20 @@ class Session:
     # but cannot drive the session (user/interrupt/close).
     _watchers: dict[int, WriterFn] = field(default_factory=dict)
 
-    # Running usage accumulator maintained from agent.result frames. Persists
-    # to <event_log_dir>/<session>.usage.json so it survives daemon restarts
+    # Running usage accumulator maintained from session.result frames (and
+    # ACP ``usage_update`` session.update frames). Persists to
+    # <event_log_dir>/<session>.usage.json so it survives daemon restarts
     # whenever the durable log is enabled.
     turns: int = 0
     last_model: str | None = None
     last_turn_at_ms: int | None = None
     last_turn_usage: dict[str, int] = field(default_factory=dict)
-    cumulative_usage: dict[str, int] = field(
-        default_factory=lambda: {
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "cache_read_input_tokens": 0,
-            "cache_creation_input_tokens": 0,
-        }
-    )
+    # Keys appear as the agent reports them (ACP camelCase); no seed.
+    cumulative_usage: dict[str, int] = field(default_factory=dict)
+    # Context occupancy / window from the agent's latest ACP ``usage_update``
+    # (``used`` / ``size``). None until the agent sends one (#66).
+    context_used: int | None = None
+    context_size: int | None = None
     _usage_path: Path | None = None
 
     # Wall-clock when the session was first registered; surfaced on
@@ -598,9 +597,20 @@ class Session:
 
         ACP usage is *optional* (#15 finding A): when present it's stored
         verbatim and summed field-by-field; a turn with no usage still
-        counts. Persisted to the usage sidecar when the durable log is on.
+        counts. A ``session.update`` carrying an ACP ``usage_update`` records
+        the context occupancy (``used``) and window (``size``) instead; it is
+        not a turn. Persisted to the usage sidecar when the durable log is on.
         """
-        if frame.get("type") != "session.result":
+        ftype = frame.get("type")
+        if ftype == "session.update":
+            update = frame.get("update")
+            if isinstance(update, dict) and update.get("sessionUpdate") == "usage_update":
+                used, size = _as_int(update.get("used")), _as_int(update.get("size"))
+                if (used, size) != (self.context_used, self.context_size):
+                    self.context_used, self.context_size = used, size
+                    self._save_usage_sidecar()
+            return
+        if ftype != "session.result":
             return
         usage = frame.get("usage")
         if isinstance(usage, dict):
@@ -614,11 +624,26 @@ class Session:
 
     def usage_snapshot(self, *, attached: bool, subprocess_running: bool) -> dict:
         """Build the payload for a ``agent.session_info_reply`` frame."""
-        last_inputs = (
-            int(self.last_turn_usage.get("input_tokens", 0) or 0)
-            + int(self.last_turn_usage.get("cache_read_input_tokens", 0) or 0)
-            + int(self.last_turn_usage.get("cache_creation_input_tokens", 0) or 0)
-        )
+        if self.context_used is not None:
+            # The agent's own figure for tokens in context (ACP usage_update).
+            context_tokens = self.context_used
+        else:
+            # Fallback for agents that never send usage_update: the last
+            # turn's input side. Approximate only: PromptResponse.usage can sum
+            # every model call of the turn (claude-agent-acp), and Codex may
+            # count cached input twice (inputTokens already includes it).
+            usage = self.last_turn_usage
+
+            def _tokens(acp_key: str, legacy_key: str) -> int:
+                # ACP usage is stored camelCase (by_alias dump); snake_case is
+                # a fallback for usage sidecars written before #66.
+                return int(usage.get(acp_key, usage.get(legacy_key, 0)) or 0)
+
+            context_tokens = (
+                _tokens("inputTokens", "input_tokens")
+                + _tokens("cachedReadTokens", "cache_read_input_tokens")
+                + _tokens("cachedWriteTokens", "cache_creation_input_tokens")
+            )
         return {
             "session_id": self.session_id,
             "backend": self.backend_name,
@@ -629,7 +654,8 @@ class Session:
             "last_turn_at_ms": self.last_turn_at_ms,
             "last_turn_usage": dict(self.last_turn_usage),
             "cumulative_usage": dict(self.cumulative_usage),
-            "context_tokens": last_inputs,
+            "context_tokens": context_tokens,
+            "context_window": self.context_size,
             "attached": attached,
             "subprocess_running": subprocess_running,
             # Highest seq the session has produced to date — mirrors the
@@ -647,6 +673,8 @@ class Session:
             "last_turn_at_ms": self.last_turn_at_ms,
             "last_turn_usage": self.last_turn_usage,
             "cumulative_usage": self.cumulative_usage,
+            "context_used": self.context_used,
+            "context_size": self.context_size,
             "native_session_id": self.native_session_id,
             "rollout_path": self.rollout_path,
         }
@@ -679,10 +707,20 @@ class Session:
             for k, v in data["cumulative_usage"].items():
                 if isinstance(v, int):
                     self.cumulative_usage[k] = v
+        # Absent in sidecars written before #66 (→ stays None).
+        self.context_used = _as_int(data.get("context_used"))
+        self.context_size = _as_int(data.get("context_size"))
         if isinstance(data.get("native_session_id"), str):
             self.native_session_id = data["native_session_id"]
         if isinstance(data.get("rollout_path"), str):
             self.rollout_path = data["rollout_path"]
+
+
+def _as_int(value: Any) -> int | None:
+    """``value`` if it's a non-negative int (not a bool), else None."""
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return None
 
 
 # ---------------------------------------------------------------------------

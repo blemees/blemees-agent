@@ -54,3 +54,15 @@ no `blemees/2` compatibility shims.
 ### Removed
 - The `blemees/2` `agent.*` event vocabulary and the
   `translate_claude.py` / `translate_codex.py` translators.
+
+### Fixed
+- `session.info_reply.context_tokens` was always 0: it read snake_case usage
+  keys, but the last turn's usage is verbatim ACP camelCase. It now reports
+  `used` from the agent's latest ACP `usage_update` (tracked from
+  `session.update` frames and kept in the usage sidecar), and the new
+  `session.info_reply.context_window` field reports its `size` (`null` when
+  the agent never sent one). When there is no `usage_update`, it falls back
+  to an approximate sum of the last turn's
+  `inputTokens + cachedReadTokens + cachedWriteTokens` (snake_case keys for
+  older sidecars). `cumulative_usage` no longer starts with snake_case zero
+  keys; it holds only the keys the agent reports. (#66)

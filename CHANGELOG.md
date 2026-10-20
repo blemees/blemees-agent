@@ -50,7 +50,15 @@ no `blemees/2` compatibility shims.
   `blemees-agentctl` and its `open` verb are profile-aware.
 - First (and only) runtime dependency: `agent-client-protocol` (the stdlib-only
   stance is retired).
+- The launchd plist logs to the per-user `~/Library/Logs/blemees-agentd.log`
+  instead of the shared, fixed `/tmp/blemees-agentd.{out,err}.log`. (#50)
 
 ### Removed
+- Dead `blemees/2` config: the `claude_bin` / `codex_bin`,
+  `max_sessions_per_connection` and `stderr_rate_*` fields and the
+  `BLEMEES_AGENTD_CLAUDE` / `BLEMEES_AGENTD_CODEX` env vars. Old config files,
+  env vars and the `--claude` / `--codex` flags are still accepted and ignored.
+  Also the unused `KNOWN_BACKENDS` / `BackendOnDiskListing` /
+  `build_spawn_env` helpers in `blemees_agent.backends`. (#50)
 - The `blemees/2` `agent.*` event vocabulary and the
   `translate_claude.py` / `translate_codex.py` translators.

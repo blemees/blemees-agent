@@ -94,6 +94,7 @@ journalctl --user -u blemees-agentd -f
 ```bash
 cp packaging/blemees-agentd/com.blemees.blemees-agentd.plist ~/Library/LaunchAgents/
 launchctl load ~/Library/LaunchAgents/com.blemees.blemees-agentd.plist
+tail -f ~/Library/Logs/blemees-agentd.log
 ```
 
 ### `brew services` (after `brew install`)
@@ -1409,7 +1410,12 @@ WantedBy=default.target
 
 ### 8.2 launchd plist (ship in `packaging/blemees-agentd/com.blemees.blemees-agentd.plist`)
 
-Standard KeepAlive-on-crash plist with `ThrottleInterval=5`.
+Standard KeepAlive-on-crash plist with `ThrottleInterval=5`. It logs
+stdout + stderr to the per-user `~/Library/Logs/blemees-agentd.log`.
+launchd does not expand `~` or `$HOME` in `StandardOutPath` /
+`StandardErrorPath`, so the plist starts the daemon as
+`/bin/sh -c 'exec blemees-agentd >> "$HOME/Library/Logs/blemees-agentd.log" 2>&1'`
+and the shell expands `$HOME`.
 
 ### 8.3 Service lifecycle
 
@@ -1431,7 +1437,8 @@ GUI session via `launchctl`. Manual install writes
 
 Socket: `/tmp/blemees-agentd-<uid>.sock`.
 Inspect: `brew services list`, `launchctl list | grep blemees`,
-`tail -f "$(brew --prefix)/var/log/blemees/blemees-agentd.err.log"`.
+`tail -f "$(brew --prefix)/var/log/blemees/blemees-agentd.err.log"`
+(manual install: `tail -f ~/Library/Logs/blemees-agentd.log`).
 
 **Linux — systemd `--user` unit.** `brew services start blemees` writes
 `~/.config/systemd/user/homebrew.blemees.service`. Manual install writes
@@ -1444,24 +1451,25 @@ Inspect: `brew services list`, `launchctl list | grep blemees`,
 Socket: `$XDG_RUNTIME_DIR/blemees/agentd.sock` (= `/run/user/<uid>/blemees/agentd.sock`).
 Inspect: `systemctl --user status blemees-agentd`, `journalctl --user -u blemees-agentd -f`.
 
-#### Finding the `claude` and `codex` binaries
+#### Finding the agent binaries
 
 Services do **not** inherit your shell's `PATH`. `brew services` and
 systemd `--user` start with a minimal `PATH` (`/usr/bin:/bin:...`) plus
 whatever the unit file adds. The tap formula extends it to cover
 `~/.local/bin`, `~/bin`, and `$HOMEBREW_PREFIX/bin`, which is where the
-standalone installers put `claude` and `codex`. The symptom when this
-is wrong is a healthy `daemon.start` line but every session for the
-affected backend ending in `spawn_failed`.
+standalone installers put the ACP agents (`claude-agent-acp`,
+`codex-acp`, ...). The symptom when this is wrong is a healthy
+`daemon.start` line but every session for the affected agent failing
+with `agent_unavailable` / `spawn_failed`.
 
-If your `claude` or `codex` lives elsewhere (npm global under
-`~/.nvm/...`, a custom path, etc.), override with `BLEMEES_AGENTD_CLAUDE`
-and / or `BLEMEES_AGENTD_CODEX`:
+If an agent lives elsewhere (npm global under `~/.nvm/...`, a custom
+path, etc.), give its full path as the profile's `agent_command` in
+`agentd.toml`. For the built-in `default` profile, `BLEMEES_AGENTD_AGENT`
+(or `--agent`) does the same:
 
 - macOS:
   ```bash
-  launchctl setenv BLEMEES_AGENTD_CLAUDE "$(which claude)"
-  launchctl setenv BLEMEES_AGENTD_CODEX  "$(which codex)"
+  launchctl setenv BLEMEES_AGENTD_AGENT "$(which claude-agent-acp)"
   brew services restart blemees
   ```
   `launchctl setenv` persists until reboot; for durable override, add
@@ -1471,13 +1479,9 @@ and / or `BLEMEES_AGENTD_CODEX`:
   systemctl --user edit blemees-agentd
   # add in the editor:
   #   [Service]
-  #   Environment="BLEMEES_AGENTD_CLAUDE=/full/path/to/claude"
-  #   Environment="BLEMEES_AGENTD_CODEX=/full/path/to/codex"
+  #   Environment="BLEMEES_AGENTD_AGENT=/full/path/to/claude-agent-acp"
   systemctl --user restart blemees-agentd
   ```
-
-Or bake `--claude /full/path/to/claude --codex /full/path/to/codex`
-into the unit's `ExecStart` / plist `ProgramArguments`.
 
 #### Running at boot
 

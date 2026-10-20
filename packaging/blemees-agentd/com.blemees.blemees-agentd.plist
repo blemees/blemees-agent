@@ -6,23 +6,33 @@
     <key>Label</key>
     <string>com.blemees.blemees-agentd</string>
 
+    <!--
+        launchd does not expand `~` or `$HOME` in StandardOutPath /
+        StandardErrorPath, so a fixed path there would have to be shared
+        (/tmp) or hard-coded per user. Instead, run the daemon through
+        /bin/sh, which does expand $HOME (launchd sets it for a
+        LaunchAgent), and send stdout + stderr to the per-user log:
+            ~/Library/Logs/blemees-agentd.log
+        `exec` replaces the shell, so launchd tracks the daemon itself
+        (KeepAlive and exit status work as before).
+    -->
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/env</string>
-        <string>blemees-agentd</string>
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <string>exec blemees-agentd &gt;&gt; "$HOME/Library/Logs/blemees-agentd.log" 2&gt;&amp;1</string>
     </array>
 
     <!--
-        If `claude` or `codex` aren't on launchd's PATH, point at them
-        explicitly:
+        If `blemees-agentd` or the ACP agent binaries (claude-agent-acp,
+        codex-acp, ...) aren't on launchd's PATH, set PATH explicitly:
             <key>EnvironmentVariables</key>
             <dict>
-                <key>BLEMEES_AGENTD_CLAUDE</key>
-                <string>/Users/you/.local/bin/claude</string>
-                <key>BLEMEES_AGENTD_CODEX</key>
-                <string>/Users/you/.local/bin/codex</string>
+                <key>PATH</key>
+                <string>/Users/you/.local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
             </dict>
-        Both default to the bare binary name resolved through PATH.
+        Or give a profile's `agent_command` (or BLEMEES_AGENTD_AGENT for
+        the default profile) as a full path.
     -->
 
     <key>RunAtLoad</key>
@@ -36,11 +46,5 @@
 
     <key>ThrottleInterval</key>
     <integer>5</integer>
-
-    <key>StandardErrorPath</key>
-    <string>/tmp/blemees-agentd.err.log</string>
-
-    <key>StandardOutPath</key>
-    <string>/tmp/blemees-agentd.out.log</string>
 </dict>
 </plist>

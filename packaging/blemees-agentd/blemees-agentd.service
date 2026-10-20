@@ -6,11 +6,11 @@ After=default.target
 ExecStart=%h/.local/bin/blemees-agentd
 Restart=on-failure
 RestartSec=2s
-# If `claude` or `codex` aren't on the daemon's PATH, point at them
-# explicitly via the matching env vars. Both default to the bare
-# binary name resolved through PATH.
-# Environment=BLEMEES_AGENTD_CLAUDE=%h/.local/bin/claude
-# Environment=BLEMEES_AGENTD_CODEX=%h/.local/bin/codex
+# If the ACP agent binaries (claude-agent-acp, codex-acp, ...) aren't on
+# the daemon's PATH, extend PATH, or give a profile's `agent_command`
+# (or BLEMEES_AGENTD_AGENT for the default profile) as a full path.
+# Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Environment=BLEMEES_AGENTD_AGENT=%h/.local/bin/claude-agent-acp
 
 [Install]
 WantedBy=default.target

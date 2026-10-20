@@ -22,6 +22,7 @@ reconnect and catch up across disconnects or daemon restarts.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import time
 from collections.abc import Awaitable, Callable
@@ -31,7 +32,13 @@ from typing import Any
 
 from .backends import AgentBackend
 from .errors import SessionExistsError, SessionUnknownError
-from .event_log import DurableEventLog, RingBuffer, event_log_path
+from .event_log import (
+    DurableEventLog,
+    RingBuffer,
+    delete_session_files,
+    event_log_path,
+    usage_sidecar_path,
+)
 from .notify import (
     AGENT_CRASHED,
     AUTH_REQUIRED,
@@ -586,7 +593,7 @@ class Session:
                 self.seq = latest
         log.open()
         self.log = log
-        self._usage_path = Path(base_dir) / f"{self.session_id}.usage.json"
+        self._usage_path = usage_sidecar_path(base_dir, self.session_id)
         self._load_usage_sidecar()
 
     # ------------------------------------------------------------------
@@ -803,11 +810,8 @@ class SessionTable:
         if sess.backend is not None:
             await sess.backend.close()
         if sess.log is not None:
-            if delete_file:
-                sess.log.unlink()
-            else:
-                sess.log.close()
-        if delete_file:
+            sess.log.close()
+        if delete_file and self.event_log_dir:
             # Backend-native transcripts under `~/.claude/projects/` and
             # `~/.codex/sessions/` are *not* removed: they live under
             # directories the backends own and (for Codex) reference from
@@ -816,13 +820,9 @@ class SessionTable:
             # stale rollout path …") and breaks resume-from-disk for
             # clients that didn't ask the daemon to do that. The daemon
             # only removes its own files: the event log and the usage
-            # sidecar.
-            if sess._usage_path is not None:
-                try:
-                    if sess._usage_path.is_file():
-                        sess._usage_path.unlink()
-                except OSError:
-                    pass
+            # sidecar (same helper as the retention sweep).
+            with contextlib.suppress(OSError, ValueError):
+                delete_session_files(self.event_log_dir, session_id)
 
     # ------------------------------------------------------------------
     # Idle reaper

@@ -263,6 +263,7 @@ blemees_agent/
   supervisor.py          # Profile → Agent registry; one ACP process per agent (#17)
   registry.py            # persistent session + over-wire profile store (#21, #25)
   event_log.py           # durable per-session `.jsonl` event log (#22)
+  retention.py           # opt-in sweep of old closed sessions (#50)
   notify.py              # needs_attention webhook sink (#24, #52)
   backends/
     __init__.py
@@ -1133,8 +1134,8 @@ not parse these files and does **not** delete them — that directory
 is CC's to manage. `close{delete:true}` only removes the daemon's
 own per-session state (event log + usage sidecar). See §5.8.
 
-Optional startup housekeeping: remove session files older than
-`SESSION_RETENTION_DAYS` (default 7). Opt-in via config.
+Optional housekeeping: the `session_retention_days` sweep (§8, off by
+default) removes old closed sessions' daemon-owned state only.
 
 ### 6.2 Codex backend (`backend:"codex"`)
 
@@ -1294,13 +1295,30 @@ vars override. Env prefix: `BLEMEES_AGENTD_`.
 | `max_concurrent_sessions` | — | — | `64` |
 | `ring_buffer_size` | — | `BLEMEES_AGENTD_RING_BUFFER_SIZE` | `1024` |
 | `shutdown_grace_s` | — | `BLEMEES_AGENTD_SHUTDOWN_GRACE` | `30` (0 = hard-kill on shutdown) |
+| `session_retention_days` | — | `BLEMEES_AGENTD_SESSION_RETENTION_DAYS` | `0` = off. N > 0: at startup and every 24 h, delete closed sessions idle > N days (see below) |
 | `notify_webhook_url` | — | `BLEMEES_AGENTD_NOTIFY_WEBHOOK_URL` | none (global fallback for the notify webhook; per-profile `[profiles.<p>.notify] webhook_url` overrides) |
 | `notify_webhook_format` | — | `BLEMEES_AGENTD_NOTIFY_FORMAT` | `json` (`ntfy` for plain-text phone push, see below) |
 
 The pre-0.11 keys `claude_bin` / `codex_bin` (and their `--claude` /
-`--codex` flags), `session_retention_days`, `max_sessions_per_connection`
+`--codex` flags), `max_sessions_per_connection`
 and `stderr_rate_lines` / `stderr_rate_window_s` are still accepted but
 ignored.
+
+**Session retention** (`session_retention_days`, off by default). With
+N > 0, a session that is not live in the daemon and whose last activity
+is more than N days old loses its registry record
+(`<state_dir>/registry.json`) and its `<event_log_dir>/<session>.jsonl`
+event log and `<session>.usage.json` sidecar: the same files
+`session.close{delete:true}` removes. Last activity is the newest of the
+record's `last_active_at_ms` and `created_at_ms` and the mtime of the
+session's event log and sidecar; the daemon refreshes `last_active_at_ms`
+on open, close and shutdown and every 30 s while the session is live. A
+record with no timestamp at all is kept. The sweep never deletes a live
+(open, attached or running) session, agent-owned files (`~/.claude`,
+`~/.codex`, …), other files in those dirs, profiles, or symlink targets.
+"Live" means live in *this* daemon process: if two daemons share a
+`state_dir` (unusual, and not supported), one daemon can sweep a session
+the other has open. Negative values are treated as 0.
 
 #### Profiles
 

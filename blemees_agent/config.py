@@ -44,7 +44,11 @@ class Config:
     log_file: str | None = None
     max_line_bytes: int = 16 * 1024 * 1024
     idle_timeout_s: int = 900
-    session_retention_days: int = 7
+    # Retention sweep for closed sessions: when > 0, at startup and every
+    # 24 h the daemon deletes registry records + event logs/usage sidecars of
+    # sessions not live in this process and idle for more than N days.
+    # 0 (default) disables it. See retention.py.
+    session_retention_days: int = 0
     max_sessions_per_connection: int = 32
     max_concurrent_sessions: int = 64
     stderr_rate_lines: int = 50
@@ -114,6 +118,7 @@ def _env_overrides() -> dict[str, Any]:
         "BLEMEES_AGENTD_EVENT_LOG_DIR": "event_log_dir",
         "BLEMEES_AGENTD_STATE_DIR": "state_dir",
         "BLEMEES_AGENTD_SHUTDOWN_GRACE": "shutdown_grace_s",
+        "BLEMEES_AGENTD_SESSION_RETENTION_DAYS": "session_retention_days",
         "BLEMEES_AGENTD_NOTIFY_WEBHOOK_URL": "notify_webhook_url",
         "BLEMEES_AGENTD_NOTIFY_FORMAT": "notify_webhook_format",
     }

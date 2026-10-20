@@ -11,13 +11,15 @@ tests and linting.
 ```bash
 git clone https://github.com/blemees/blemees-daemon
 cd blemees-daemon
-uv pip install -e ".[dev]"     # or: pip install -e ".[dev]"
+uv sync --extra dev            # installs the versions pinned in uv.lock, like CI
+# pip install -e ".[dev]" also works, but it ignores uv.lock, so it
+# does not match CI.
 ```
 
 Run the daemon locally for smoke testing:
 
 ```bash
-blemees-agentd --log-level debug
+uv run blemees-agentd --log-level debug
 ```
 
 ## Tests and lint
@@ -25,9 +27,9 @@ blemees-agentd --log-level debug
 All four must pass locally before opening a PR — CI runs the same set:
 
 ```bash
-ruff check .
-ruff format --check .
-pytest -q
+uv run ruff check .
+uv run ruff format --check .
+uv run pytest -q
 uv build       # sanity-check sdist + wheel
 ```
 

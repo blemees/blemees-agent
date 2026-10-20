@@ -387,6 +387,9 @@ reading `protocol.py`.
 → {"type":"profile.list","id":"p1"}
 ← {"type":"profiles","id":"p1","profiles":[ { …profile fields, "running":true, "sessions":2 } ]}
 
+→ {"type":"profile.get","id":"pg","name":"claude-sonnet"}
+← {"type":"profile.info","id":"pg","name":"claude-sonnet","source":"dynamic","profile":{ "name":"claude-sonnet","agents":{ "default":{"command":"claude-agent-acp","args":[…],"model":"sonnet","mcp_servers":[{"name":"fs","command":"…","env":{"FS_TOKEN":"<redacted>"}}],"env":{"ANTHROPIC_API_KEY":"<redacted>"}} },"permission_policy":{"mode":"relay","detached":"stall"},"notify":{"webhook_url":"<redacted>","format":"ntfy"},"attention":{"triggers":[…]} }}
+
 → {"type":"profile.create","id":"p2","profile":{ "name":"claude-sonnet","agent":{…},"model":"sonnet","permission_policy":{"mode":"relay","detached":"stall"},"mcp_servers":[…],"notify":{…} }}
 ← {"type":"profile.created","id":"p2","name":"claude-sonnet"}
 
@@ -404,6 +407,24 @@ config-file profiles are **config-managed** and reject `update`/`delete`
 `create` validates each agent binary is on `$PATH` (else `agent_unavailable`)
 and rejects an existing name (`profile_exists`). `update`/`delete` of a profile
 that still has live sessions are refused (`profile_in_use`) — close them first.
+
+`profile.get` returns one profile's **full editable spec** (any `source`; an
+unknown name is `profile_unknown`). `profile.list` carries only per-agent
+name/command/model, and `profile.update` *replaces* the whole spec, so an
+editor must seed itself from `profile.get` or it silently drops the fields it
+did not re-type. The `profile` object is an `agents` table (each agent:
+`command`, `args`, `mcp_servers`, `env`, and `model`/`mode`/`agent_home` when
+set) plus `permission_policy`, `notify` and `attention.triggers`, and can be
+sent back unchanged as the `profile` of a `profile.update`.
+
+Secrets are never returned (§10): every agent `env` value, every MCP-server
+`env` value, and every `notify` value except `format` (i.e. the webhook URL)
+is the literal placeholder `"<redacted>"`; the keys are kept so an editor can
+list them. In `profile.update`, a `"<redacted>"` value means **keep the stored
+value** of that key (agents matched by name, MCP servers by `name`), any other
+value replaces it, and an omitted key is removed. A placeholder with nothing
+stored behind it (a new key, a renamed agent, or `profile.create`) is dropped,
+never stored literally.
 
 ### 9.3 Sessions
 ```json
@@ -516,6 +537,9 @@ perms, no remote listener (SSH-forward the socket), per-user daemon,
 - The notify webhook URL and payloads are treated as secret-adjacent;
   `detail` text is the only conversation-derived field and is capped/scrubbed
   (no prompt bodies).
+- Neither is ever sent back over the wire: `notify.test_result` reports only
+  `webhook_configured`, and `profile.get` (§9.2) replaces agent / MCP-server
+  `env` values and `notify` values (except `format`) with `"<redacted>"`.
 
 ---
 

@@ -22,6 +22,7 @@ profile with a ``default`` agent is always synthesised from the daemon's
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import os
 import shutil
@@ -44,6 +45,13 @@ if TYPE_CHECKING:
 
 DEFAULT_PROFILE = "default"
 DEFAULT_AGENT = "default"
+
+# Placeholder that ``profile.get`` puts in place of a secret value (#43): agent
+# ``env`` values, MCP-server ``env`` values, and every ``notify`` value except
+# ``format`` (the webhook URL is secret-adjacent, spec §10). Sent back in a
+# ``profile.update`` (or ``create``), it means "keep the stored value" — see
+# :func:`_restore_redacted`.
+REDACTED = "<redacted>"
 
 
 @dataclasses.dataclass(slots=True)
@@ -148,6 +156,73 @@ def _profile_from_spec(
         notify=dict(notify) if isinstance(notify, dict) else {},
         attention_triggers=_attention_triggers_from_spec(name, pspec, log),
     )
+
+
+def _agent_specs(pspec: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """The (agent name, raw agent spec) pairs of a raw profile spec, using the
+    same shape precedence as :func:`_profile_from_spec`."""
+    agents_spec = pspec.get("agents")
+    if isinstance(agents_spec, dict) and agents_spec:
+        return [(str(a), s) for a, s in agents_spec.items() if isinstance(s, dict)]
+    if isinstance(pspec.get("agent"), dict):
+        return [(DEFAULT_AGENT, pspec["agent"])]
+    return [(DEFAULT_AGENT, pspec)]
+
+
+def _mcp_key(spec: dict[str, Any]) -> Any:
+    # Same identity the ACP backend uses for an MCP server (name, else command).
+    return spec.get("name", spec.get("command"))
+
+
+def _restore_map(new: Any, old: dict[str, Any]) -> None:
+    """In place: swap each ``REDACTED`` value in ``new`` for the stored one
+    under the same key; drop the key when nothing is stored to restore."""
+    if not isinstance(new, dict):
+        return
+    for key, value in list(new.items()):
+        if value == REDACTED:
+            if key in old:
+                new[key] = old[key]
+            else:
+                del new[key]
+
+
+def _restore_redacted(spec: dict[str, Any], old: Profile | None) -> dict[str, Any]:
+    """Return a copy of a raw profile spec with ``REDACTED`` placeholders
+    replaced by the stored secret values of ``old`` (#43).
+
+    ``profile.get`` never returns secrets, but ``profile.update`` replaces the
+    whole spec — so an editor that round-trips ``profile.info`` sends the
+    placeholders back. They resolve to the existing value of the same key
+    (agent ``env``, MCP-server ``env`` matched by server name, ``notify``); a
+    placeholder with no stored value (new key, renamed agent, or ``create``)
+    is dropped rather than stored literally.
+    """
+    spec = copy.deepcopy(spec)
+    _restore_map(spec.get("notify"), old.notify if old is not None else {})
+    for aname, aspec in _agent_specs(spec):
+        old_agent = old.agents.get(aname) if old is not None else None
+        _restore_map(aspec.get("env"), old_agent.env if old_agent is not None else {})
+        mcp_servers = aspec.get("mcp_servers")
+        if not isinstance(mcp_servers, list):
+            continue
+        old_mcp = {
+            _mcp_key(m): m
+            for m in (old_agent.mcp_servers if old_agent is not None else [])
+            if isinstance(m, dict)
+        }
+        for server in mcp_servers:
+            if isinstance(server, dict):
+                old_env = old_mcp.get(_mcp_key(server), {}).get("env")
+                _restore_map(server.get("env"), old_env if isinstance(old_env, dict) else {})
+    return spec
+
+
+def _redacted_mcp_server(spec: dict[str, Any]) -> dict[str, Any]:
+    out = copy.deepcopy(spec)
+    if isinstance(out.get("env"), dict):
+        out["env"] = {k: REDACTED for k in out["env"]}
+    return out
 
 
 def _attention_triggers_from_spec(
@@ -360,6 +435,8 @@ class Supervisor:
     def create_profile(self, name: str, spec: dict[str, Any]) -> Profile:
         if name in self._profiles:
             raise ProfileExistsError(name)
+        # Nothing stored to restore: any REDACTED placeholder is dropped (#43).
+        spec = _restore_redacted(spec, None)
         profile = _profile_from_spec(name, spec, self._config.agent_command, self._log)
         if profile is None:
             raise ProfileUnknownError(name)  # malformed spec → no agents
@@ -372,6 +449,9 @@ class Supervisor:
         if name not in self._profiles:
             raise ProfileUnknownError(name)
         self._ensure_mutable(name)
+        # A round-tripped profile.info carries REDACTED placeholders for
+        # secrets; resolve them to the stored values before replacing (#43).
+        spec = _restore_redacted(spec, self._profiles[name])
         profile = _profile_from_spec(name, spec, self._config.agent_command, self._log)
         if profile is None:
             raise ProfileUnknownError(name)
@@ -421,6 +501,49 @@ class Supervisor:
                 }
             )
         return rows
+
+    def is_config_managed(self, name: str) -> bool:
+        return name in self._static_names
+
+    def profile_spec(self, name: str | None) -> dict[str, Any]:
+        """The full editable spec of one profile, for ``profile.get`` (#43).
+
+        ``profile_list`` only carries per-agent name/command/model, and
+        ``profile.update`` replaces the whole spec, so an editor seeded from
+        it drops every other field. This is the complete spec (``agents``
+        table with command/args/model/mode/agent_home/mcp_servers/env, plus
+        ``permission_policy``, ``notify``, ``attention``), shaped so it can be
+        sent back unchanged as a ``profile.update`` body. Works for config and
+        dynamic profiles alike. Raises ``ProfileUnknownError`` for a bad name.
+
+        Secrets are never returned (spec §10): agent ``env`` and MCP-server
+        ``env`` values and all ``notify`` values except ``format`` are replaced
+        by :data:`REDACTED`; keys are kept so the editor can show them.
+        """
+        profile = self.get_profile(name)
+        agents: dict[str, Any] = {}
+        for aname, agent in profile.agents.items():
+            aspec: dict[str, Any] = {"command": agent.command, "args": list(agent.args)}
+            # Optional scalars are omitted when unset (not null) so the spec
+            # stays valid as a profile.update body (AgentSpec types them string).
+            if agent.model is not None:
+                aspec["model"] = agent.model
+            if agent.mode is not None:
+                aspec["mode"] = agent.mode
+            if agent.agent_home is not None:
+                aspec["agent_home"] = agent.agent_home
+            aspec["mcp_servers"] = [
+                _redacted_mcp_server(m) if isinstance(m, dict) else m for m in agent.mcp_servers
+            ]
+            aspec["env"] = {k: REDACTED for k in agent.env}
+            agents[aname] = aspec
+        return {
+            "name": profile.name,
+            "agents": agents,
+            "permission_policy": copy.deepcopy(profile.permission_policy),
+            "notify": {k: (v if k == "format" else REDACTED) for k, v in profile.notify.items()},
+            "attention": {"triggers": sorted(profile.attention_triggers)},
+        }
 
     # -- reaping / shutdown --------------------------------------------
 

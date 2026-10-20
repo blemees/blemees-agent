@@ -1323,7 +1323,9 @@ agent_args = ["acp"]
 ```
 
 Profiles can also be created over the wire (`profile.create`, persisted
-under `state_dir`).
+under `state_dir`). `profile.get` returns one profile's full editable spec for
+an editor, with `env` values and the notify webhook URL redacted
+([`docs/acp-migration-spec.md`](docs/acp-migration-spec.md) §9.2).
 
 #### Attention policy (per profile)
 

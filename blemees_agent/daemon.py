@@ -305,6 +305,8 @@ class Connection:
                 await self._handle_session_info(parse_session_info(obj))
             elif msg_type == "profile.list":
                 await self._handle_profile_list(parse_profile_list(obj))
+            elif msg_type == "profile.get":
+                await self._handle_profile_get(parse_profile_action(obj))
             elif msg_type == "profile.start":
                 await self._handle_profile_start(parse_profile_action(obj))
             elif msg_type == "profile.stop":
@@ -884,6 +886,21 @@ class Connection:
     async def _handle_profile_list(self, msg) -> None:
         await self._emit_frame(
             {"type": "profiles", "id": msg.id, "profiles": self._supervisor.profile_list()}
+        )
+
+    async def _handle_profile_get(self, msg) -> None:
+        # Full editable spec for one profile, secrets redacted (#43).
+        # profile_spec raises ProfileUnknownError (→ profile_unknown).
+        spec = self._supervisor.profile_spec(msg.name)
+        await self._emit_frame(
+            {
+                "type": "profile.info",
+                "id": msg.id,
+                "name": msg.name,
+                # config-managed profiles are readable but not editable (#25).
+                "source": "config" if self._supervisor.is_config_managed(msg.name) else "dynamic",
+                "profile": spec,
+            }
         )
 
     async def _handle_profile_start(self, msg) -> None:

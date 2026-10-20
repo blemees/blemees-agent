@@ -15,7 +15,7 @@ from blemees_agent.errors import (
 )
 from blemees_agent.logging import configure
 from blemees_agent.registry import Registry
-from blemees_agent.supervisor import Supervisor
+from blemees_agent.supervisor import REDACTED, Supervisor
 
 LOG = configure("error")
 GOOD = sys.executable  # always resolvable on PATH
@@ -147,3 +147,126 @@ async def test_start_missing_binary_raises_agent_unavailable():
     sup = Supervisor(cfg, LOG)
     with pytest.raises(AgentUnavailableError):
         await sup.start("default")
+
+
+# ---- profile_spec / profile.get (#43) --------------------------------
+
+_RICH = {
+    "agent": {
+        "agent_command": GOOD,
+        "args": ["--flag"],
+        "model": "opus",
+        "mode": "plan",
+        "agent_home": "/tmp/home",
+        "mcp_servers": [{"name": "fs", "command": "mcp-fs", "env": {"FS_TOKEN": "s3cret"}}],
+        "env": {"API_KEY": "sk-live", "REGION": "us"},
+    },
+    "permission_policy": {"mode": "deny", "detached": "allow"},
+    "notify": {"webhook_url": "https://ntfy.sh/private-topic", "format": "ntfy"},
+    "attention": {"triggers": ["turn_complete", "permission_pending"]},
+}
+
+
+async def test_profile_spec_returns_full_spec_with_secrets_redacted(tmp_path):
+    sup, _ = _sup(tmp_path)
+    sup.create_profile("rich", _RICH)
+    spec = sup.profile_spec("rich")
+    assert spec == {
+        "name": "rich",
+        "agents": {
+            "default": {
+                "command": GOOD,
+                "args": ["--flag"],
+                "model": "opus",
+                "mode": "plan",
+                "agent_home": "/tmp/home",
+                "mcp_servers": [{"name": "fs", "command": "mcp-fs", "env": {"FS_TOKEN": REDACTED}}],
+                "env": {"API_KEY": REDACTED, "REGION": REDACTED},
+            }
+        },
+        "permission_policy": {"mode": "deny", "detached": "allow"},
+        "notify": {"webhook_url": REDACTED, "format": "ntfy"},
+        "attention": {"triggers": ["permission_pending", "turn_complete"]},
+    }
+    # Redaction is a view: the live profile still holds the real secrets.
+    agent = sup.get_profile("rich").default_agent
+    assert agent.env["API_KEY"] == "sk-live"
+    assert agent.mcp_servers[0]["env"]["FS_TOKEN"] == "s3cret"
+    assert "s3cret" not in repr(spec) and "sk-live" not in repr(spec)
+    assert "private-topic" not in repr(spec)
+
+
+async def test_profile_spec_config_managed_multi_agent(tmp_path):
+    sup, _ = _sup(
+        tmp_path,
+        work={"agents": {"a": {"agent_command": GOOD}, "b": {"agent_command": GOOD, "model": "x"}}},
+    )
+    spec = sup.profile_spec("work")
+    assert set(spec["agents"]) == {"a", "b"}
+    assert spec["agents"]["a"] == {"command": GOOD, "args": [], "mcp_servers": [], "env": {}}
+    assert spec["agents"]["b"]["model"] == "x"
+    assert spec["permission_policy"] == {"mode": "relay", "detached": "stall"}
+    assert spec["notify"] == {}
+    assert sup.is_config_managed("work") and sup.is_config_managed("default")
+    # The synthesised default profile is gettable too.
+    assert sup.profile_spec("default")["agents"]["default"]["command"] == GOOD
+
+
+async def test_profile_spec_unknown_raises(tmp_path):
+    sup, _ = _sup(tmp_path)
+    with pytest.raises(ProfileUnknownError):
+        sup.profile_spec("nope")
+
+
+async def test_update_with_round_tripped_spec_keeps_secrets(tmp_path):
+    # An editor sends profile.info's spec straight back (placeholders and
+    # all), changing only the model. Stored secrets must survive, both in
+    # memory and in the persisted registry spec.
+    sup, reg = _sup(tmp_path)
+    sup.create_profile("rich", _RICH)
+    spec = sup.profile_spec("rich")
+    spec["agents"]["default"]["model"] = "sonnet"
+    await sup.update_profile("rich", spec)
+
+    profile = sup.get_profile("rich")
+    agent = profile.default_agent
+    assert agent.model == "sonnet"
+    assert agent.args == ["--flag"] and agent.mode == "plan"
+    assert agent.env == {"API_KEY": "sk-live", "REGION": "us"}
+    assert agent.mcp_servers[0]["env"] == {"FS_TOKEN": "s3cret"}
+    assert profile.notify == {"webhook_url": "https://ntfy.sh/private-topic", "format": "ntfy"}
+    assert profile.permission_policy == {"mode": "deny", "detached": "allow"}
+    assert profile.attention_triggers == {"permission_pending", "turn_complete"}
+    persisted = reg.get_profile_spec("rich")
+    assert REDACTED not in repr(persisted)
+    assert persisted["agents"]["default"]["env"]["API_KEY"] == "sk-live"
+    # Round-tripping again yields the same redacted view (idempotent).
+    assert sup.profile_spec("rich")["agents"]["default"]["model"] == "sonnet"
+
+
+async def test_update_replaces_and_drops_secrets_explicitly(tmp_path):
+    sup, _ = _sup(tmp_path)
+    sup.create_profile("rich", _RICH)
+    spec = sup.profile_spec("rich")
+    env = spec["agents"]["default"]["env"]
+    env["API_KEY"] = "sk-new"  # explicit new value wins
+    del env["REGION"]  # removed key is gone
+    env["ADDED"] = REDACTED  # placeholder with nothing stored → dropped
+    spec["notify"].pop("webhook_url")
+    await sup.update_profile("rich", spec)
+    profile = sup.get_profile("rich")
+    assert profile.default_agent.env == {"API_KEY": "sk-new"}
+    assert profile.notify == {"format": "ntfy"}
+
+
+async def test_create_drops_redacted_placeholders(tmp_path):
+    # Duplicating a profile from profile.info: placeholders have no stored
+    # value to resolve to, so they're dropped instead of stored literally.
+    sup, reg = _sup(tmp_path)
+    sup.create_profile("rich", _RICH)
+    sup.create_profile("copy", sup.profile_spec("rich"))
+    copied = sup.get_profile("copy")
+    assert copied.default_agent.env == {}
+    assert copied.default_agent.mcp_servers[0]["env"] == {}
+    assert copied.notify == {"format": "ntfy"}
+    assert REDACTED not in repr(reg.get_profile_spec("copy"))

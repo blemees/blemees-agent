@@ -294,6 +294,108 @@ async def test_update_profile_with_live_session_rejected(state_dir):
                 await c.close()
 
 
+# ---- profile.get (#43) ----------------------------------------------
+
+
+async def test_profile_get_dynamic_full_spec_and_round_trip(state_dir):
+    # #43: profile.get returns the whole editable spec (not just the
+    # profile.list row) with secrets redacted, and the returned spec can be
+    # sent straight back as a profile.update body without losing anything.
+    sock = short_socket_path("blemeesd-pg1")
+    with socket_cleanup(sock):
+        async with _daemon(state_dir, sock):
+            c = await _connect(sock)
+            try:
+                await c.send(
+                    {
+                        "type": "profile.create",
+                        "id": "c",
+                        "profile": {
+                            "name": "rich",
+                            "agent": {
+                                "agent_command": GOOD,
+                                "args": [FAKE_ACP],
+                                "model": "opus",
+                                "mcp_servers": [
+                                    {"name": "fs", "command": "mcp-fs", "env": {"T": "s3cret"}}
+                                ],
+                                "env": {"API_KEY": "sk-live"},
+                            },
+                            "permission_policy": {"mode": "deny", "detached": "allow"},
+                            "notify": {"webhook_url": "https://ntfy.sh/private-topic"},
+                        },
+                    }
+                )
+                await c.wait_for(lambda e: e.get("type") == "profile.created")
+
+                await c.send({"type": "profile.get", "id": "g", "name": "rich"})
+                info = await c.wait_for(lambda e: e.get("type") == "profile.info")
+                assert info["id"] == "g"
+                assert info["name"] == "rich"
+                assert info["source"] == "dynamic"
+                spec = info["profile"]
+                agent = spec["agents"]["default"]
+                assert agent["command"] == GOOD
+                assert agent["args"] == [FAKE_ACP]
+                assert agent["model"] == "opus"
+                assert agent["mcp_servers"] == [
+                    {"name": "fs", "command": "mcp-fs", "env": {"T": "<redacted>"}}
+                ]
+                assert agent["env"] == {"API_KEY": "<redacted>"}
+                assert spec["permission_policy"] == {"mode": "deny", "detached": "allow"}
+                assert spec["notify"] == {"webhook_url": "<redacted>"}
+                assert sorted(spec["attention"]["triggers"]) == [
+                    "agent_crashed",
+                    "auth_required",
+                    "permission_pending",
+                ]
+                for secret in ("sk-live", "s3cret", "private-topic"):
+                    assert secret not in repr(info)
+
+                # Round-trip with one edit; nothing else may be lost.
+                agent["model"] = "sonnet"
+                await c.send({"type": "profile.update", "id": "u", "name": "rich", "profile": spec})
+                await c.wait_for(lambda e: e.get("type") == "profile.updated")
+                await c.send({"type": "profile.get", "id": "g2", "name": "rich"})
+                again = await c.wait_for(
+                    lambda e: e.get("type") == "profile.info" and e.get("id") == "g2"
+                )
+                assert again["profile"] == spec
+            finally:
+                await c.close()
+
+
+async def test_profile_get_config_profile_and_unknown(state_dir):
+    sock = short_socket_path("blemeesd-pg2")
+    with socket_cleanup(sock):
+        async with _daemon(
+            state_dir,
+            sock,
+            profiles={"cfg": {"agent_command": GOOD, "model": "m", "env": {"K": "v"}}},
+        ):
+            c = await _connect(sock)
+            try:
+                # Config-managed profiles are readable (just not editable).
+                await c.send({"type": "profile.get", "id": "g", "name": "cfg"})
+                info = await c.wait_for(lambda e: e.get("type") == "profile.info")
+                assert info["source"] == "config"
+                agent = info["profile"]["agents"]["default"]
+                assert agent["model"] == "m"
+                assert agent["env"] == {"K": "<redacted>"}
+
+                await c.send({"type": "profile.get", "id": "g0", "name": "default"})
+                info = await c.wait_for(lambda e: e.get("type") == "profile.info")
+                assert info["source"] == "config"
+                assert info["profile"]["agents"]["default"]["args"] == [FAKE_ACP]
+
+                await c.send({"type": "profile.get", "id": "g2", "name": "nope"})
+                err = await c.wait_for(lambda e: e.get("type") == "error")
+                assert err["code"] == "profile_unknown"
+                assert err["id"] == "g2"
+            finally:
+                await c.close()
+
+
 # ---- agent_unavailable ----------------------------------------------
 
 

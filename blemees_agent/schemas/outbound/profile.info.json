@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blemees/schemas/outbound/profile.info.json",
+  "title": "profile.info",
+  "description": "Reply to profile.get (#43). `profile` is the complete editable spec (an `agents` table with command/args/model/mode/agent_home/mcp_servers/env per agent, plus permission_policy, notify, attention), shaped so it can be sent back unchanged as the `profile` of a profile.update. Secrets are never returned: agent `env` values, MCP-server `env` values and every `notify` value except `format` are the literal placeholder \"<redacted>\" (keys are kept). A \"<redacted>\" value sent back in profile.update keeps the stored value; with no stored value the key is dropped. `source` is config | dynamic; config-managed profiles are readable but reject update (profile_protected).",
+  "type": "object",
+  "properties": {
+    "type": { "const": "profile.info" },
+    "id": { "$ref": "https://blemees/schemas/_common.json#/$defs/RequestId" },
+    "name": { "$ref": "https://blemees/schemas/_common.json#/$defs/ProfileName" },
+    "source": { "type": "string", "enum": ["config", "dynamic"] },
+    "profile": {
+      "type": "object",
+      "properties": {
+        "name": { "$ref": "https://blemees/schemas/_common.json#/$defs/ProfileName" },
+        "agents": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "command": { "type": "string" },
+              "args": { "type": "array", "items": { "type": "string" } },
+              "model": { "type": "string" },
+              "mode": { "type": "string" },
+              "agent_home": { "type": "string" },
+              "mcp_servers": { "type": "array", "items": { "type": "object" } },
+              "env": {
+                "type": "object",
+                "additionalProperties": { "const": "<redacted>" }
+              }
+            },
+            "required": ["command", "args", "mcp_servers", "env"],
+            "additionalProperties": true
+          }
+        },
+        "permission_policy": {
+          "type": "object",
+          "properties": {
+            "mode": { "type": "string", "enum": ["relay", "allow", "deny"] },
+            "detached": { "type": "string", "enum": ["stall", "allow", "deny"] }
+          },
+          "additionalProperties": true
+        },
+        "notify": {
+          "type": "object",
+          "properties": {
+            "webhook_url": { "const": "<redacted>" },
+            "format": { "type": "string" }
+          },
+          "additionalProperties": true
+        },
+        "attention": {
+          "type": "object",
+          "properties": {
+            "triggers": { "type": "array", "items": { "type": "string" } }
+          },
+          "additionalProperties": true
+        }
+      },
+      "required": ["name", "agents", "permission_policy", "notify", "attention"],
+      "additionalProperties": true
+    }
+  },
+  "required": ["type", "name", "source", "profile"],
+  "additionalProperties": true
+}

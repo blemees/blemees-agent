@@ -34,6 +34,7 @@ INBOUND_TYPES = [
     "session.detach",
     "session.permission_response",
     "profile.list",
+    "profile.get",
     "profile.start",
     "profile.stop",
     "profile.create",
@@ -48,6 +49,7 @@ OUTBOUND_TYPES = [
     "status_reply",
     "replay_gap",
     "profiles",
+    "profile.info",
     "profile.created",
     "profile.updated",
     "profile.deleted",
@@ -120,6 +122,7 @@ EXAMPLES: dict[str, dict] = {
         "option_id": "allow",
     },
     _sid("inbound", "profile.list"): {"type": "profile.list", "id": "pl"},
+    _sid("inbound", "profile.get"): {"type": "profile.get", "id": "pg", "name": "mine"},
     _sid("inbound", "profile.start"): {"type": "profile.start", "id": "ps", "name": "claude"},
     _sid("inbound", "profile.stop"): {"type": "profile.stop", "id": "px", "name": "claude"},
     _sid("inbound", "profile.create"): {
@@ -175,6 +178,29 @@ EXAMPLES: dict[str, dict] = {
         "type": "profiles",
         "id": "pl",
         "profiles": [{"name": "default", "source": "config", "agents": []}],
+    },
+    _sid("outbound", "profile.info"): {
+        "type": "profile.info",
+        "id": "pg",
+        "name": "mine",
+        "source": "dynamic",
+        "profile": {
+            "name": "mine",
+            "agents": {
+                "default": {
+                    "command": "claude-agent-acp",
+                    "args": ["--foo"],
+                    "model": "opus",
+                    "mcp_servers": [
+                        {"name": "fs", "command": "mcp-fs", "env": {"FS_TOKEN": "<redacted>"}}
+                    ],
+                    "env": {"API_KEY": "<redacted>"},
+                }
+            },
+            "permission_policy": {"mode": "relay", "detached": "stall"},
+            "notify": {"webhook_url": "<redacted>", "format": "ntfy"},
+            "attention": {"triggers": ["permission_pending"]},
+        },
     },
     _sid("outbound", "profile.created"): {"type": "profile.created", "id": "pc", "name": "mine"},
     _sid("outbound", "profile.updated"): {"type": "profile.updated", "id": "pu", "name": "mine"},
@@ -331,6 +357,46 @@ NEGATIVE: list[tuple[str, dict]] = [
         _sid("inbound", "session.attach"),
         {"type": "session.attach", "session_id": "s1", "as": "admin"},
     ),
+    # profile.get requires a name (#43)
+    (_sid("inbound", "profile.get"), {"type": "profile.get", "id": "pg"}),
+    # profile.info must never carry a plaintext env value or webhook URL (#43)
+    (
+        _sid("outbound", "profile.info"),
+        {
+            "type": "profile.info",
+            "name": "mine",
+            "source": "dynamic",
+            "profile": {
+                "name": "mine",
+                "agents": {
+                    "default": {
+                        "command": "x",
+                        "args": [],
+                        "mcp_servers": [],
+                        "env": {"API_KEY": "sk-live"},
+                    }
+                },
+                "permission_policy": {},
+                "notify": {},
+                "attention": {"triggers": []},
+            },
+        },
+    ),
+    (
+        _sid("outbound", "profile.info"),
+        {
+            "type": "profile.info",
+            "name": "mine",
+            "source": "dynamic",
+            "profile": {
+                "name": "mine",
+                "agents": {},
+                "permission_policy": {},
+                "notify": {"webhook_url": "https://ntfy.sh/topic"},
+                "attention": {"triggers": []},
+            },
+        },
+    ),
 ]
 
 
@@ -396,3 +462,14 @@ def test_invalid_frame_rejected(store_and_registry, schema_id, frame):
     store, registry = store_and_registry
     with pytest.raises(jsonschema.ValidationError):
         Draft202012Validator(store[schema_id], registry=registry).validate(frame)
+
+
+def test_profile_info_spec_round_trips_as_profile_update(store_and_registry):
+    # #43: profile.info's `profile` is meant to be sent back unchanged as a
+    # profile.update body — pin that it satisfies the inbound contract.
+    store, registry = store_and_registry
+    info = EXAMPLES[_sid("outbound", "profile.info")]
+    frame = {"type": "profile.update", "id": "pu", "name": info["name"], "profile": info["profile"]}
+    Draft202012Validator(store[_sid("inbound", "profile.update")], registry=registry).validate(
+        frame
+    )

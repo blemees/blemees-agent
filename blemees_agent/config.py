@@ -28,8 +28,6 @@ DEFAULT_CONFIG_PATH = _config_dir() / "agentd.toml"
 @dataclasses.dataclass(slots=True)
 class Config:
     socket_path: str
-    claude_bin: str = "claude"
-    codex_bin: str = "codex"
     # blemees/3 ACP backend: the agent binary the daemon spawns and drives
     # over stdio (e.g. "claude-agent-acp", "codex-acp", "gemini").
     # Profiles (#17) will let each session pick its own; #16 uses this default.
@@ -45,10 +43,7 @@ class Config:
     max_line_bytes: int = 16 * 1024 * 1024
     idle_timeout_s: int = 900
     session_retention_days: int = 7
-    max_sessions_per_connection: int = 32
     max_concurrent_sessions: int = 64
-    stderr_rate_lines: int = 50
-    stderr_rate_window_s: int = 10
     # Per-session event-stream buffering.
     ring_buffer_size: int = 1024
     # When set, outbound frames are appended to ``<event_log_dir>/<session>.jsonl``.
@@ -103,8 +98,6 @@ def _load_toml(path: Path) -> dict[str, Any]:
 def _env_overrides() -> dict[str, Any]:
     mapping = {
         "BLEMEES_AGENTD_SOCKET": "socket_path",
-        "BLEMEES_AGENTD_CLAUDE": "claude_bin",
-        "BLEMEES_AGENTD_CODEX": "codex_bin",
         "BLEMEES_AGENTD_AGENT": "agent_command",
         "BLEMEES_AGENTD_LOG_LEVEL": "log_level",
         "BLEMEES_AGENTD_LOG_FILE": "log_file",
@@ -135,8 +128,13 @@ def _coerce(field: dataclasses.Field, value: Any) -> Any:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="blemees-agentd")
     parser.add_argument("--socket", dest="socket_path", help="Unix socket path")
-    parser.add_argument("--claude", dest="claude_bin", help="Path to the claude binary")
-    parser.add_argument("--codex", dest="codex_bin", help="Path to the codex binary")
+    # Pre-0.11 (blemees/2) flags. They do nothing now, but old launchd plists /
+    # systemd units may still pass them (the README told users to bake them
+    # into ProgramArguments / ExecStart), so accept them and drop the value
+    # rather than fail at startup. ``load()`` drops these dests because they
+    # are not ``Config`` fields.
+    parser.add_argument("--claude", dest="_legacy_claude", help=argparse.SUPPRESS)
+    parser.add_argument("--codex", dest="_legacy_codex", help=argparse.SUPPRESS)
     parser.add_argument("--agent", dest="agent_command", help="Path to the ACP agent binary")
     parser.add_argument("--log-level", dest="log_level", help="debug|info|warning|error")
     parser.add_argument("--log-file", dest="log_file", help="Log file path (default stderr)")
@@ -168,6 +166,10 @@ def load(argv: list[str] | None = None) -> tuple[Config, bool]:
     merged.setdefault("socket_path", default_socket_path())
     merged.setdefault("state_dir", default_state_dir())
 
+    # Keys that are not ``Config`` fields are dropped, not rejected. This keeps
+    # old config files working after a field is removed (e.g. the pre-0.11
+    # ``claude_bin`` / ``codex_bin`` / ``max_sessions_per_connection`` /
+    # ``stderr_rate_*`` keys).
     fields = {f.name: f for f in dataclasses.fields(Config)}
     cleaned: dict[str, Any] = {}
     for key, value in merged.items():

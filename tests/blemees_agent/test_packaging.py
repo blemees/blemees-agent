@@ -8,6 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 PACKAGING = Path(__file__).resolve().parents[2] / "packaging" / "blemees-agentd"
 PLIST = PACKAGING / "com.blemees.blemees-agentd.plist"
 LOG_REL = "Library/Logs/blemees-agentd.log"
@@ -35,13 +37,18 @@ def test_plist_logs_to_per_user_library_logs_not_tmp():
     args = data["ProgramArguments"]
     assert args[:2] == ["/bin/sh", "-c"]
     assert f'"$HOME/{LOG_REL}"' in args[2]
-    assert args[2].startswith("exec blemees-agentd ")
+    assert args[2].startswith('mkdir -p "$HOME/Library/Logs" && exec blemees-agentd ')
     assert not any("/tmp" in a for a in args)
 
 
-def test_plist_command_writes_stdout_and_stderr_to_home_log(tmp_path):
+@pytest.mark.parametrize("logs_dir_exists", [True, False], ids=["logs-dir", "no-logs-dir"])
+def test_plist_command_writes_stdout_and_stderr_to_home_log(tmp_path, logs_dir_exists):
     home = tmp_path / "home"
-    (home / "Library" / "Logs").mkdir(parents=True)
+    if logs_dir_exists:
+        (home / "Library" / "Logs").mkdir(parents=True)
+    else:
+        # A HOME without Library/Logs: the command must create it.
+        home.mkdir()
     bindir = tmp_path / "bin"
     bindir.mkdir()
     fake = bindir / "blemees-agentd"

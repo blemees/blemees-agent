@@ -51,7 +51,8 @@ no `blemees/2` compatibility shims.
 - First (and only) runtime dependency: `agent-client-protocol` (the stdlib-only
   stance is retired).
 - The launchd plist logs to the per-user `~/Library/Logs/blemees-agentd.log`
-  instead of the shared, fixed `/tmp/blemees-agentd.{out,err}.log`. (#50)
+  instead of the shared, fixed `/tmp/blemees-agentd.{out,err}.log`, and
+  creates `~/Library/Logs` first if it is missing. (#50)
 
 ### Removed
 - Dead `blemees/2` config: the `claude_bin` / `codex_bin`,

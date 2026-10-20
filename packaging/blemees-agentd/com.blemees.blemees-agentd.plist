@@ -13,6 +13,8 @@
         /bin/sh, which does expand $HOME (launchd sets it for a
         LaunchAgent), and send stdout + stderr to the per-user log:
             ~/Library/Logs/blemees-agentd.log
+        `mkdir -p` makes the log dir first if it is missing (else the
+        redirect fails before `exec`, with no trace anywhere).
         `exec` replaces the shell, so launchd tracks the daemon itself
         (KeepAlive and exit status work as before).
     -->
@@ -20,7 +22,7 @@
     <array>
         <string>/bin/sh</string>
         <string>-c</string>
-        <string>exec blemees-agentd &gt;&gt; "$HOME/Library/Logs/blemees-agentd.log" 2&gt;&amp;1</string>
+        <string>mkdir -p "$HOME/Library/Logs" &amp;&amp; exec blemees-agentd &gt;&gt; "$HOME/Library/Logs/blemees-agentd.log" 2&gt;&amp;1</string>
     </array>
 
     <!--

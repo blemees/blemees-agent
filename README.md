@@ -1414,8 +1414,14 @@ Standard KeepAlive-on-crash plist with `ThrottleInterval=5`. It logs
 stdout + stderr to the per-user `~/Library/Logs/blemees-agentd.log`.
 launchd does not expand `~` or `$HOME` in `StandardOutPath` /
 `StandardErrorPath`, so the plist starts the daemon as
-`/bin/sh -c 'exec blemees-agentd >> "$HOME/Library/Logs/blemees-agentd.log" 2>&1'`
+`/bin/sh -c 'mkdir -p "$HOME/Library/Logs" && exec blemees-agentd >> "$HOME/Library/Logs/blemees-agentd.log" 2>&1'`
 and the shell expands `$HOME`.
+The log is not rotated (the daemon's `--log-file` / `log_file` only appends, too).
+To cap it, add a `newsyslog` entry, e.g. `/etc/newsyslog.d/blemees-agentd.conf`:
+`/Users/YOU/Library/Logs/blemees-agentd.log  YOU:staff  644  5  10240  *  NJ`
+(5 files of 10 MB, no signal). The daemon keeps its open file, so it writes to
+the new file only after its next restart; `: > ~/Library/Logs/blemees-agentd.log`
+truncates in place at any time (the file is opened for append).
 
 ### 8.3 Service lifecycle
 
@@ -1532,8 +1538,8 @@ Write `/Library/LaunchDaemons/com.blemees.blemees-agentd.plist` (owned
   </dict>
   <key>RunAtLoad</key>        <true/>
   <key>KeepAlive</key>        <true/>
-  <key>StandardOutPath</key>  <string>/Users/YOUR_USERNAME/Library/Logs/blemees/blemees-agentd.out.log</string>
-  <key>StandardErrorPath</key><string>/Users/YOUR_USERNAME/Library/Logs/blemees/blemees-agentd.err.log</string>
+  <key>StandardOutPath</key>  <string>/Users/YOUR_USERNAME/Library/Logs/blemees-agentd.log</string>
+  <key>StandardErrorPath</key><string>/Users/YOUR_USERNAME/Library/Logs/blemees-agentd.log</string>
 </dict>
 </plist>
 ```

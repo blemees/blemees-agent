@@ -2,7 +2,27 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://blemees/schemas/outbound/profile.info.json",
   "title": "profile.info",
-  "description": "Reply to profile.get (#43). `profile` is the complete editable spec (an `agents` table with command/args/model/mode/agent_home/mcp_servers/env per agent, plus permission_policy, notify, attention), shaped so it can be sent back unchanged as the `profile` of a profile.update. Secrets are never returned: agent `env` values, MCP-server `env` values and every `notify` value except `format` are the literal placeholder \"<redacted>\" (keys are kept). A \"<redacted>\" value sent back in profile.update keeps the stored value; with no stored value the key is dropped. `source` is config | dynamic; config-managed profiles are readable but reject update (profile_protected).",
+  "description": "Reply to profile.get (#43). `profile` is the complete editable spec (an `agents` table with command/args/model/mode/agent_home/mcp_servers/env per agent, plus permission_policy, notify, attention), shaped so it can be sent back unchanged as the `profile` of a profile.update. Values are the resolved ones (command falls back to the daemon's agent_command; default permission_policy and attention triggers), so a spec sent back unchanged pins them. Redacted to the literal placeholder \"<redacted>\" (keys kept): agent `env` values; MCP-server `env` values (dict or list form) and `headers` values; every `notify` value except `format` (a deny-list, so a new notify knob is never leaked). `args`, `url` and everything else are returned as-is. A \"<redacted>\" value sent back in profile.update keeps the stored value; with no stored value it is dropped. `source` is config | dynamic; config-managed profiles are readable but reject update (profile_protected).",
+  "$defs": {
+    "RedactedSecrets": {
+      "description": "A secret-bearing field (env / headers) as returned by profile.get: dict form with every value redacted, list form [{name, value}] with every value redacted, or an unrecognised shape replaced whole.",
+      "anyOf": [
+        { "type": "object", "additionalProperties": { "const": "<redacted>" } },
+        {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "string" },
+              "value": { "const": "<redacted>" }
+            },
+            "additionalProperties": true
+          }
+        },
+        { "const": "<redacted>" }
+      ]
+    }
+  },
   "type": "object",
   "properties": {
     "type": { "const": "profile.info" },
@@ -23,7 +43,21 @@
               "model": { "type": "string" },
               "mode": { "type": "string" },
               "agent_home": { "type": "string" },
-              "mcp_servers": { "type": "array", "items": { "type": "object" } },
+              "mcp_servers": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "name": { "type": "string" },
+                    "command": { "type": "string" },
+                    "args": { "type": "array", "items": { "type": "string" } },
+                    "url": { "type": "string" },
+                    "env": { "$ref": "#/$defs/RedactedSecrets" },
+                    "headers": { "$ref": "#/$defs/RedactedSecrets" }
+                  },
+                  "additionalProperties": true
+                }
+              },
               "env": {
                 "type": "object",
                 "additionalProperties": { "const": "<redacted>" }

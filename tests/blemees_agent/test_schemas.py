@@ -192,7 +192,18 @@ EXAMPLES: dict[str, dict] = {
                     "args": ["--foo"],
                     "model": "opus",
                     "mcp_servers": [
-                        {"name": "fs", "command": "mcp-fs", "env": {"FS_TOKEN": "<redacted>"}}
+                        {"name": "fs", "command": "mcp-fs", "env": {"FS_TOKEN": "<redacted>"}},
+                        {
+                            "name": "gh",
+                            "command": "npx",
+                            "args": ["gh-mcp"],
+                            "env": [{"name": "GH_TOKEN", "value": "<redacted>"}],
+                        },
+                        {
+                            "name": "remote",
+                            "url": "https://mcp.example",
+                            "headers": {"Authorization": "<redacted>"},
+                        },
                     ],
                     "env": {"API_KEY": "<redacted>"},
                 }
@@ -390,6 +401,54 @@ NEGATIVE: list[tuple[str, dict]] = [
             "source": "dynamic",
             "profile": {
                 "name": "mine",
+                "agents": {
+                    "default": {
+                        "command": "x",
+                        "args": [],
+                        "mcp_servers": [
+                            {"name": "r", "url": "https://m", "headers": {"Authorization": "B t"}}
+                        ],
+                        "env": {},
+                    }
+                },
+                "permission_policy": {},
+                "notify": {},
+                "attention": {"triggers": []},
+            },
+        },
+    ),
+    (
+        _sid("outbound", "profile.info"),
+        {
+            "type": "profile.info",
+            "name": "mine",
+            "source": "dynamic",
+            "profile": {
+                "name": "mine",
+                "agents": {
+                    "default": {
+                        "command": "x",
+                        "args": [],
+                        "mcp_servers": [
+                            {"name": "s", "command": "c", "env": [{"name": "T", "value": "v"}]}
+                        ],
+                        "env": {},
+                    }
+                },
+                "permission_policy": {},
+                "notify": {},
+                "attention": {"triggers": []},
+            },
+        },
+    ),
+    (
+        _sid("outbound", "profile.info"),
+        {
+            "type": "profile.info",
+            "name": "mine",
+            "source": "dynamic",
+            "profile": {
+                "name": "mine",
                 "agents": {},
                 "permission_policy": {},
                 "notify": {"webhook_url": "https://ntfy.sh/topic"},
@@ -473,3 +532,41 @@ def test_profile_info_spec_round_trips_as_profile_update(store_and_registry):
     Draft202012Validator(store[_sid("inbound", "profile.update")], registry=registry).validate(
         frame
     )
+
+
+def test_real_profile_spec_validates_as_profile_info(store_and_registry):
+    # The daemon's actual profile.get output (with dict/list env, headers and
+    # notify) must satisfy the profile.info schema, so no secret slips past it.
+    import sys
+
+    from blemees_agent.config import Config
+    from blemees_agent.logging import configure
+    from blemees_agent.supervisor import Supervisor
+
+    sup = Supervisor(
+        Config(socket_path="/tmp/x.sock", agent_command=sys.executable), configure("error")
+    )
+    sup.create_profile(
+        "mine",
+        {
+            "agent": {
+                "agent_command": sys.executable,
+                "env": {"K": "v"},
+                "mcp_servers": [
+                    {"command": "npx", "env": {"T": "a"}},
+                    {"command": "npx", "env": [{"name": "T", "value": "b"}]},
+                    {"name": "r", "url": "https://m", "headers": {"Authorization": "B t"}},
+                    {"name": "r2", "url": "https://m", "headers": [{"name": "X", "value": "y"}]},
+                ],
+            },
+            "notify": {"webhook_url": "https://ntfy.sh/t", "format": "ntfy"},
+        },
+    )
+    store, registry = store_and_registry
+    frame = {
+        "type": "profile.info",
+        "name": "mine",
+        "source": "dynamic",
+        "profile": sup.profile_spec("mine"),
+    }
+    Draft202012Validator(store[_sid("outbound", "profile.info")], registry=registry).validate(frame)

@@ -270,3 +270,134 @@ async def test_create_drops_redacted_placeholders(tmp_path):
     assert copied.default_agent.mcp_servers[0]["env"] == {}
     assert copied.notify == {"format": "ntfy"}
     assert REDACTED not in repr(reg.get_profile_spec("copy"))
+
+
+# ---- MCP restore matching by (name-or-command, occurrence) (#43 review) --
+
+
+async def test_round_trip_unnamed_mcp_servers_same_command_keep_own_secrets(tmp_path):
+    # Two unnamed servers share the key "npx" (name, else command). Each must
+    # get its own secret back, not the last one's.
+    sup, reg = _sup(tmp_path)
+    servers = [
+        {"command": "npx", "args": ["gh-mcp"], "env": {"TOKEN": "github-secret"}},
+        {"command": "npx", "args": ["slack-mcp"], "env": {"TOKEN": "slack-secret"}},
+    ]
+    sup.create_profile("m", {"agent": {"agent_command": GOOD, "mcp_servers": servers}})
+    await sup.update_profile("m", sup.profile_spec("m"))
+    assert sup.get_profile("m").default_agent.mcp_servers == servers
+    assert reg.get_profile_spec("m")["agents"]["default"]["mcp_servers"] == servers
+
+
+async def test_round_trip_same_named_mcp_servers_keep_own_secrets(tmp_path):
+    sup, reg = _sup(tmp_path)
+    servers = [
+        {"name": "fs", "command": "mcp-fs", "env": {"A": "secret-a"}},
+        {"name": "fs", "command": "mcp-fs", "env": {"B": "secret-b"}},
+    ]
+    sup.create_profile("m", {"agent": {"agent_command": GOOD, "mcp_servers": servers}})
+    await sup.update_profile("m", sup.profile_spec("m"))
+    assert sup.get_profile("m").default_agent.mcp_servers == servers
+    assert reg.get_profile_spec("m")["agents"]["default"]["mcp_servers"] == servers
+
+
+# ---- MCP headers + list-form env redaction (#43 review) ----------------
+
+
+_HTTP_AND_LIST = [
+    {
+        "name": "remote",
+        "type": "http",
+        "url": "https://mcp.example/sse?team=1",
+        "headers": {"Authorization": "Bearer hdr-secret"},
+    },
+    {
+        "name": "remote2",
+        "url": "https://mcp2.example",
+        "headers": [{"name": "X-Key", "value": "list-hdr-secret"}],
+    },
+    {
+        "name": "stdio",
+        "command": "mcp-x",
+        "args": ["--verbose"],
+        "env": [
+            {"name": "TOK", "value": "list-env-1"},
+            {"name": "TOK", "value": "list-env-2"},
+            {"name": "OTHER", "value": "list-env-3"},
+        ],
+    },
+]
+
+
+async def test_profile_spec_redacts_mcp_headers_and_list_env(tmp_path):
+    sup, _ = _sup(tmp_path)
+    sup.create_profile("h", {"agent": {"agent_command": GOOD, "mcp_servers": _HTTP_AND_LIST}})
+    servers = sup.profile_spec("h")["agents"]["default"]["mcp_servers"]
+    assert servers == [
+        {
+            "name": "remote",
+            "type": "http",
+            "url": "https://mcp.example/sse?team=1",  # url is returned as-is
+            "headers": {"Authorization": REDACTED},
+        },
+        {
+            "name": "remote2",
+            "url": "https://mcp2.example",
+            "headers": [{"name": "X-Key", "value": REDACTED}],
+        },
+        {
+            "name": "stdio",
+            "command": "mcp-x",
+            "args": ["--verbose"],  # args are returned as-is
+            "env": [
+                {"name": "TOK", "value": REDACTED},
+                {"name": "TOK", "value": REDACTED},
+                {"name": "OTHER", "value": REDACTED},
+            ],
+        },
+    ]
+    assert "secret" not in repr(servers) and "list-env" not in repr(servers)
+
+
+async def test_round_trip_mcp_headers_and_list_env_keep_secrets(tmp_path):
+    sup, reg = _sup(tmp_path)
+    sup.create_profile("h", {"agent": {"agent_command": GOOD, "mcp_servers": _HTTP_AND_LIST}})
+    await sup.update_profile("h", sup.profile_spec("h"))
+    assert sup.get_profile("h").default_agent.mcp_servers == _HTTP_AND_LIST
+    assert reg.get_profile_spec("h")["agents"]["default"]["mcp_servers"] == _HTTP_AND_LIST
+
+
+async def test_list_env_and_headers_replace_remove_and_drop(tmp_path):
+    sup, _ = _sup(tmp_path)
+    sup.create_profile("h", {"agent": {"agent_command": GOOD, "mcp_servers": _HTTP_AND_LIST}})
+    spec = sup.profile_spec("h")
+    remote, remote2, stdio = spec["agents"]["default"]["mcp_servers"]
+    remote["headers"]["Authorization"] = "Bearer new"  # explicit value replaces
+    remote["headers"]["X-New"] = REDACTED  # nothing stored → dropped
+    remote2["headers"] = []  # omitted entries are removed
+    stdio["env"][1]["value"] = "replaced-2"  # second TOK replaced, first kept
+    del stdio["env"][2]  # OTHER removed
+    stdio["env"].append({"name": "NEW", "value": REDACTED})  # nothing stored → dropped
+    await sup.update_profile("h", spec)
+    got = sup.get_profile("h").default_agent.mcp_servers
+    assert got[0]["headers"] == {"Authorization": "Bearer new"}
+    assert got[1]["headers"] == []
+    assert got[2]["env"] == [
+        {"name": "TOK", "value": "list-env-1"},
+        {"name": "TOK", "value": "replaced-2"},
+    ]
+
+
+async def test_unrecognised_secret_field_shape_redacted_whole(tmp_path):
+    # An env/headers shape the daemon doesn't know is redacted whole (fails
+    # safe) and a whole-field placeholder restores the stored value.
+    sup, _ = _sup(tmp_path)
+    odd = [{"name": "odd", "command": "x", "headers": "Authorization: Bearer odd-secret"}]
+    sup.create_profile("o", {"agent": {"agent_command": GOOD, "mcp_servers": odd}})
+    spec = sup.profile_spec("o")
+    assert spec["agents"]["default"]["mcp_servers"][0]["headers"] == REDACTED
+    await sup.update_profile("o", spec)
+    assert sup.get_profile("o").default_agent.mcp_servers == odd
+    # On create there is nothing to restore → the field is dropped.
+    sup.create_profile("o2", spec)
+    assert "headers" not in sup.get_profile("o2").default_agent.mcp_servers[0]

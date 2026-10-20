@@ -417,14 +417,34 @@ did not re-type. The `profile` object is an `agents` table (each agent:
 set) plus `permission_policy`, `notify` and `attention.triggers`, and can be
 sent back unchanged as the `profile` of a `profile.update`.
 
-Secrets are never returned (§10): every agent `env` value, every MCP-server
-`env` value, and every `notify` value except `format` (i.e. the webhook URL)
-is the literal placeholder `"<redacted>"`; the keys are kept so an editor can
-list them. In `profile.update`, a `"<redacted>"` value means **keep the stored
-value** of that key (agents matched by name, MCP servers by `name`), any other
-value replaces it, and an omitted key is removed. A placeholder with nothing
-stored behind it (a new key, a renamed agent, or `profile.create`) is dropped,
-never stored literally.
+The values are the **resolved** ones: `command` falls back to the daemon's
+`agent_command` when the profile set none, and an unset `permission_policy` or
+attention policy comes back as the default. A profile sent back unchanged
+therefore pins those values and no longer follows later changes to the
+daemon's defaults.
+
+Exactly these values are redacted to the literal placeholder `"<redacted>"`
+(§10), with the keys kept so an editor can list them:
+- agent `env` values;
+- MCP-server `env` values, in dict form (`{"K":"v"}`) and list form
+  (`[{"name":"K","value":"v"}]`), and MCP-server `headers` values (same two
+  forms); an `env`/`headers` of any other shape is replaced whole;
+- every `notify` value except `format` (today the webhook URL). This is a
+  deny-list on purpose: a future notify knob is redacted until it is known to
+  be safe, so it can never leak.
+
+Everything else — `command`, `args`, MCP `url`/`args`, `model`, … — is
+returned as-is.
+
+In `profile.update`, a `"<redacted>"` value means **keep the stored value** of
+that key, any other value replaces it, and an omitted key is removed. Agents
+are matched by name; MCP servers by `name` (else `command`) plus position
+among the servers with that same key, so the n-th server with key K maps to
+the n-th stored server with key K; list-form entries by `name` plus position
+among entries with that name. A placeholder with nothing stored behind it (a
+new key, a renamed agent, or `profile.create`) is dropped, never stored
+literally — so the literal string `"<redacted>"` itself cannot be stored as a
+value.
 
 ### 9.3 Sessions
 ```json
@@ -537,9 +557,13 @@ perms, no remote listener (SSH-forward the socket), per-user daemon,
 - The notify webhook URL and payloads are treated as secret-adjacent;
   `detail` text is the only conversation-derived field and is capped/scrubbed
   (no prompt bodies).
-- Neither is ever sent back over the wire: `notify.test_result` reports only
-  `webhook_configured`, and `profile.get` (§9.2) replaces agent / MCP-server
-  `env` values and `notify` values (except `format`) with `"<redacted>"`.
+- Neither is sent back over the wire: `notify.test_result` reports only
+  `webhook_configured`, and `profile.get` (§9.2) replaces with `"<redacted>"`
+  exactly: agent `env` values; MCP-server `env` values (dict and list form)
+  and `headers` values; `notify` values except `format`. `args`, URLs and
+  everything else are returned as-is.
+- Put secrets in `env` (or MCP `headers`), not in `args` or URLs —
+  `profile.get` returns those verbatim.
 
 ---
 

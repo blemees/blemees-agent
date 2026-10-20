@@ -46,11 +46,13 @@ if TYPE_CHECKING:
 DEFAULT_PROFILE = "default"
 DEFAULT_AGENT = "default"
 
-# Placeholder that ``profile.get`` puts in place of a secret value (#43): agent
-# ``env`` values, MCP-server ``env`` values, and every ``notify`` value except
-# ``format`` (the webhook URL is secret-adjacent, spec §10). Sent back in a
-# ``profile.update`` (or ``create``), it means "keep the stored value" — see
-# :func:`_restore_redacted`.
+# Placeholder that ``profile.get`` puts in place of a secret value (#43):
+# agent ``env`` values; MCP-server ``env`` values (dict or list form) and
+# ``headers`` values; every ``notify`` value except ``format`` (a deny-list, so
+# a new notify knob is never leaked; the webhook URL is secret-adjacent, spec
+# §10). Everything else (``args``, ``url``, ...) is returned as-is. Sent back
+# in a ``profile.update`` (or ``create``), it means "keep the stored value" —
+# see :func:`_restore_redacted`. So the literal string can't be stored.
 REDACTED = "<redacted>"
 
 
@@ -169,59 +171,157 @@ def _agent_specs(pspec: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
     return [(DEFAULT_AGENT, pspec)]
 
 
+def _hashable(key: Any) -> Any:
+    # Keys come from client JSON; a list/dict "name" must not crash matching.
+    return key if key is None or isinstance(key, str) else repr(key)
+
+
 def _mcp_key(spec: dict[str, Any]) -> Any:
     # Same identity the ACP backend uses for an MCP server (name, else command).
-    return spec.get("name", spec.get("command"))
+    return _hashable(spec.get("name", spec.get("command")))
 
 
-def _restore_map(new: Any, old: dict[str, Any]) -> None:
-    """In place: swap each ``REDACTED`` value in ``new`` for the stored one
-    under the same key; drop the key when nothing is stored to restore."""
-    if not isinstance(new, dict):
+def _occurrences(keys: list[Any]) -> list[tuple[Any, int]]:
+    """Pair each key with its occurrence index: [a, b, a] → [(a,0), (b,0), (a,1)].
+
+    Matching on (key, index) maps an unchanged list sent back 1:1 onto the
+    stored one, even when keys repeat (two unnamed ``npx`` MCP servers)."""
+    seen: dict[Any, int] = {}
+    out: list[tuple[Any, int]] = []
+    for key in keys:
+        n = seen.get(key, 0)
+        seen[key] = n + 1
+        out.append((key, n))
+    return out
+
+
+def _is_pair_list(value: Any) -> bool:
+    # List form of env / headers: [{"name": ..., "value": ...}, ...].
+    return isinstance(value, list) and all(isinstance(e, dict) for e in value)
+
+
+def _pair_names(entries: list[Any]) -> list[Any]:
+    return [_hashable(e.get("name")) if isinstance(e, dict) else None for e in entries]
+
+
+def _redact_secret_field(value: Any) -> Any:
+    """Redacted view of a secret-bearing field (env / headers, #43).
+
+    Dict form keeps its keys; list form keeps each entry but replaces its
+    ``value``; any other (unrecognised) shape is replaced whole, so an
+    unexpected shape fails safe instead of leaking."""
+    if isinstance(value, dict):
+        return {k: REDACTED for k in value}
+    if _is_pair_list(value):
+        return [{**e, "value": REDACTED} if "value" in e else dict(e) for e in value]
+    if value is None:
+        return None
+    return REDACTED
+
+
+def _stored_secrets(old: Any) -> dict[tuple[Any, int], Any]:
+    """(key, occurrence) → stored value, for dict or list form."""
+    if isinstance(old, dict):
+        return {(k, 0): v for k, v in old.items()}
+    if _is_pair_list(old):
+        return {
+            key: e["value"]
+            for e, key in zip(old, _occurrences(_pair_names(old)), strict=True)
+            if "value" in e
+        }
+    return {}
+
+
+_MISSING = object()
+
+
+def _restore_secret_field(new: Any, old: Any) -> Any:
+    """Resolve ``REDACTED`` placeholders in a secret-bearing field (#43).
+
+    A placeholder keeps the stored value under the same key (list entries by
+    ``name`` plus occurrence index); any other value replaces it; an omitted
+    key is gone; a placeholder with nothing stored is dropped. Returns
+    ``_MISSING`` when a whole-field placeholder has nothing to restore."""
+    if new == REDACTED:
+        return old if old is not None else _MISSING
+    stored = _stored_secrets(old)
+    if isinstance(new, dict):
+        out: dict[str, Any] = {}
+        for k, v in new.items():
+            if v != REDACTED:
+                out[k] = v
+            elif (k, 0) in stored:
+                out[k] = stored[(k, 0)]
+        return out
+    if isinstance(new, list):
+        out_list: list[Any] = []
+        for entry, key in zip(new, _occurrences(_pair_names(new)), strict=True):
+            if isinstance(entry, dict) and entry.get("value") == REDACTED:
+                if key in stored:
+                    out_list.append({**entry, "value": stored[key]})
+                continue
+            out_list.append(entry)
+        return out_list
+    return new
+
+
+def _restore_field(container: dict[str, Any], field: str, old: Any) -> None:
+    if field not in container:
         return
-    for key, value in list(new.items()):
-        if value == REDACTED:
-            if key in old:
-                new[key] = old[key]
-            else:
-                del new[key]
+    restored = _restore_secret_field(container[field], old)
+    if restored is _MISSING:
+        del container[field]
+    else:
+        container[field] = restored
+
+
+# Secret-bearing fields of an MCP server entry (#43): redacted by profile.get.
+_MCP_SECRET_FIELDS = ("env", "headers")
 
 
 def _restore_redacted(spec: dict[str, Any], old: Profile | None) -> dict[str, Any]:
     """Return a copy of a raw profile spec with ``REDACTED`` placeholders
     replaced by the stored secret values of ``old`` (#43).
 
-    ``profile.get`` never returns secrets, but ``profile.update`` replaces the
-    whole spec — so an editor that round-trips ``profile.info`` sends the
-    placeholders back. They resolve to the existing value of the same key
-    (agent ``env``, MCP-server ``env`` matched by server name, ``notify``); a
-    placeholder with no stored value (new key, renamed agent, or ``create``)
-    is dropped rather than stored literally.
+    ``profile.get`` never returns these secrets, but ``profile.update``
+    replaces the whole spec — so an editor that round-trips ``profile.info``
+    sends the placeholders back. They resolve to the stored value of the same
+    key: agent ``env`` (agents matched by name), MCP-server ``env`` /
+    ``headers`` (servers matched by name-else-command plus occurrence index),
+    and ``notify``. A placeholder with no stored value (new key, renamed agent,
+    or ``create``) is dropped rather than stored literally.
     """
     spec = copy.deepcopy(spec)
-    _restore_map(spec.get("notify"), old.notify if old is not None else {})
+    _restore_field(spec, "notify", old.notify if old is not None else {})
     for aname, aspec in _agent_specs(spec):
         old_agent = old.agents.get(aname) if old is not None else None
-        _restore_map(aspec.get("env"), old_agent.env if old_agent is not None else {})
+        _restore_field(aspec, "env", old_agent.env if old_agent is not None else {})
         mcp_servers = aspec.get("mcp_servers")
         if not isinstance(mcp_servers, list):
             continue
-        old_mcp = {
-            _mcp_key(m): m
+        old_servers = [
+            m
             for m in (old_agent.mcp_servers if old_agent is not None else [])
             if isinstance(m, dict)
-        }
-        for server in mcp_servers:
-            if isinstance(server, dict):
-                old_env = old_mcp.get(_mcp_key(server), {}).get("env")
-                _restore_map(server.get("env"), old_env if isinstance(old_env, dict) else {})
+        ]
+        old_by_key = dict(
+            zip(_occurrences([_mcp_key(m) for m in old_servers]), old_servers, strict=True)
+        )
+        new_servers = [m for m in mcp_servers if isinstance(m, dict)]
+        for server, key in zip(
+            new_servers, _occurrences([_mcp_key(m) for m in new_servers]), strict=True
+        ):
+            old_server = old_by_key.get(key, {})
+            for field in _MCP_SECRET_FIELDS:
+                _restore_field(server, field, old_server.get(field))
     return spec
 
 
 def _redacted_mcp_server(spec: dict[str, Any]) -> dict[str, Any]:
     out = copy.deepcopy(spec)
-    if isinstance(out.get("env"), dict):
-        out["env"] = {k: REDACTED for k in out["env"]}
+    for field in _MCP_SECRET_FIELDS:
+        if field in out:
+            out[field] = _redact_secret_field(out[field])
     return out
 
 
@@ -516,9 +616,12 @@ class Supervisor:
         sent back unchanged as a ``profile.update`` body. Works for config and
         dynamic profiles alike. Raises ``ProfileUnknownError`` for a bad name.
 
-        Secrets are never returned (spec §10): agent ``env`` and MCP-server
-        ``env`` values and all ``notify`` values except ``format`` are replaced
-        by :data:`REDACTED`; keys are kept so the editor can show them.
+        Redacted (spec §10) to :data:`REDACTED`, keys kept so the editor can
+        show them: agent ``env`` values; MCP-server ``env`` values (dict or
+        list form) and ``headers`` values; every ``notify`` value except
+        ``format``. Everything else, including ``args`` and ``url``, is
+        returned as-is. Values are the resolved ones (e.g. the daemon's
+        ``agent_command`` when the profile set none, default policy/triggers).
         """
         profile = self.get_profile(name)
         agents: dict[str, Any] = {}

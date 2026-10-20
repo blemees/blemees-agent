@@ -1324,8 +1324,10 @@ agent_args = ["acp"]
 
 Profiles can also be created over the wire (`profile.create`, persisted
 under `state_dir`). `profile.get` returns one profile's full editable spec for
-an editor, with `env` values and the notify webhook URL redacted
-([`docs/acp-migration-spec.md`](docs/acp-migration-spec.md) §9.2).
+an editor. It redacts agent `env` values, MCP-server `env` and `headers`
+values, and `notify` values except `format`; `args`, URLs and everything else
+are returned as-is, so keep secrets in `env`
+([`docs/acp-migration-spec.md`](docs/acp-migration-spec.md) §9.2, §10).
 
 #### Attention policy (per profile)
 

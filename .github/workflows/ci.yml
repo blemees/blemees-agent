@@ -55,11 +55,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - name: Install (editable) with dev extras
-        run: uv pip install --system -e ".[dev]"
+      - name: Install from uv.lock with dev extras
+        # --locked: test the pinned versions in uv.lock (fails if the lock
+        # is stale), not whatever the pyproject range resolves to today (#70).
+        run: uv sync --locked --extra dev --python ${{ matrix.python }}
       - name: Run pytest
         # requires_claude tests auto-skip unless -m requires_claude is set.
-        run: pytest -q
+        run: uv run --no-sync pytest -q
 
   package:
     name: Build sdist + wheel

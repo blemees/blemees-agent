@@ -276,3 +276,36 @@ async def test_new_session_auth_error_raises_auth_required():
             await handle.spawn()
     finally:
         await process.close()
+
+
+class _RecordingLogger:
+    """Stand-in for ``StructuredLogger`` that keeps (level, event, fields)."""
+
+    def __init__(self) -> None:
+        self.records: list[tuple[str, str, dict]] = []
+
+    def bind(self, **_fields):
+        return self
+
+    def __getattr__(self, level: str):
+        return lambda event, **fields: self.records.append((level, event, fields))
+
+
+async def test_profile_model_reaches_agent_via_set_model():
+    """A profile's ``model`` must reach an agent that advertises models only
+    through ``session/new.models`` (``session/set_model``), e.g. gemini-cli.
+    acp 0.11 dropped that path, so the model was silently ignored (#70)."""
+    log = _RecordingLogger()
+    agent = Agent(name="default", command=sys.executable, args=[FAKE_ACP], model="fake-model-b")
+    process = AcpAgentProcess(agent, key=("t", "default"), logger=log, env=dict(os.environ))
+    q: asyncio.Queue = asyncio.Queue()
+    handle = await _handle(process, q)
+    try:
+        await handle.send_user_turn({"role": "user", "content": "whichmodel"})
+        frames = await _collect_turn(q)
+    finally:
+        await process.close()
+    text = "".join(f["update"]["content"]["text"] for f in frames if f["type"] == "session.update")
+    assert text == "model:fake-model-b"
+    selection_events = [e for _lvl, e, _f in log.records if e.startswith("acp.selection_")]
+    assert selection_events == []

@@ -24,8 +24,11 @@ classifiers = [
 ]
 # NOTE (blemees/3 ACP migration, #15 spike): the daemon is no longer
 # stdlib-only. It acts as an ACP client via the official Python SDK.
+# Capped below 0.11: 0.11 drops `session/set_model` and the `models` field
+# of `session/new`, so a profile's `model` is silently ignored for agents
+# that advertise models only that way (e.g. gemini-cli). See #70.
 dependencies = [
-    "agent-client-protocol>=0.10,<0.12",
+    "agent-client-protocol>=0.10,<0.11",
 ]
 
 [project.scripts]

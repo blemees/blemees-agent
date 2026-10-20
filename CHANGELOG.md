@@ -60,3 +60,6 @@ no `blemees/2` compatibility shims.
   was not referenced, so it could be garbage-collected mid-run. The session
   now holds it until done, logs a failure, and `SessionTable.remove` waits for
   it. (#50)
+- `blemees-agentctl` REPL: `sessions` with no argument printed a usage error.
+  It now sends `session.list` without `cwd` and lists all sessions, as the
+  help text says. (#50)

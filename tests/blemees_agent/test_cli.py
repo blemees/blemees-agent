@@ -111,6 +111,23 @@ async def test_resume_sets_resume_true(h):
     assert f["last_seen_seq"] == 42
 
 
+async def test_sessions_without_cwd_lists_all(h):
+    # #50: cwd is an optional filter (HELP, protocol, schema); omitting it
+    # must send session.list with no cwd key, not print a usage error.
+    assert await dispatch(h, "sessions") is True
+    f = h.sent[-1]
+    assert f["type"] == "session.list"
+    assert f["id"].startswith("req_")
+    assert "cwd" not in f
+
+
+async def test_sessions_with_cwd_filters(h):
+    await dispatch(h, "sessions /proj")
+    f = h.sent[-1]
+    assert f["type"] == "session.list"
+    assert f["cwd"] == "/proj"
+
+
 async def test_close_with_delete_flag(h):
     await dispatch(h, "close my-session --delete")
     assert h.sent[-1] == {"type": "session.close", "session_id": "my-session", "delete": True}

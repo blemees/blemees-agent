@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blemees/schemas/inbound/profile.get.json",
+  "title": "profile.get",
+  "description": "Fetch one profile's full editable spec (#43) so an editor can pre-fill every field before a profile.update (which replaces the whole spec). Works for config-managed and dynamic profiles; an unknown name is profile_unknown. Replied with profile.info.",
+  "type": "object",
+  "properties": {
+    "type": { "const": "profile.get" },
+    "id": { "$ref": "https://blemees/schemas/_common.json#/$defs/RequestId" },
+    "name": { "$ref": "https://blemees/schemas/_common.json#/$defs/ProfileName" }
+  },
+  "required": ["type", "name"],
+  "additionalProperties": false
+}

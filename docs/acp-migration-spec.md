@@ -387,6 +387,9 @@ reading `protocol.py`.
 → {"type":"profile.list","id":"p1"}
 ← {"type":"profiles","id":"p1","profiles":[ { …profile fields, "running":true, "sessions":2 } ]}
 
+→ {"type":"profile.get","id":"pg","name":"claude-sonnet"}
+← {"type":"profile.info","id":"pg","name":"claude-sonnet","source":"dynamic","profile":{ "name":"claude-sonnet","agents":{ "default":{"command":"claude-agent-acp","args":[…],"model":"sonnet","mcp_servers":[{"name":"fs","command":"…","env":{"FS_TOKEN":"<redacted>"}}],"env":{"ANTHROPIC_API_KEY":"<redacted>"}} },"permission_policy":{"mode":"relay","detached":"stall"},"notify":{"webhook_url":"<redacted>","format":"ntfy"},"attention":{"triggers":[…]} }}
+
 → {"type":"profile.create","id":"p2","profile":{ "name":"claude-sonnet","agent":{…},"model":"sonnet","permission_policy":{"mode":"relay","detached":"stall"},"mcp_servers":[…],"notify":{…} }}
 ← {"type":"profile.created","id":"p2","name":"claude-sonnet"}
 
@@ -404,6 +407,70 @@ config-file profiles are **config-managed** and reject `update`/`delete`
 `create` validates each agent binary is on `$PATH` (else `agent_unavailable`)
 and rejects an existing name (`profile_exists`). `update`/`delete` of a profile
 that still has live sessions are refused (`profile_in_use`) — close them first.
+
+`profile.get` returns one profile's **full editable spec** (any `source`; an
+unknown name is `profile_unknown`). `profile.list` carries only per-agent
+name/command/model, and `profile.update` *replaces* the whole spec, so an
+editor must seed itself from `profile.get` or it silently drops the fields it
+did not re-type. The `profile` object is an `agents` table (each agent:
+`command`, `args`, `mcp_servers`, `env`, and `model`/`mode`/`agent_home` when
+set) plus `permission_policy`, `notify` and `attention.triggers`, and can be
+sent back unchanged as the `profile` of a `profile.update`.
+
+The values are the **resolved** ones: `command` falls back to the daemon's
+`agent_command` when the profile set none, and an unset `permission_policy` or
+attention policy comes back as the default. A profile sent back unchanged
+therefore pins those values and no longer follows later changes to the
+daemon's defaults.
+
+Exactly these values are redacted to the literal placeholder `"<redacted>"`
+(§10), with the keys kept so an editor can list them:
+- agent `env` values;
+- MCP-server `env` and `headers` values: in dict form (`{"K":"v"}`) every
+  value; in list form (`[{"name":"K","value":"v"}]`) every key of each entry
+  except `name`; an `env`/`headers` of any other shape is replaced whole;
+- every `notify` value except `format` (today the webhook URL). This is a
+  deny-list on purpose: a future notify knob is redacted until it is known to
+  be safe, so it can never leak.
+
+Everything else — `command`, `args`, MCP `url`/`args`, `model`, … — is
+returned as-is.
+
+In `profile.update`, a `"<redacted>"` value means **keep the stored value** of
+that key, any other value replaces it, and an omitted key is removed. The
+daemon never guesses where a placeholder belongs:
+- Agents are matched by name. Agent `env` and `notify` are keyed: a
+  placeholder for a key with nothing stored (a new key, a renamed agent) is
+  dropped.
+- A placeholder in `mcp_servers[i]` resolves only against a stored server it
+  can identify for certain: (1) the stored server with **exactly the same
+  non-secret fields** (everything but `env`/`headers`: `name`, `command`,
+  `args`, `url`, `type`, …), when that identity occurs once in the stored list
+  and once in the new list; else (2) the stored server with the same `name`,
+  when that name occurs once in both lists **and** the endpoint is the same:
+  equal `command`, and equal `url` when either side has one (so a named
+  server keeps its secret through an `args` edit, but not through a
+  `command`/`url` change or a rename onto another server's name). Unnamed
+  servers have no fallback,
+  and list position is never used. Deleting, reordering or adding servers is
+  therefore safe.
+- List-form `env`/`headers` entries match by `name`, when that name occurs
+  once in both the stored and the new list.
+- A server with no placeholder (all real values, or no `env`) needs no match.
+
+A placeholder that none of these rules resolves **refuses the whole update**
+with `invalid_message` — nothing is written, in memory or on disk — and the
+message names it, e.g. `cannot resolve <redacted> for
+agents.default.mcp_servers[1].env.TOKEN; re-enter the value`. Typical causes:
+editing the `args` of an unnamed server, changing the `command`/`url` of a
+named one, adding a server with a placeholder, or a duplicated server. Send the real value to resolve it. Known limit: two
+servers whose non-secret fields are identical (they differ only in
+`env`/`headers`) can't be told apart, so even an unchanged round trip is
+refused until their values are re-entered (or one gets a distinct `name`).
+
+In `profile.create` there is nothing stored, so every placeholder is dropped.
+Because the placeholder always means "keep" or "drop", the literal string
+`"<redacted>"` itself can never be stored as a value.
 
 ### 9.3 Sessions
 ```json
@@ -488,7 +555,7 @@ plus the ACP-era changes:
 | Code | Meaning | Fatal? |
 |---|---|---|
 | `protocol_mismatch` | Bad protocol version. | Yes |
-| `invalid_message` / `unknown_message` | Malformed / unknown frame. | No |
+| `invalid_message` / `unknown_message` | Malformed / unknown frame; also a `profile.update` whose `"<redacted>"` placeholder cannot be resolved for certain (§9.2). | No |
 | `profile_unknown` | No such profile. | No |
 | `profile_exists` | `profile.create` named an existing profile. | No |
 | `profile_protected` | `profile.update`/`delete` targeted a config-managed profile. | No |
@@ -516,6 +583,13 @@ perms, no remote listener (SSH-forward the socket), per-user daemon,
 - The notify webhook URL and payloads are treated as secret-adjacent;
   `detail` text is the only conversation-derived field and is capped/scrubbed
   (no prompt bodies).
+- Neither is sent back over the wire: `notify.test_result` reports only
+  `webhook_configured`, and `profile.get` (§9.2) replaces with `"<redacted>"`
+  exactly: agent `env` values; MCP-server `env` and `headers` values (in
+  list form, every entry key except `name`); `notify` values except `format`.
+  `args`, URLs and everything else are returned as-is.
+- Put secrets in `env` (or MCP `headers`), not in `args` or URLs —
+  `profile.get` returns those verbatim.
 
 ---
 

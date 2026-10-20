@@ -65,7 +65,10 @@ From source for development:
 ```bash
 git clone https://github.com/blemees/blemees-agent
 cd blemees-agent
-uv pip install -e ".[dev]"      # or: pip install -e ".[dev]"
+uv sync --extra dev             # installs the versions pinned in uv.lock, like CI
+uv run pytest -q
+# pip install -e ".[dev]" also works, but it ignores uv.lock, so it
+# does not match CI.
 ```
 
 Run in the foreground:

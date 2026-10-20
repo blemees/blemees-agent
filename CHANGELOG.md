@@ -43,6 +43,12 @@ no `blemees/2` compatibility shims.
   skipped unless installed + authenticated) covering turn, multi-turn memory,
   attach/viewer, and interrupt; `python -m blemees_agent.bench` measures warm
   prompt → first `agent_message_chunk`. (#26)
+- **Session retention sweep** (opt-in) — `session_retention_days = N`
+  (env `BLEMEES_AGENTD_SESSION_RETENTION_DAYS`) makes the daemon delete, at
+  startup and every 24 h, the registry record, event log and usage sidecar of
+  each closed session idle for more than N days. Live sessions and
+  agent-owned files are never touched. The default is now `0` (off); the old
+  default of 7 was never enforced, so nothing changes unless you set it. (#50)
 
 ### Changed
 - Wire protocol is now `blemees/3`; the data plane carries verbatim ACP

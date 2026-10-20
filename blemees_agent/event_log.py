@@ -132,3 +132,47 @@ class DurableEventLog:
 def event_log_path(base_dir: Path | str, session_id: str) -> Path:
     """Return the log file path for a session under ``base_dir``."""
     return Path(base_dir) / f"{session_id}.jsonl"
+
+
+def usage_sidecar_path(base_dir: Path | str, session_id: str) -> Path:
+    """Return the usage-sidecar path for a session under ``base_dir``."""
+    return Path(base_dir) / f"{session_id}.usage.json"
+
+
+def session_file_paths(base_dir: Path | str, session_id: str) -> list[Path]:
+    """The daemon-owned per-session files: event log + usage sidecar."""
+    return [event_log_path(base_dir, session_id), usage_sidecar_path(base_dir, session_id)]
+
+
+def delete_session_files(base_dir: Path | str, session_id: str) -> list[Path]:
+    """Unlink a session's daemon-owned files under ``base_dir``.
+
+    The one deletion path for ``session.close{delete:true}`` and the
+    retention sweep, so the two cannot drift. Only the files named by
+    :func:`session_file_paths` are touched, and only when they sit directly
+    in ``base_dir`` (a session id with a path separator is refused). A
+    symlink is unlinked itself; its target is never followed. Agent-owned
+    files (``~/.claude``, ``~/.codex``, …) are never touched.
+
+    Returns the paths that were removed. A missing file is not an error;
+    on any other ``OSError`` the remaining files are still tried, then the
+    first error is raised to the caller.
+    """
+    base = Path(base_dir)
+    paths = session_file_paths(base, session_id)
+    if any(path.parent != base for path in paths):
+        raise ValueError(f"session id {session_id!r} escapes {base}")
+    removed: list[Path] = []
+    first_error: OSError | None = None
+    for path in paths:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            first_error = first_error or exc
+            continue
+        removed.append(path)
+    if first_error is not None:
+        raise first_error
+    return removed

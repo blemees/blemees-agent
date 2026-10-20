@@ -76,6 +76,7 @@ from .protocol import (
     parse_status,
 )
 from .registry import Registry
+from .retention import SWEEP_INTERVAL_S, sweep_expired_sessions
 from .session import SessionTable, make_reaper
 from .supervisor import Supervisor
 
@@ -1129,6 +1130,7 @@ class Daemon:
         self._shutdown_event = asyncio.Event()
         self._reaper_task: asyncio.Task | None = None
         self._proc_reaper_task: asyncio.Task | None = None
+        self._retention_task: asyncio.Task | None = None
         self._agents: dict[str, str] = {}
         registry_path = Path(config.state_dir) / "registry.json" if config.state_dir else None
         self._registry = Registry(registry_path)
@@ -1153,6 +1155,11 @@ class Daemon:
         self._registry.load()
         # Adopt over-wire profiles persisted by a prior run (#25).
         self._supervisor.load_persisted()
+        # Opt-in retention sweep: once now, before any client can open a
+        # session, then every 24 h while running.
+        retention_days = self._retention_days()
+        if retention_days > 0:
+            self._sweep_retention(retention_days)
         _prepare_socket_path(self._config.socket_path, self._log)
 
         self._server = await asyncio.start_unix_server(
@@ -1164,6 +1171,10 @@ class Daemon:
         self._proc_reaper_task = asyncio.create_task(
             self._reap_idle_processes(), name="blemees-proc-reaper"
         )
+        if retention_days > 0:
+            self._retention_task = asyncio.create_task(
+                self._retention_loop(retention_days), name="blemees-retention"
+            )
         self._log.info(
             "daemon.start",
             socket=self._config.socket_path,
@@ -1255,6 +1266,34 @@ class Daemon:
             except Exception:  # pragma: no cover - defensive
                 self._log.exception("profile.reaper_error")
 
+    def _retention_days(self) -> int:
+        days = self._config.session_retention_days or 0
+        if days < 0:
+            self._log.warning("config.session_retention_days_negative", value=days)
+            return 0
+        return days
+
+    def _sweep_retention(self, retention_days: int) -> list[str]:
+        try:
+            return sweep_expired_sessions(
+                registry=self._registry,
+                sessions=self._sessions,
+                log_dir=self._log_dir,
+                retention_days=retention_days,
+                logger=self._log,
+            )
+        except Exception:  # pragma: no cover - defensive; never crash the daemon
+            self._log.exception("session.retention_sweep_error")
+            return []
+
+    async def _retention_loop(self, retention_days: int) -> None:
+        while True:
+            try:
+                await asyncio.sleep(SWEEP_INTERVAL_S)
+            except asyncio.CancelledError:
+                return
+            self._sweep_retention(retention_days)
+
     async def serve_forever(self) -> None:
         assert self._server is not None
         try:
@@ -1320,7 +1359,11 @@ class Daemon:
         except TimeoutError:
             self._log.warning("daemon.shutdown_supervisor_timeout")
 
-        reapers = [t for t in (self._reaper_task, self._proc_reaper_task) if t is not None]
+        reapers = [
+            t
+            for t in (self._reaper_task, self._proc_reaper_task, self._retention_task)
+            if t is not None
+        ]
         for task in reapers:
             task.cancel()
         if reapers:

@@ -6,7 +6,7 @@ import asyncio
 
 from blemees_agent.event_log import DurableEventLog, RingBuffer, event_log_path
 from blemees_agent.protocol import OpenMessage
-from blemees_agent.session import Session
+from blemees_agent.session import Session, SessionTable
 
 # ---------------------------------------------------------------------------
 # RingBuffer
@@ -197,3 +197,89 @@ async def test_session_finishing_triggers_soft_kill_on_result():
     # Give the scheduled close task a chance to run.
     await asyncio.sleep(0.01)
     assert sub.closed is True
+
+
+async def test_soft_kill_task_is_held_until_done():
+    # #50: the loop keeps only weak refs to tasks, so the session must hold
+    # the soft-kill close task until it finishes.
+    release = asyncio.Event()
+
+    class SlowSub:
+        def __init__(self):
+            self.closed = False
+
+        async def close(self):
+            await release.wait()
+            self.closed = True
+
+    sess = Session(session_id="s1", open_msg=_open_msg(), cwd=None)
+    sub = SlowSub()
+    sess.backend = sub  # type: ignore[assignment]
+    sess.mark_finishing()
+
+    await sess.on_event({"type": "session.result", "session_id": "s1", "subtype": "success"})
+    await asyncio.sleep(0)
+    assert len(sess._bg_tasks) == 1
+    (task,) = sess._bg_tasks
+    assert task.get_name() == "backend-soft-kill-s1"
+    assert not task.done()
+
+    release.set()
+    await sess.wait_background_tasks()
+    assert sub.closed is True
+    assert sess._bg_tasks == set()
+
+
+async def test_soft_kill_task_failure_is_logged(monkeypatch):
+    import blemees_agent.session as session_mod
+
+    warnings: list[tuple[str, dict]] = []
+
+    class RecordingLog:
+        def warning(self, event, **fields):
+            warnings.append((event, fields))
+
+    monkeypatch.setattr(session_mod, "_log", RecordingLog())
+
+    class BrokenSub:
+        async def close(self):
+            raise RuntimeError("boom")
+
+    sess = Session(session_id="s1", open_msg=_open_msg(), cwd=None)
+    sess.backend = BrokenSub()  # type: ignore[assignment]
+    sess.mark_finishing()
+
+    await sess.on_event({"type": "session.result", "session_id": "s1", "subtype": "success"})
+    await sess.wait_background_tasks()
+    await asyncio.sleep(0)  # let the done-callback run
+    assert sess._bg_tasks == set()
+    assert len(warnings) == 1
+    event, fields = warnings[0]
+    assert event == "session.background_task_failed"
+    assert fields["session_id"] == "s1"
+    assert "boom" in fields["error"]
+
+
+async def test_table_remove_waits_for_soft_kill_task():
+    order: list[str] = []
+    release = asyncio.Event()
+
+    class SlowSub:
+        async def close(self):
+            if not release.is_set():
+                await release.wait()
+                order.append("soft-kill")
+            else:
+                order.append("remove-close")
+
+    table = SessionTable(idle_timeout_s=60, max_concurrent=4)
+    sess = Session(session_id="s1", open_msg=_open_msg(), cwd=None)
+    await table.register(sess)
+    sess.backend = SlowSub()  # type: ignore[assignment]
+    sess.mark_finishing()
+    await sess.on_event({"type": "session.result", "session_id": "s1", "subtype": "success"})
+
+    asyncio.get_running_loop().call_later(0.01, release.set)
+    await table.remove("s1")
+    assert order == ["soft-kill", "remove-close"]
+    assert sess._bg_tasks == set()

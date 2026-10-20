@@ -396,6 +396,57 @@ async def test_profile_get_config_profile_and_unknown(state_dir):
                 await c.close()
 
 
+async def test_profile_update_unresolvable_placeholder_refused_on_wire(state_dir):
+    # #43 review: a "<redacted>" placeholder that can't be matched to one
+    # stored MCP server for certain refuses the whole update (invalid_message)
+    # and writes nothing — not in memory, not in registry.json.
+    gh = {"command": "npx", "args": ["gh-mcp"], "env": {"TOKEN": "github-secret"}}
+    slack = {"command": "npx", "args": ["slack-mcp"], "env": {"TOKEN": "slack-secret"}}
+    sock = short_socket_path("blemeesd-pg3")
+    with socket_cleanup(sock):
+        async with _daemon(state_dir, sock):
+            c = await _connect(sock)
+            try:
+                await c.send(
+                    {
+                        "type": "profile.create",
+                        "id": "c",
+                        "profile": {
+                            "name": "m",
+                            "agent": {"agent_command": GOOD, "mcp_servers": [gh, slack]},
+                        },
+                    }
+                )
+                await c.wait_for(lambda e: e.get("type") == "profile.created")
+                registry_file = Path(state_dir) / "registry.json"
+                before = registry_file.read_text()
+
+                await c.send({"type": "profile.get", "id": "g", "name": "m"})
+                info = await c.wait_for(lambda e: e.get("type") == "profile.info")
+                spec = info["profile"]
+                spec["agents"]["default"]["mcp_servers"].insert(
+                    0, {"command": "npx", "args": ["new-mcp"], "env": {"TOKEN": "<redacted>"}}
+                )
+                await c.send({"type": "profile.update", "id": "u", "name": "m", "profile": spec})
+                err = await c.wait_for(lambda e: e.get("type") == "error")
+                assert err["code"] == "invalid_message"
+                assert err["id"] == "u"
+                assert err["message"] == (
+                    "cannot resolve <redacted> for "
+                    "agents.default.mcp_servers[0].env.TOKEN; re-enter the value"
+                )
+                assert registry_file.read_text() == before
+
+                await c.send({"type": "profile.get", "id": "g2", "name": "m"})
+                again = await c.wait_for(
+                    lambda e: e.get("type") == "profile.info" and e.get("id") == "g2"
+                )
+                servers = again["profile"]["agents"]["default"]["mcp_servers"]
+                assert [s["args"] for s in servers] == [["gh-mcp"], ["slack-mcp"]]
+            finally:
+                await c.close()
+
+
 # ---- agent_unavailable ----------------------------------------------
 
 

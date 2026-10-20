@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import sys
 
 import pytest
@@ -12,6 +13,7 @@ from blemees_agent.errors import (
     ProfileExistsError,
     ProfileProtectedError,
     ProfileUnknownError,
+    ProtocolError,
 )
 from blemees_agent.logging import configure
 from blemees_agent.registry import Registry
@@ -272,33 +274,174 @@ async def test_create_drops_redacted_placeholders(tmp_path):
     assert REDACTED not in repr(reg.get_profile_spec("copy"))
 
 
-# ---- MCP restore matching by (name-or-command, occurrence) (#43 review) --
+# ---- MCP restore matching: exact identity, else unique name, else refuse ---
+#
+# A "<redacted>" placeholder in mcp_servers[i] resolves only against a stored
+# server we can identify for certain (#43 review rounds 1-2): the unique
+# server with the same non-secret fields, else the unique server with the
+# same `name`. Anything else refuses the whole update with invalid_message.
+
+GH = {"command": "npx", "args": ["gh-mcp"], "env": {"TOKEN": "github-secret"}}
+SLACK = {"command": "npx", "args": ["slack-mcp"], "env": {"TOKEN": "slack-secret"}}
+
+
+def _servers(sup, name="m"):
+    return sup.get_profile(name).default_agent.mcp_servers
+
+
+def _stored_servers(reg, name="m"):
+    return reg.get_profile_spec(name)["agents"]["default"]["mcp_servers"]
+
+
+def _with_servers(sup, servers, name="m"):
+    sup.create_profile(name, {"agent": {"agent_command": GOOD, "mcp_servers": servers}})
+    spec = sup.profile_spec(name)
+    return spec, spec["agents"]["default"]["mcp_servers"]
+
+
+async def _assert_refused(sup, reg, spec, match, name="m"):
+    before_mem = copy.deepcopy(_servers(sup, name))
+    before_reg = copy.deepcopy(reg.get_profile_spec(name))
+    with pytest.raises(ProtocolError, match=match) as exc:
+        await sup.update_profile(name, spec)
+    assert exc.value.code == "invalid_message"
+    assert "re-enter the value" in exc.value.message
+    # No partial write, in memory or in the registry.
+    assert _servers(sup, name) == before_mem
+    assert reg.get_profile_spec(name) == before_reg
 
 
 async def test_round_trip_unnamed_mcp_servers_same_command_keep_own_secrets(tmp_path):
-    # Two unnamed servers share the key "npx" (name, else command). Each must
-    # get its own secret back, not the last one's.
+    # Two unnamed servers share the command "npx"; unchanged, each must get
+    # its own secret back (matched by exact identity: command + args).
     sup, reg = _sup(tmp_path)
-    servers = [
-        {"command": "npx", "args": ["gh-mcp"], "env": {"TOKEN": "github-secret"}},
-        {"command": "npx", "args": ["slack-mcp"], "env": {"TOKEN": "slack-secret"}},
-    ]
-    sup.create_profile("m", {"agent": {"agent_command": GOOD, "mcp_servers": servers}})
-    await sup.update_profile("m", sup.profile_spec("m"))
-    assert sup.get_profile("m").default_agent.mcp_servers == servers
-    assert reg.get_profile_spec("m")["agents"]["default"]["mcp_servers"] == servers
+    spec, _ = _with_servers(sup, [GH, SLACK])
+    await sup.update_profile("m", spec)
+    assert _servers(sup) == [GH, SLACK]
+    assert _stored_servers(reg) == [GH, SLACK]
 
 
-async def test_round_trip_same_named_mcp_servers_keep_own_secrets(tmp_path):
+async def test_mcp_delete_first_server_keeps_remaining_secret(tmp_path):
     sup, reg = _sup(tmp_path)
-    servers = [
-        {"name": "fs", "command": "mcp-fs", "env": {"A": "secret-a"}},
-        {"name": "fs", "command": "mcp-fs", "env": {"B": "secret-b"}},
+    spec, servers = _with_servers(sup, [GH, SLACK])
+    del servers[0]
+    await sup.update_profile("m", spec)
+    assert _servers(sup) == [SLACK]
+    assert _stored_servers(reg) == [SLACK]
+
+
+async def test_mcp_swap_servers_keeps_own_secrets(tmp_path):
+    sup, reg = _sup(tmp_path)
+    spec, servers = _with_servers(sup, [GH, SLACK])
+    servers.reverse()
+    await sup.update_profile("m", spec)
+    assert _servers(sup) == [SLACK, GH]
+    assert _stored_servers(reg) == [SLACK, GH]
+
+
+async def test_mcp_insert_server_with_unresolvable_placeholder_refused(tmp_path):
+    sup, reg = _sup(tmp_path)
+    spec, servers = _with_servers(sup, [GH, SLACK])
+    servers.insert(0, {"command": "npx", "args": ["new-mcp"], "env": {"TOKEN": REDACTED}})
+    await _assert_refused(sup, reg, spec, r"agents\.default\.mcp_servers\[0\]\.env\.TOKEN")
+
+
+async def test_mcp_edit_args_of_unnamed_server_with_placeholder_refused(tmp_path):
+    # Command alone is not an identity: new args may mean a different server.
+    sup, reg = _sup(tmp_path)
+    spec, servers = _with_servers(sup, [GH, SLACK])
+    servers[1]["args"] = ["slack-mcp", "--v2"]
+    await _assert_refused(sup, reg, spec, r"mcp_servers\[1\]\.env\.TOKEN")
+
+
+async def test_mcp_edit_args_of_unnamed_server_with_real_value_accepted(tmp_path):
+    sup, reg = _sup(tmp_path)
+    spec, servers = _with_servers(sup, [GH, SLACK])
+    servers[1]["args"] = ["slack-mcp", "--v2"]
+    servers[1]["env"]["TOKEN"] = "new-slack-secret"
+    await sup.update_profile("m", spec)
+    expected = [
+        GH,
+        {"command": "npx", "args": ["slack-mcp", "--v2"], "env": {"TOKEN": "new-slack-secret"}},
     ]
-    sup.create_profile("m", {"agent": {"agent_command": GOOD, "mcp_servers": servers}})
-    await sup.update_profile("m", sup.profile_spec("m"))
-    assert sup.get_profile("m").default_agent.mcp_servers == servers
-    assert reg.get_profile_spec("m")["agents"]["default"]["mcp_servers"] == servers
+    assert _servers(sup) == expected
+    assert _stored_servers(reg) == expected
+
+
+async def test_named_mcp_server_args_edit_keeps_secret(tmp_path):
+    # A unique name is an explicit identity: it survives a command/args edit.
+    sup, reg = _sup(tmp_path)
+    fs = {"name": "fs", "command": "mcp-fs", "args": ["/a"], "env": {"K": "fs-secret"}}
+    spec, servers = _with_servers(sup, [fs, GH])
+    servers[0]["args"] = ["/b"]
+    servers[0]["command"] = "mcp-fs2"
+    await sup.update_profile("m", spec)
+    expected = [{**fs, "command": "mcp-fs2", "args": ["/b"]}, GH]
+    assert _servers(sup) == expected
+    assert _stored_servers(reg) == expected
+
+
+async def test_same_named_servers_different_command_delete_and_reorder(tmp_path):
+    a = {"name": "fs", "command": "mcp-a", "env": {"K": "secret-a"}}
+    b = {"name": "fs", "command": "mcp-b", "env": {"K": "secret-b"}}
+    # Reorder: exact identity (name + command) still tells them apart.
+    sup, reg = _sup(tmp_path)
+    spec, servers = _with_servers(sup, [a, b])
+    servers.reverse()
+    await sup.update_profile("m", spec)
+    assert _servers(sup) == [b, a] and _stored_servers(reg) == [b, a]
+    # Delete one: the other keeps its own secret.
+    spec = sup.profile_spec("m")
+    del spec["agents"]["default"]["mcp_servers"][0]
+    await sup.update_profile("m", spec)
+    assert _servers(sup) == [a] and _stored_servers(reg) == [a]
+
+
+async def test_same_named_servers_ambiguous_edit_refused(tmp_path):
+    # The edited server matches no identity and its name is not unique.
+    a = {"name": "fs", "command": "mcp-a", "env": {"K": "secret-a"}}
+    b = {"name": "fs", "command": "mcp-b", "env": {"K": "secret-b"}}
+    sup, reg = _sup(tmp_path)
+    spec, servers = _with_servers(sup, [a, b])
+    servers[1]["command"] = "mcp-c"
+    await _assert_refused(sup, reg, spec, r"mcp_servers\[1\]\.env\.K")
+
+
+async def test_identical_servers_differing_only_in_env_refused(tmp_path):
+    # Known limit: nothing but the (redacted) secret tells these apart, so
+    # even an unchanged round trip is refused rather than guessed.
+    a = {"name": "fs", "command": "mcp-fs", "env": {"A": "secret-a"}}
+    b = {"name": "fs", "command": "mcp-fs", "env": {"B": "secret-b"}}
+    sup, reg = _sup(tmp_path)
+    spec, _ = _with_servers(sup, [a, b])
+    await _assert_refused(sup, reg, spec, r"mcp_servers\[0\]\.env\.A")
+    # Re-entering the values resolves it.
+    spec["agents"]["default"]["mcp_servers"][0]["env"]["A"] = "secret-a"
+    spec["agents"]["default"]["mcp_servers"][1]["env"]["B"] = "secret-b"
+    await sup.update_profile("m", spec)
+    assert _servers(sup) == [a, b] and _stored_servers(reg) == [a, b]
+
+
+async def test_servers_without_placeholders_never_refused(tmp_path):
+    # Duplicates are fine when nothing needs resolving.
+    sup, reg = _sup(tmp_path)
+    spec, servers = _with_servers(sup, [GH, SLACK])
+    servers[:] = [
+        {"command": "npx", "args": ["x"], "env": {"T": "v1"}},
+        {"command": "npx", "args": ["x"], "env": {"T": "v2"}},
+        {"command": "npx", "args": ["y"]},
+    ]
+    await sup.update_profile("m", spec)
+    assert _servers(sup) == servers
+    assert _stored_servers(reg) == servers
+
+
+async def test_placeholder_under_new_agent_refused_on_update(tmp_path):
+    # No stored server can match under an agent name that didn't exist.
+    sup, reg = _sup(tmp_path)
+    spec, _ = _with_servers(sup, [GH])
+    spec["agents"]["other"] = copy.deepcopy(spec["agents"]["default"])
+    await _assert_refused(sup, reg, spec, r"agents\.other\.mcp_servers\[0\]\.env\.TOKEN")
 
 
 # ---- MCP headers + list-form env redaction (#43 review) ----------------
@@ -322,8 +465,7 @@ _HTTP_AND_LIST = [
         "args": ["--verbose"],
         "env": [
             {"name": "TOK", "value": "list-env-1"},
-            {"name": "TOK", "value": "list-env-2"},
-            {"name": "OTHER", "value": "list-env-3"},
+            {"name": "OTHER", "value": "list-env-3", "extra": "extra-secret"},
         ],
     },
 ]
@@ -351,8 +493,8 @@ async def test_profile_spec_redacts_mcp_headers_and_list_env(tmp_path):
             "args": ["--verbose"],  # args are returned as-is
             "env": [
                 {"name": "TOK", "value": REDACTED},
-                {"name": "TOK", "value": REDACTED},
-                {"name": "OTHER", "value": REDACTED},
+                # every key but `name` is redacted, not only `value`
+                {"name": "OTHER", "value": REDACTED, "extra": REDACTED},
             ],
         },
     ]
@@ -363,8 +505,8 @@ async def test_round_trip_mcp_headers_and_list_env_keep_secrets(tmp_path):
     sup, reg = _sup(tmp_path)
     sup.create_profile("h", {"agent": {"agent_command": GOOD, "mcp_servers": _HTTP_AND_LIST}})
     await sup.update_profile("h", sup.profile_spec("h"))
-    assert sup.get_profile("h").default_agent.mcp_servers == _HTTP_AND_LIST
-    assert reg.get_profile_spec("h")["agents"]["default"]["mcp_servers"] == _HTTP_AND_LIST
+    assert _servers(sup, "h") == _HTTP_AND_LIST
+    assert _stored_servers(reg, "h") == _HTTP_AND_LIST
 
 
 async def test_list_env_and_headers_replace_remove_and_drop(tmp_path):
@@ -373,19 +515,37 @@ async def test_list_env_and_headers_replace_remove_and_drop(tmp_path):
     spec = sup.profile_spec("h")
     remote, remote2, stdio = spec["agents"]["default"]["mcp_servers"]
     remote["headers"]["Authorization"] = "Bearer new"  # explicit value replaces
-    remote["headers"]["X-New"] = REDACTED  # nothing stored → dropped
+    remote["headers"]["X-New"] = REDACTED  # dict form, nothing stored → dropped
     remote2["headers"] = []  # omitted entries are removed
-    stdio["env"][1]["value"] = "replaced-2"  # second TOK replaced, first kept
-    del stdio["env"][2]  # OTHER removed
-    stdio["env"].append({"name": "NEW", "value": REDACTED})  # nothing stored → dropped
+    stdio["env"][0]["value"] = "replaced-1"  # explicit value replaces
+    del stdio["env"][1]["extra"]  # omitted key is removed, value kept
+    stdio["env"].reverse()  # entries match by unique name, not position
     await sup.update_profile("h", spec)
-    got = sup.get_profile("h").default_agent.mcp_servers
+    got = _servers(sup, "h")
     assert got[0]["headers"] == {"Authorization": "Bearer new"}
     assert got[1]["headers"] == []
     assert got[2]["env"] == [
-        {"name": "TOK", "value": "list-env-1"},
-        {"name": "TOK", "value": "replaced-2"},
+        {"name": "OTHER", "value": "list-env-3"},
+        {"name": "TOK", "value": "replaced-1"},
     ]
+
+
+async def test_list_env_duplicate_name_with_placeholder_refused(tmp_path):
+    sup, reg = _sup(tmp_path)
+    dup = {
+        "name": "s",
+        "command": "c",
+        "env": [{"name": "TOK", "value": "one"}, {"name": "TOK", "value": "two"}],
+    }
+    spec, _ = _with_servers(sup, [dup])
+    await _assert_refused(sup, reg, spec, r"mcp_servers\[0\]\.env\[0\]")
+
+
+async def test_list_env_new_name_with_placeholder_refused(tmp_path):
+    sup, reg = _sup(tmp_path)
+    spec, servers = _with_servers(sup, [_HTTP_AND_LIST[2]])
+    servers[0]["env"].append({"name": "NEW", "value": REDACTED})
+    await _assert_refused(sup, reg, spec, r"mcp_servers\[0\]\.env\[2\]")
 
 
 async def test_unrecognised_secret_field_shape_redacted_whole(tmp_path):

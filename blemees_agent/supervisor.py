@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import json
 import os
 import shutil
 import time
@@ -36,6 +37,7 @@ from .errors import (
     ProfileExistsError,
     ProfileProtectedError,
     ProfileUnknownError,
+    ProtocolError,
 )
 from .notify import BLOCKED_TRIGGERS, KNOWN_TRIGGERS
 from .protocol import is_valid_name
@@ -47,12 +49,14 @@ DEFAULT_PROFILE = "default"
 DEFAULT_AGENT = "default"
 
 # Placeholder that ``profile.get`` puts in place of a secret value (#43):
-# agent ``env`` values; MCP-server ``env`` values (dict or list form) and
-# ``headers`` values; every ``notify`` value except ``format`` (a deny-list, so
-# a new notify knob is never leaked; the webhook URL is secret-adjacent, spec
-# §10). Everything else (``args``, ``url``, ...) is returned as-is. Sent back
-# in a ``profile.update`` (or ``create``), it means "keep the stored value" —
-# see :func:`_restore_redacted`. So the literal string can't be stored.
+# agent ``env`` values; MCP-server ``env`` and ``headers`` values (in list
+# form every entry key except ``name``); every ``notify`` value except
+# ``format`` (a deny-list, so a new notify knob is never leaked; the webhook
+# URL is secret-adjacent, spec §10). Everything else (``args``, ``url``, ...)
+# is returned as-is. Sent back in a ``profile.update`` it means "keep the
+# stored value" (or refuse if that can't be matched for certain); in
+# ``create`` it is dropped — see :func:`_restore_redacted`. So the literal
+# string can't be stored.
 REDACTED = "<redacted>"
 
 
@@ -176,144 +180,212 @@ def _hashable(key: Any) -> Any:
     return key if key is None or isinstance(key, str) else repr(key)
 
 
-def _mcp_key(spec: dict[str, Any]) -> Any:
-    # Same identity the ACP backend uses for an MCP server (name, else command).
-    return _hashable(spec.get("name", spec.get("command")))
-
-
-def _occurrences(keys: list[Any]) -> list[tuple[Any, int]]:
-    """Pair each key with its occurrence index: [a, b, a] → [(a,0), (b,0), (a,1)].
-
-    Matching on (key, index) maps an unchanged list sent back 1:1 onto the
-    stored one, even when keys repeat (two unnamed ``npx`` MCP servers)."""
-    seen: dict[Any, int] = {}
-    out: list[tuple[Any, int]] = []
-    for key in keys:
-        n = seen.get(key, 0)
-        seen[key] = n + 1
-        out.append((key, n))
-    return out
-
-
 def _is_pair_list(value: Any) -> bool:
     # List form of env / headers: [{"name": ..., "value": ...}, ...].
     return isinstance(value, list) and all(isinstance(e, dict) for e in value)
 
 
-def _pair_names(entries: list[Any]) -> list[Any]:
-    return [_hashable(e.get("name")) if isinstance(e, dict) else None for e in entries]
+def _redact_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    # Every key except ``name`` may carry the secret (``value``, ``val``, …).
+    return {k: (v if k == "name" else REDACTED) for k, v in entry.items()}
 
 
 def _redact_secret_field(value: Any) -> Any:
     """Redacted view of a secret-bearing field (env / headers, #43).
 
-    Dict form keeps its keys; list form keeps each entry but replaces its
-    ``value``; any other (unrecognised) shape is replaced whole, so an
-    unexpected shape fails safe instead of leaking."""
+    Dict form keeps its keys; list form keeps each entry's ``name`` and
+    redacts every other key; any other (unrecognised) shape is replaced
+    whole, so an unexpected shape fails safe instead of leaking."""
     if isinstance(value, dict):
         return {k: REDACTED for k in value}
     if _is_pair_list(value):
-        return [{**e, "value": REDACTED} if "value" in e else dict(e) for e in value]
+        return [_redact_entry(e) for e in value]
     if value is None:
         return None
     return REDACTED
 
 
-def _stored_secrets(old: Any) -> dict[tuple[Any, int], Any]:
-    """(key, occurrence) → stored value, for dict or list form."""
-    if isinstance(old, dict):
-        return {(k, 0): v for k, v in old.items()}
-    if _is_pair_list(old):
-        return {
-            key: e["value"]
-            for e, key in zip(old, _occurrences(_pair_names(old)), strict=True)
-            if "value" in e
-        }
-    return {}
+def _entry_has_placeholder(entry: dict[str, Any]) -> bool:
+    return any(k != "name" and v == REDACTED for k, v in entry.items())
 
 
-_MISSING = object()
+def _placeholder_path(value: Any) -> str | None:
+    """Path suffix of the first placeholder in a secret field, else None."""
+    if value == REDACTED:
+        return ""
+    if isinstance(value, dict):
+        for k, v in value.items():
+            if v == REDACTED:
+                return f".{k}"
+    elif _is_pair_list(value):
+        for j, entry in enumerate(value):
+            if _entry_has_placeholder(entry):
+                return f"[{j}]"
+    return None
 
 
-def _restore_secret_field(new: Any, old: Any) -> Any:
-    """Resolve ``REDACTED`` placeholders in a secret-bearing field (#43).
-
-    A placeholder keeps the stored value under the same key (list entries by
-    ``name`` plus occurrence index); any other value replaces it; an omitted
-    key is gone; a placeholder with nothing stored is dropped. Returns
-    ``_MISSING`` when a whole-field placeholder has nothing to restore."""
-    if new == REDACTED:
-        return old if old is not None else _MISSING
-    stored = _stored_secrets(old)
-    if isinstance(new, dict):
-        out: dict[str, Any] = {}
-        for k, v in new.items():
-            if v != REDACTED:
-                out[k] = v
-            elif (k, 0) in stored:
-                out[k] = stored[(k, 0)]
-        return out
-    if isinstance(new, list):
-        out_list: list[Any] = []
-        for entry, key in zip(new, _occurrences(_pair_names(new)), strict=True):
-            if isinstance(entry, dict) and entry.get("value") == REDACTED:
-                if key in stored:
-                    out_list.append({**entry, "value": stored[key]})
-                continue
-            out_list.append(entry)
-        return out_list
-    return new
+def _unresolvable(path: str) -> ProtocolError:
+    return ProtocolError(f"cannot resolve {REDACTED} for {path}; re-enter the value")
 
 
-def _restore_field(container: dict[str, Any], field: str, old: Any) -> None:
+def _drop_placeholders(container: dict[str, Any], field: str) -> None:
+    """``create`` (nothing stored): every placeholder is dropped (#43)."""
+    value = container.get(field)
+    if value == REDACTED:
+        del container[field]
+    elif isinstance(value, dict):
+        container[field] = {k: v for k, v in value.items() if v != REDACTED}
+    elif _is_pair_list(value):
+        container[field] = [e for e in value if not _entry_has_placeholder(e)]
+
+
+def _unique_by(items: list[dict[str, Any]], key: Any) -> dict[Any, dict[str, Any]]:
+    """``key(item)`` → item, for keys that occur exactly once (None skipped)."""
+    seen: dict[Any, list[dict[str, Any]]] = {}
+    for item in items:
+        k = key(item)
+        if k is not None:
+            seen.setdefault(k, []).append(item)
+    return {k: group[0] for k, group in seen.items() if len(group) == 1}
+
+
+def _entry_name(entry: dict[str, Any]) -> Any:
+    return _hashable(entry["name"]) if entry.get("name") is not None else None
+
+
+def _restore_field(container: dict[str, Any], field: str, old: Any, path: str) -> None:
+    """Resolve ``REDACTED`` placeholders in one secret-bearing field against
+    its stored value (``update``, #43).
+
+    Dict form is keyed: a placeholder keeps the stored value of that key, or
+    is dropped if nothing is stored. List form matches an entry by ``name``
+    only when that name is unique in both the stored and the new list, and
+    raises (``invalid_message``) for any other entry with a placeholder. A
+    whole-field placeholder keeps the stored field."""
     if field not in container:
         return
-    restored = _restore_secret_field(container[field], old)
-    if restored is _MISSING:
-        del container[field]
-    else:
-        container[field] = restored
+    new = container[field]
+    if new == REDACTED:
+        if old is None:
+            del container[field]
+        else:
+            container[field] = copy.deepcopy(old)
+        return
+    if isinstance(new, dict):
+        stored = old if isinstance(old, dict) else {}
+        container[field] = {
+            k: (stored[k] if v == REDACTED else v)
+            for k, v in new.items()
+            if v != REDACTED or k in stored
+        }
+        return
+    if not _is_pair_list(new):
+        return
+    old_by_name = _unique_by(old if _is_pair_list(old) else [], _entry_name)
+    new_by_name = _unique_by(new, _entry_name)
+    out: list[dict[str, Any]] = []
+    for j, entry in enumerate(new):
+        if not _entry_has_placeholder(entry):
+            out.append(entry)
+            continue
+        name = _entry_name(entry)
+        if name is None or name not in new_by_name or name not in old_by_name:
+            raise _unresolvable(f"{path}.{field}[{j}]")
+        stored_entry = old_by_name[name]
+        out.append(
+            {
+                k: (stored_entry[k] if k != "name" and v == REDACTED else v)
+                for k, v in entry.items()
+                if k == "name" or v != REDACTED or k in stored_entry
+            }
+        )
+    container[field] = out
 
 
 # Secret-bearing fields of an MCP server entry (#43): redacted by profile.get.
 _MCP_SECRET_FIELDS = ("env", "headers")
 
 
+def _mcp_identity(server: dict[str, Any]) -> str:
+    # A server's non-secret fields (name/command/args/url/type/…), compared exactly.
+    rest = {k: v for k, v in server.items() if k not in _MCP_SECRET_FIELDS}
+    return json.dumps(rest, sort_keys=True, default=repr)
+
+
+def _restore_mcp_servers(agent_path: str, new_servers: list[Any], old_servers: list[Any]) -> None:
+    """Resolve placeholders in an agent's ``mcp_servers`` (``update``, #43).
+
+    Never guesses. A server with a placeholder is matched to a stored server
+    only by (1) exact identity — the same non-secret fields — when that
+    identity occurs exactly once in both lists, else (2) its ``name`` when
+    that name occurs exactly once in both lists. Unnamed servers have no
+    fallback (the same command with new args may be a different server), and
+    occurrence order is never used. Anything else raises ``invalid_message``
+    naming the server, so a secret can't land on the wrong server. Servers
+    with no placeholder need no match."""
+    old = [m for m in old_servers if isinstance(m, dict)]
+    new = [(i, m) for i, m in enumerate(new_servers) if isinstance(m, dict)]
+    new_dicts = [m for _, m in new]
+    old_by_id = _unique_by(old, _mcp_identity)
+    new_by_id = _unique_by(new_dicts, _mcp_identity)
+    old_by_name = _unique_by(old, _entry_name)
+    new_by_name = _unique_by(new_dicts, _entry_name)
+    for i, server in new:
+        path = f"{agent_path}.mcp_servers[{i}]"
+        pending = [
+            (field, suffix)
+            for field in _MCP_SECRET_FIELDS
+            if field in server and (suffix := _placeholder_path(server[field])) is not None
+        ]
+        if not pending:
+            continue
+        ident, name = _mcp_identity(server), _entry_name(server)
+        if ident in new_by_id and ident in old_by_id:
+            match = old_by_id[ident]
+        elif name is not None and name in new_by_name and name in old_by_name:
+            match = old_by_name[name]
+        else:
+            field, suffix = pending[0]
+            raise _unresolvable(f"{path}.{field}{suffix}")
+        for field in _MCP_SECRET_FIELDS:
+            _restore_field(server, field, match.get(field), path)
+
+
 def _restore_redacted(spec: dict[str, Any], old: Profile | None) -> dict[str, Any]:
     """Return a copy of a raw profile spec with ``REDACTED`` placeholders
-    replaced by the stored secret values of ``old`` (#43).
+    resolved against the stored profile ``old`` (#43).
 
     ``profile.get`` never returns these secrets, but ``profile.update``
     replaces the whole spec — so an editor that round-trips ``profile.info``
-    sends the placeholders back. They resolve to the stored value of the same
-    key: agent ``env`` (agents matched by name), MCP-server ``env`` /
-    ``headers`` (servers matched by name-else-command plus occurrence index),
-    and ``notify``. A placeholder with no stored value (new key, renamed agent,
-    or ``create``) is dropped rather than stored literally.
+    sends the placeholders back. On update they resolve to the stored value
+    (agent ``env`` and ``notify`` by key, agents by name, MCP servers per
+    :func:`_restore_mcp_servers`); a placeholder that can't be resolved for
+    certain raises ``ProtocolError`` (``invalid_message``) before anything is
+    written. On ``create`` (``old is None``) nothing is stored, so every
+    placeholder is dropped rather than stored literally.
     """
     spec = copy.deepcopy(spec)
-    _restore_field(spec, "notify", old.notify if old is not None else {})
+    if old is None:
+        _drop_placeholders(spec, "notify")
+        for _aname, aspec in _agent_specs(spec):
+            _drop_placeholders(aspec, "env")
+            if isinstance(aspec.get("mcp_servers"), list):
+                for server in aspec["mcp_servers"]:
+                    if isinstance(server, dict):
+                        for field in _MCP_SECRET_FIELDS:
+                            _drop_placeholders(server, field)
+        return spec
+    if isinstance(spec.get("notify"), dict):
+        _restore_field(spec, "notify", old.notify, "notify")
     for aname, aspec in _agent_specs(spec):
-        old_agent = old.agents.get(aname) if old is not None else None
-        _restore_field(aspec, "env", old_agent.env if old_agent is not None else {})
-        mcp_servers = aspec.get("mcp_servers")
-        if not isinstance(mcp_servers, list):
-            continue
-        old_servers = [
-            m
-            for m in (old_agent.mcp_servers if old_agent is not None else [])
-            if isinstance(m, dict)
-        ]
-        old_by_key = dict(
-            zip(_occurrences([_mcp_key(m) for m in old_servers]), old_servers, strict=True)
-        )
-        new_servers = [m for m in mcp_servers if isinstance(m, dict)]
-        for server, key in zip(
-            new_servers, _occurrences([_mcp_key(m) for m in new_servers]), strict=True
-        ):
-            old_server = old_by_key.get(key, {})
-            for field in _MCP_SECRET_FIELDS:
-                _restore_field(server, field, old_server.get(field))
+        old_agent = old.agents.get(aname)
+        agent_path = f"agents.{aname}"
+        if isinstance(aspec.get("env"), dict):
+            _restore_field(aspec, "env", old_agent.env if old_agent else None, agent_path)
+        if isinstance(aspec.get("mcp_servers"), list):
+            _restore_mcp_servers(
+                agent_path, aspec["mcp_servers"], old_agent.mcp_servers if old_agent else []
+            )
     return spec
 
 
@@ -617,9 +689,9 @@ class Supervisor:
         dynamic profiles alike. Raises ``ProfileUnknownError`` for a bad name.
 
         Redacted (spec §10) to :data:`REDACTED`, keys kept so the editor can
-        show them: agent ``env`` values; MCP-server ``env`` values (dict or
-        list form) and ``headers`` values; every ``notify`` value except
-        ``format``. Everything else, including ``args`` and ``url``, is
+        show them: agent ``env`` values; MCP-server ``env`` and ``headers``
+        values (in list form every entry key except ``name``); every
+        ``notify`` value except ``format``. Everything else, including ``args`` and ``url``, is
         returned as-is. Values are the resolved ones (e.g. the daemon's
         ``agent_command`` when the profile set none, default policy/triggers).
         """

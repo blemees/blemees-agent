@@ -1326,7 +1326,9 @@ Profiles can also be created over the wire (`profile.create`, persisted
 under `state_dir`). `profile.get` returns one profile's full editable spec for
 an editor. It redacts agent `env` values, MCP-server `env` and `headers`
 values, and `notify` values except `format`; `args`, URLs and everything else
-are returned as-is, so keep secrets in `env`
+are returned as-is, so keep secrets in `env`. On `profile.update` a
+`"<redacted>"` value keeps the stored secret only where the daemon can match
+it for certain; otherwise the update is refused with `invalid_message`
 ([`docs/acp-migration-spec.md`](docs/acp-migration-spec.md) §9.2, §10).
 
 #### Attention policy (per profile)

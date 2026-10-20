@@ -447,8 +447,11 @@ daemon never guesses where a placeholder belongs:
   non-secret fields** (everything but `env`/`headers`: `name`, `command`,
   `args`, `url`, `type`, …), when that identity occurs once in the stored list
   and once in the new list; else (2) the stored server with the same `name`,
-  when that name occurs once in both lists (so a named server keeps its
-  secret through a `command`/`args` edit). Unnamed servers have no fallback,
+  when that name occurs once in both lists **and** the endpoint is the same:
+  equal `command`, and equal `url` when either side has one (so a named
+  server keeps its secret through an `args` edit, but not through a
+  `command`/`url` change or a rename onto another server's name). Unnamed
+  servers have no fallback,
   and list position is never used. Deleting, reordering or adding servers is
   therefore safe.
 - List-form `env`/`headers` entries match by `name`, when that name occurs
@@ -459,8 +462,8 @@ A placeholder that none of these rules resolves **refuses the whole update**
 with `invalid_message` — nothing is written, in memory or on disk — and the
 message names it, e.g. `cannot resolve <redacted> for
 agents.default.mcp_servers[1].env.TOKEN; re-enter the value`. Typical causes:
-editing the `args` of an unnamed server, adding a server with a placeholder,
-or a duplicated server. Send the real value to resolve it. Known limit: two
+editing the `args` of an unnamed server, changing the `command`/`url` of a
+named one, adding a server with a placeholder, or a duplicated server. Send the real value to resolve it. Known limit: two
 servers whose non-secret fields are identical (they differ only in
 `env`/`headers`) can't be told apart, so even an unchanged round trip is
 refused until their values are re-entered (or one gets a distinct `name`).

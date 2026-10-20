@@ -312,13 +312,21 @@ def _mcp_identity(server: dict[str, Any]) -> str:
     return json.dumps(rest, sort_keys=True, default=repr)
 
 
+def _same_endpoint(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    # Same process / endpoint: equal ``command``, and equal ``url`` when either
+    # side has one. ``args`` may differ.
+    return a.get("command") == b.get("command") and a.get("url") == b.get("url")
+
+
 def _restore_mcp_servers(agent_path: str, new_servers: list[Any], old_servers: list[Any]) -> None:
     """Resolve placeholders in an agent's ``mcp_servers`` (``update``, #43).
 
     Never guesses. A server with a placeholder is matched to a stored server
     only by (1) exact identity — the same non-secret fields — when that
     identity occurs exactly once in both lists, else (2) its ``name`` when
-    that name occurs exactly once in both lists. Unnamed servers have no
+    that name occurs exactly once in both lists *and* the endpoint is the
+    same (equal ``command``, and equal ``url`` when either side has one;
+    ``args`` may differ). Unnamed servers have no
     fallback (the same command with new args may be a different server), and
     occurrence order is never used. Anything else raises ``invalid_message``
     naming the server, so a secret can't land on the wrong server. Servers
@@ -342,7 +350,12 @@ def _restore_mcp_servers(agent_path: str, new_servers: list[Any], old_servers: l
         ident, name = _mcp_identity(server), _entry_name(server)
         if ident in new_by_id and ident in old_by_id:
             match = old_by_id[ident]
-        elif name is not None and name in new_by_name and name in old_by_name:
+        elif (
+            name is not None
+            and name in new_by_name
+            and name in old_by_name
+            and _same_endpoint(server, old_by_name[name])
+        ):
             match = old_by_name[name]
         else:
             field, suffix = pending[0]

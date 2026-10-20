@@ -369,16 +369,44 @@ async def test_mcp_edit_args_of_unnamed_server_with_real_value_accepted(tmp_path
 
 
 async def test_named_mcp_server_args_edit_keeps_secret(tmp_path):
-    # A unique name is an explicit identity: it survives a command/args edit.
+    # A unique name with the same command is an explicit identity: it
+    # survives an args edit.
     sup, reg = _sup(tmp_path)
     fs = {"name": "fs", "command": "mcp-fs", "args": ["/a"], "env": {"K": "fs-secret"}}
     spec, servers = _with_servers(sup, [fs, GH])
     servers[0]["args"] = ["/b"]
-    servers[0]["command"] = "mcp-fs2"
     await sup.update_profile("m", spec)
-    expected = [{**fs, "command": "mcp-fs2", "args": ["/b"]}, GH]
+    expected = [{**fs, "args": ["/b"]}, GH]
     assert _servers(sup) == expected
     assert _stored_servers(reg) == expected
+
+
+async def test_named_mcp_server_command_or_url_change_with_placeholder_refused(tmp_path):
+    # The name fallback also needs the same endpoint (command, and url when
+    # either side has one); a new endpoint must not inherit the secret.
+    sup, reg = _sup(tmp_path)
+    fs = {"name": "fs", "command": "mcp-fs", "args": ["/a"], "env": {"K": "fs-secret"}}
+    spec, servers = _with_servers(sup, [fs])
+    servers[0]["command"] = "mcp-fs2"
+    await _assert_refused(sup, reg, spec, r"mcp_servers\[0\]\.env\.K")
+
+    remote = {"name": "r", "url": "https://a.example", "headers": {"Authorization": "B s"}}
+    spec, servers = _with_servers(sup, [remote], name="u")
+    servers[0]["url"] = "https://evil.example"
+    await _assert_refused(sup, reg, spec, r"mcp_servers\[0\]\.headers\.Authorization", name="u")
+
+
+async def test_delete_and_rename_onto_deleted_name_refused(tmp_path):
+    # Review round 3: delete server y, rename server x to "y" keeping its
+    # placeholder. The name now matches y, but the command is x's, so y's
+    # secret must not move to x's process.
+    sup, reg = _sup(tmp_path)
+    x = {"name": "x", "command": "a", "env": {"T": "x-secret"}}
+    y = {"name": "y", "command": "b", "env": {"T": "y-secret"}}
+    spec, servers = _with_servers(sup, [x, y])
+    del servers[1]
+    servers[0]["name"] = "y"
+    await _assert_refused(sup, reg, spec, r"agents\.default\.mcp_servers\[0\]\.env\.T")
 
 
 async def test_same_named_servers_different_command_delete_and_reorder(tmp_path):

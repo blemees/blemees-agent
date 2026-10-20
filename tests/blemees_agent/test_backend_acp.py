@@ -309,3 +309,24 @@ async def test_profile_model_reaches_agent_via_set_model():
     assert text == "model:fake-model-b"
     selection_events = [e for _lvl, e, _f in log.records if e.startswith("acp.selection_")]
     assert selection_events == []
+
+
+async def test_profile_model_reaches_agent_via_config_option():
+    """A profile's ``model`` must reach an agent that advertises models only
+    as a ``category: "model"`` config option (``session/set_config_option``),
+    e.g. claude-agent-acp / codex-acp: the ``_select`` fallback (#70)."""
+    log = _RecordingLogger()
+    agent = Agent(name="default", command=sys.executable, args=[FAKE_ACP], model="fake-model-b")
+    env = {**os.environ, "BLEMEES_FAKE_CONFIG_MODELS": "1"}
+    process = AcpAgentProcess(agent, key=("t", "default"), logger=log, env=env)
+    q: asyncio.Queue = asyncio.Queue()
+    handle = await _handle(process, q)
+    try:
+        await handle.send_user_turn({"role": "user", "content": "whichmodel"})
+        frames = await _collect_turn(q)
+    finally:
+        await process.close()
+    text = "".join(f["update"]["content"]["text"] for f in frames if f["type"] == "session.update")
+    assert text == "model:fake-model-b"
+    selection_events = [e for _lvl, e, _f in log.records if e.startswith("acp.selection_")]
+    assert selection_events == []

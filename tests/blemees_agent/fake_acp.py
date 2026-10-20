@@ -13,10 +13,15 @@ is driven by the prompt text so a single stub covers several scenarios:
 * contains "boom"  → raise, so the turn surfaces as an agent error.
 * contains "die"   → hard-exit the process mid-turn (crash/recovery tests).
 * contains "whichmodel" → reply ``model:<id>`` with the model last set via
-                     ``session/set_model`` (model-selection tests, #70).
+                     ``session/set_model`` or ``session/set_config_option``
+                     (model-selection tests, #70).
 
 ``session/new`` advertises ``FAKE_MODELS`` through the ``models`` field, the
 way gemini-cli does, so ``session/set_model`` is the only way to pick one.
+With ``BLEMEES_FAKE_CONFIG_MODELS=1`` it sends no ``models`` and instead
+advertises them as a ``category: "model"`` config option, the way
+claude-agent-acp and codex-acp do, so ``session/set_config_option`` is the
+only way to pick one.
 
 Run as: ``python fake_acp.py`` (stdio).
 """
@@ -37,13 +42,27 @@ from acp.schema import (
 )
 
 FAKE_MODELS = ("fake-model-a", "fake-model-b")
+_MODEL_CONFIG_ID = "model"
+
+
+def _model_config_option(current: str) -> dict:
+    """Wire-shaped ``category: "model"`` select config option."""
+    return {
+        "id": _MODEL_CONFIG_ID,
+        "name": "Model",
+        "category": "model",
+        "type": "select",
+        "currentValue": current,
+        "options": [{"value": m, "name": m} for m in FAKE_MODELS],
+    }
 
 
 class FakeAgent(acp.Agent):
     def __init__(self) -> None:
         self._conn: acp.AgentSideConnection | None = None
         self._session_seq = 0
-        # session_id -> model id received via session/set_model.
+        # session_id -> model id received via session/set_model or
+        # session/set_config_option.
         self._models: dict[str, str] = {}
 
     def on_connect(self, conn: acp.AgentSideConnection) -> None:
@@ -66,8 +85,13 @@ class FakeAgent(acp.Agent):
         # Unique id per session so one process can multiplex several.
         self._session_seq += 1
         session_id = f"fake-session-{self._session_seq}"
-        # Wire-shaped dict (not ``NewSessionResponse``) so ``models`` is sent
-        # whatever SDK version runs this stub.
+        # Wire-shaped dicts (not ``NewSessionResponse``) so ``models`` /
+        # ``configOptions`` are sent whatever SDK version runs this stub.
+        if os.environ.get("BLEMEES_FAKE_CONFIG_MODELS") == "1":
+            return {
+                "sessionId": session_id,
+                "configOptions": [_model_config_option(FAKE_MODELS[0])],
+            }
         return {
             "sessionId": session_id,
             "models": {
@@ -79,6 +103,12 @@ class FakeAgent(acp.Agent):
     async def set_session_model(self, model_id, session_id, **kw):
         self._models[session_id] = model_id
         return None
+
+    async def set_config_option(self, config_id, session_id, value, **kw):
+        if config_id != _MODEL_CONFIG_ID:
+            raise acp.RequestError.invalid_params({"configId": config_id})
+        self._models[session_id] = value
+        return {"configOptions": [_model_config_option(value)]}
 
     async def load_session(
         self, cwd, session_id, additional_directories=None, mcp_servers=None, **kw

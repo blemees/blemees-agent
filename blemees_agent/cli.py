@@ -252,8 +252,11 @@ class Harness:
     async def status(self) -> None:
         await self._send({"type": "status", "id": _req_id()})
 
-    async def list_sessions(self, cwd: str) -> None:
-        await self._send({"type": "session.list", "id": _req_id(), "cwd": cwd})
+    async def list_sessions(self, cwd: str | None = None) -> None:
+        frame: dict[str, Any] = {"type": "session.list", "id": _req_id()}
+        if cwd:
+            frame["cwd"] = cwd
+        await self._send(frame)
 
     async def session_info(self, session_id: str) -> None:
         await self._send({"type": "session.info", "id": _req_id(), "session_id": session_id})
@@ -359,10 +362,8 @@ async def dispatch(h: Harness, line: str) -> bool:
         return True
 
     if cmd == "sessions":
-        if not rest:
-            print("usage: sessions <cwd>")
-            return True
-        await h.list_sessions(rest)
+        # cwd is an optional filter; omit it to list every session.
+        await h.list_sessions(rest or None)
         return True
     if cmd == "session-info":
         if not rest:

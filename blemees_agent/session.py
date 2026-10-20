@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -32,6 +33,7 @@ from typing import Any
 from .backends import AgentBackend
 from .errors import SessionExistsError, SessionUnknownError
 from .event_log import DurableEventLog, RingBuffer, event_log_path
+from .logging import StructuredLogger
 from .notify import (
     AGENT_CRASHED,
     AUTH_REQUIRED,
@@ -42,6 +44,13 @@ from .notify import (
     NotifyService,
 )
 from .protocol import OpenMessage
+
+_log = StructuredLogger(logging.getLogger("blemees-agent.session"))
+
+# How long ``SessionTable.remove`` waits for a session's background tasks
+# (e.g. a soft-kill ``close()``) before it goes on. Matches the daemon's
+# per-step ``_SHUTDOWN_BUDGET_S`` so a hung agent cannot block close/reap.
+_BG_TASK_WAIT_S = 5.0
 
 WriterFn = Callable[[dict], Awaitable[None]]
 
@@ -148,6 +157,10 @@ class Session:
     # from the profile at open (default = the blocked set), overridable per
     # session via session.open options.attention_triggers.
     attention_triggers: set[str] = field(default_factory=lambda: set(BLOCKED_TRIGGERS))
+    # Strong refs to fire-and-forget tasks (the post-turn soft-kill). The
+    # event loop only keeps weak refs, so an unreferenced task can be
+    # garbage-collected mid-run (#50).
+    _bg_tasks: set[asyncio.Task] = field(default_factory=set)
 
     # ------------------------------------------------------------------
     # Event dispatch
@@ -207,7 +220,9 @@ class Session:
             self._finishing = False
             sub = self.backend
             if sub is not None:
-                asyncio.create_task(sub.close(), name=f"backend-soft-kill-{self.session_id}")
+                task = asyncio.create_task(sub.close(), name=f"backend-soft-kill-{self.session_id}")
+                self._bg_tasks.add(task)
+                task.add_done_callback(self._reap_bg_task)
         # An error delivered to a session whose owner has left needs the
         # owner's attention — fire the notify trigger (#24). enter_attention
         # self-gates on "no owner attached", so an error watched live is silent.
@@ -217,6 +232,41 @@ class Session:
                 await self.enter_attention(
                     code, frame.get("message") or "the agent reported an error"
                 )
+
+    def _reap_bg_task(self, task: asyncio.Task) -> None:
+        """Drop a finished background task; log its crash instead of
+        leaving it to the "Task exception was never retrieved" warning."""
+        self._bg_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            _log.warning(
+                "session.background_task_failed",
+                session_id=self.session_id,
+                task=task.get_name(),
+                error=repr(exc),
+            )
+
+    async def wait_background_tasks(self, timeout: float | None = None) -> bool:
+        """Wait for in-flight background tasks (e.g. a soft-kill close).
+
+        Waits at most ``timeout`` seconds (``None`` = no limit). Tasks still
+        running after that are left in place (the done-callback reaps them)
+        and a warning is logged. Returns ``True`` when no task is pending.
+        """
+        if not self._bg_tasks:
+            return True
+        _done, pending = await asyncio.wait(set(self._bg_tasks), timeout=timeout)
+        if pending:
+            _log.warning(
+                "session.background_tasks_timeout",
+                session_id=self.session_id,
+                timeout_s=timeout,
+                tasks=sorted(t.get_name() for t in pending),
+            )
+            return False
+        return True
 
     # ------------------------------------------------------------------
     # Attach / detach
@@ -800,6 +850,7 @@ class SessionTable:
         if sess is None:
             return
         sess.cancel_pending_permissions()
+        await sess.wait_background_tasks(timeout=_BG_TASK_WAIT_S)
         if sess.backend is not None:
             await sess.backend.close()
         if sess.log is not None:

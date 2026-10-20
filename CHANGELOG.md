@@ -54,3 +54,12 @@ no `blemees/2` compatibility shims.
 ### Removed
 - The `blemees/2` `agent.*` event vocabulary and the
   `translate_claude.py` / `translate_codex.py` translators.
+
+### Fixed
+- The post-turn soft-kill task (`backend.close()` after a detached turn ends)
+  was not referenced, so it could be garbage-collected mid-run. The session
+  now holds it until done, logs a failure, and `SessionTable.remove` waits for
+  it (at most 5 s, then logs a warning and goes on). (#50)
+- `blemees-agentctl` REPL: `sessions` with no argument printed a usage error.
+  It now sends `session.list` without `cwd` and lists all sessions, as the
+  help text says. (#50)

@@ -1305,14 +1305,20 @@ and `stderr_rate_lines` / `stderr_rate_window_s` are still accepted but
 ignored.
 
 **Session retention** (`session_retention_days`, off by default). With
-N > 0, a session that is not live in the daemon and whose registry
-`last_active_at_ms` is more than N days old loses its registry record
+N > 0, a session that is not live in the daemon and whose last activity
+is more than N days old loses its registry record
 (`<state_dir>/registry.json`) and its `<event_log_dir>/<session>.jsonl`
 event log and `<session>.usage.json` sidecar: the same files
-`session.close{delete:true}` removes. The sweep never deletes a live
+`session.close{delete:true}` removes. Last activity is the newest of the
+record's `last_active_at_ms` and `created_at_ms` and the mtime of the
+session's event log and sidecar; the daemon refreshes `last_active_at_ms`
+on open, close and shutdown and every 30 s while the session is live. A
+record with no timestamp at all is kept. The sweep never deletes a live
 (open, attached or running) session, agent-owned files (`~/.claude`,
 `~/.codex`, …), other files in those dirs, profiles, or symlink targets.
-Negative values are treated as 0.
+"Live" means live in *this* daemon process: if two daemons share a
+`state_dir` (unusual, and not supported), one daemon can sweep a session
+the other has open. Negative values are treated as 0.
 
 #### Profiles
 

@@ -476,6 +476,9 @@ class Connection:
             model=agent.model,
             view_only=bool(sess.extra.get("view_only", False)),
         )
+        # upsert keeps an existing last_active_at_ms, so a resumed record
+        # would still look idle to the retention sweep (#50). Mark it used now.
+        self._registry.touch(msg.session_id)
         self._registry.save()
 
         # Send ack before the event stream so clients can match the reply
@@ -677,6 +680,11 @@ class Connection:
         # close anyway.
         sess = self._sessions.try_get(msg.session_id)
         if sess is not None:
+            if not msg.delete:
+                # Persist the last activity now; the 30 s touch loop may not
+                # have run since the last turn (retention sweep, #50).
+                self._registry.touch(msg.session_id, turns=sess.turns, model=sess.last_model)
+                self._registry.save()
             await sess.broadcast_to_watchers(
                 {
                     "type": "session.closed_notice",
@@ -1257,14 +1265,17 @@ class Daemon:
                 reaped = await self._supervisor.reap_idle(self._config.idle_timeout_s)
                 if reaped:
                     self._log.info("profile.reaped", profiles=reaped)
-                # Persist current turn counters / activity for live sessions (#21).
-                for sess in list(self._sessions._sessions.values()):
-                    self._registry.touch(sess.session_id, turns=sess.turns, model=sess.last_model)
-                self._registry.save()
+                self._touch_live_sessions()
             except asyncio.CancelledError:
                 return
             except Exception:  # pragma: no cover - defensive
                 self._log.exception("profile.reaper_error")
+
+    def _touch_live_sessions(self) -> None:
+        """Persist turn counters / last activity for every live session (#21, #50)."""
+        for sess in list(self._sessions._sessions.values()):
+            self._registry.touch(sess.session_id, turns=sess.turns, model=sess.last_model)
+        self._registry.save()
 
     def _retention_days(self) -> int:
         days = self._config.session_retention_days or 0
@@ -1348,6 +1359,11 @@ class Daemon:
                 )
             except TimeoutError:
                 self._log.warning("daemon.shutdown_grace_expired", still_running=len(active))
+
+        # Record last activity before the sessions go away, so a session used
+        # in the last 30 s is not seen as idle by the next startup sweep (#50).
+        with contextlib.suppress(Exception):
+            self._touch_live_sessions()
 
         # Force phase: drop sessions, then terminate all profile agent processes.
         try:

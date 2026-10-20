@@ -20,11 +20,13 @@ outside the event-log dir, never follows a symlink (a symlinked log is
 unlinked itself), and never touches over-wire profiles. ``N <= 0`` (the
 default) disables the sweep.
 
-Last activity is the record's ``last_active_at_ms``: the daemon sets it on
-every open and refreshes it every 30 s while the session is live, so it is
-the time the session was last in use. A record without it falls back to
-``created_at_ms``, then to the newest mtime of the session's own files. A
-record with none of these is kept.
+Last activity is the newest of the record's ``last_active_at_ms`` and
+``created_at_ms`` and the ``lstat`` mtime of the session's own files (event
+log + usage sidecar). The daemon sets ``last_active_at_ms`` on every open
+and close, at shutdown, and every 30 s while the session is live; the event
+log gets a write on every frame. Taking the newest of all of them guards
+against any path that forgets to touch the record. A record with none of
+these timestamps is kept.
 """
 
 from __future__ import annotations
@@ -44,19 +46,18 @@ SWEEP_INTERVAL_S = 24 * 60 * 60
 
 
 def _last_active_ms(rec: dict[str, Any], log_dir: Path | None) -> int | None:
+    candidates: list[int] = []
     for key in ("last_active_at_ms", "created_at_ms"):
         value = rec.get(key)
         if isinstance(value, int) and not isinstance(value, bool) and value > 0:
-            return value
-    if log_dir is None:
-        return None
-    mtimes: list[float] = []
-    for path in session_file_paths(log_dir, rec["session_id"]):
-        try:
-            mtimes.append(path.lstat().st_mtime)
-        except OSError:
-            continue
-    return int(max(mtimes) * 1000) if mtimes else None
+            candidates.append(value)
+    if log_dir is not None:
+        for path in session_file_paths(log_dir, rec["session_id"]):
+            try:
+                candidates.append(int(path.lstat().st_mtime * 1000))
+            except OSError:
+                continue
+    return max(candidates) if candidates else None
 
 
 def sweep_expired_sessions(
@@ -90,6 +91,10 @@ def sweep_expired_sessions(
             last_ms = _last_active_ms(rec, base)
             if last_ms is None or last_ms >= cutoff_ms:
                 continue
+            # Files go first, then the record. If the final Registry.save()
+            # fails (it swallows OSError), the record comes back on the next
+            # start with no files, and the next sweep removes it again, so
+            # this order is harmless.
             files = delete_session_files(base, sid) if base is not None else []
             registry.remove(sid)
         except Exception as exc:  # one bad entry must not stop the sweep

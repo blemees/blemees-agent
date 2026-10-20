@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -29,14 +30,27 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def _backdate(path: Path, ms: int) -> None:
+    os.utime(path, (ms / 1000, ms / 1000), follow_symlinks=False)
+
+
 def _seed(state_dir: Path, records: list[dict]) -> Path:
-    """Write ``registry.json`` + per-session files the way the daemon lays them out."""
+    """Write ``registry.json`` + per-session files the way the daemon lays them out.
+
+    Each file's mtime is set to the record's last activity, as it would be
+    for a session the daemon last wrote at that time.
+    """
     log_dir = state_dir / "sessions"
     log_dir.mkdir(parents=True, exist_ok=True)
     for rec in records:
         sid = rec["session_id"]
-        (log_dir / f"{sid}.jsonl").write_text('{"seq":1}\n')
-        (log_dir / f"{sid}.usage.json").write_text("{}")
+        last_ms = rec.get("last_active_at_ms") or rec.get("created_at_ms")
+        files = {f"{sid}.jsonl": '{"seq":1}\n', f"{sid}.usage.json": "{}"}
+        for name, text in files.items():
+            path = log_dir / name
+            path.write_text(text)
+            if last_ms:
+                _backdate(path, last_ms)
     payload = {"version": 1, "sessions": records, "profiles": []}
     (state_dir / "registry.json").write_text(json.dumps(payload))
     return log_dir
@@ -183,8 +197,6 @@ async def test_startup_sweep_removes_old_keeps_recent(tmp_path):
 
 
 def test_falls_back_to_file_mtime_without_timestamps(tmp_path):
-    import os
-
     state = tmp_path / "state"
     log_dir = _seed(state, [{"session_id": "bare-old"}, {"session_id": "bare-new"}])
     old = time.time() - 30 * 86400
@@ -192,6 +204,52 @@ def test_falls_back_to_file_mtime_without_timestamps(tmp_path):
         os.utime(log_dir / name, (old, old))
     assert _sweep(state, 7) == ["bare-old"]
     assert _registry_ids(state) == {"bare-new"}
+
+
+def test_uses_newest_of_record_and_file_mtime(tmp_path):
+    """Old record timestamps but a fresh event log -> kept (max rule)."""
+    state = tmp_path / "state"
+    log_dir = _seed(state, [_rec("fresh-log", 30), _rec("all-old", 30)])
+    # A frame was written to fresh-log's event log just now.
+    (log_dir / "fresh-log.jsonl").write_text('{"seq":1}\n{"seq":2}\n')
+    assert _sweep(state, 7) == ["all-old"]
+    assert _registry_ids(state) == {"fresh-log"}
+    assert (log_dir / "fresh-log.jsonl").is_file()
+    assert (log_dir / "fresh-log.usage.json").is_file()
+
+
+async def test_resumed_old_session_survives_restart_sweep(tmp_path):
+    """Resume a 30-day-old record, run a turn, restart with retention on: kept."""
+    state = tmp_path / "state"
+    log_dir = _seed(state, [_rec("old", 30)])
+    sock = short_socket_path("blemeesd-ret")
+    with socket_cleanup(sock):
+        async with _daemon(state, sock):
+            c = await _connect(sock)
+            try:
+                await c.send(
+                    {
+                        "type": "session.open",
+                        "id": "o",
+                        "session_id": "old",
+                        "resume": True,
+                        "options": {},
+                    }
+                )
+                await c.wait_for(lambda e: e.get("type") == "session.opened")
+                await c.send({"type": "session.prompt", "session_id": "old", "prompt": "hi"})
+                await c.wait_for(lambda e: e.get("type") == "session.result", timeout=30.0)
+            finally:
+                await c.close()
+    # The record itself was refreshed (open / close / shutdown touch it).
+    rec = json.loads((state / "registry.json").read_text())["sessions"][0]
+    assert rec["last_active_at_ms"] > _now_ms() - DAY_MS
+    with socket_cleanup(sock):
+        async with _daemon(state, sock, session_retention_days=7):
+            assert _registry_ids(state) == {"old"}
+    assert _registry_ids(state) == {"old"}
+    assert (log_dir / "old.jsonl").is_file()
+    assert (log_dir / "old.usage.json").is_file()
 
 
 # -- (c) a live session is never swept -------------------------------------
@@ -236,6 +294,7 @@ def test_files_outside_owned_dirs_untouched(tmp_path):
     target.write_text("keep me")
     (log_dir / "linked.jsonl").unlink()
     (log_dir / "linked.jsonl").symlink_to(target)
+    _backdate(log_dir / "linked.jsonl", _now_ms() - 30 * DAY_MS)
     # Unrelated files in the log dir (no registry record).
     (log_dir / "orphan.jsonl").write_text("x")
     (log_dir / "notes.txt").write_text("x")
@@ -269,6 +328,7 @@ def test_failure_on_one_entry_does_not_stop_others(tmp_path):
     (log_dir / "broken.usage.json").unlink()
     (log_dir / "broken.usage.json").mkdir()
     (log_dir / "broken.usage.json" / "x").write_text("x")
+    _backdate(log_dir / "broken.usage.json", _now_ms() - 30 * DAY_MS)
 
     removed = _sweep(state, 7)
 

@@ -231,15 +231,13 @@ async def test_soft_kill_task_is_held_until_done():
 
 
 async def test_soft_kill_task_failure_is_logged(monkeypatch):
-    import blemees_agent.session as session_mod
-
     warnings: list[tuple[str, dict]] = []
 
     class RecordingLog:
         def warning(self, event, **fields):
             warnings.append((event, fields))
 
-    monkeypatch.setattr(session_mod, "_log", RecordingLog())
+    monkeypatch.setattr("blemees_agent.session._log", RecordingLog())
 
     class BrokenSub:
         async def close(self):
@@ -282,4 +280,48 @@ async def test_table_remove_waits_for_soft_kill_task():
     asyncio.get_running_loop().call_later(0.01, release.set)
     await table.remove("s1")
     assert order == ["soft-kill", "remove-close"]
+    assert sess._bg_tasks == set()
+
+
+async def test_table_remove_does_not_hang_on_stuck_soft_kill(monkeypatch):
+    # #50 review: a soft-kill close() that never returns must not block
+    # remove() past the wait budget; remove() still closes the backend.
+    warnings: list[tuple[str, dict]] = []
+
+    class RecordingLog:
+        def warning(self, event, **fields):
+            warnings.append((event, fields))
+
+    monkeypatch.setattr("blemees_agent.session._log", RecordingLog())
+    monkeypatch.setattr("blemees_agent.session._BG_TASK_WAIT_S", 0.05)
+
+    hang = asyncio.Event()  # never set
+    calls: list[str] = []
+
+    class HangingSub:
+        async def close(self):
+            if not calls:
+                calls.append("soft-kill")
+                await hang.wait()
+            else:
+                calls.append("remove-close")
+
+    table = SessionTable(idle_timeout_s=60, max_concurrent=4)
+    sess = Session(session_id="s1", open_msg=_open_msg(), cwd=None)
+    await table.register(sess)
+    sess.backend = HangingSub()  # type: ignore[assignment]
+    sess.mark_finishing()
+    await sess.on_event({"type": "session.result", "session_id": "s1", "subtype": "success"})
+    await asyncio.sleep(0)
+    (task,) = sess._bg_tasks
+
+    await asyncio.wait_for(table.remove("s1"), timeout=1.0)
+    assert calls == ["soft-kill", "remove-close"]
+    assert [e for e, _ in warnings] == ["session.background_tasks_timeout"]
+    assert warnings[0][1]["tasks"] == ["backend-soft-kill-s1"]
+    assert not task.done()
+
+    task.cancel()
+    await asyncio.wait({task})
+    await asyncio.sleep(0)  # let the done-callback run
     assert sess._bg_tasks == set()

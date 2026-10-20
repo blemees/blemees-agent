@@ -47,6 +47,11 @@ from .protocol import OpenMessage
 
 _log = StructuredLogger(logging.getLogger("blemees-agent.session"))
 
+# How long ``SessionTable.remove`` waits for a session's background tasks
+# (e.g. a soft-kill ``close()``) before it goes on. Matches the daemon's
+# per-step ``_SHUTDOWN_BUDGET_S`` so a hung agent cannot block close/reap.
+_BG_TASK_WAIT_S = 5.0
+
 WriterFn = Callable[[dict], Awaitable[None]]
 
 
@@ -243,10 +248,25 @@ class Session:
                 error=repr(exc),
             )
 
-    async def wait_background_tasks(self) -> None:
-        """Wait for in-flight background tasks (e.g. a soft-kill close)."""
-        if self._bg_tasks:
-            await asyncio.gather(*self._bg_tasks, return_exceptions=True)
+    async def wait_background_tasks(self, timeout: float | None = None) -> bool:
+        """Wait for in-flight background tasks (e.g. a soft-kill close).
+
+        Waits at most ``timeout`` seconds (``None`` = no limit). Tasks still
+        running after that are left in place (the done-callback reaps them)
+        and a warning is logged. Returns ``True`` when no task is pending.
+        """
+        if not self._bg_tasks:
+            return True
+        _done, pending = await asyncio.wait(set(self._bg_tasks), timeout=timeout)
+        if pending:
+            _log.warning(
+                "session.background_tasks_timeout",
+                session_id=self.session_id,
+                timeout_s=timeout,
+                tasks=sorted(t.get_name() for t in pending),
+            )
+            return False
+        return True
 
     # ------------------------------------------------------------------
     # Attach / detach
@@ -830,7 +850,7 @@ class SessionTable:
         if sess is None:
             return
         sess.cancel_pending_permissions()
-        await sess.wait_background_tasks()
+        await sess.wait_background_tasks(timeout=_BG_TASK_WAIT_S)
         if sess.backend is not None:
             await sess.backend.close()
         if sess.log is not None:
